@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "web-team-orchestrator"
+version = "0.1.0"
+description = "Multi-agent, multi-backend orchestrator that builds a web service into a target project directory."
+requires-python = ">=3.10"
+dependencies = [
+    # Frontmatter parsing has a no-dep fallback; pyyaml is optional but recommended.
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+claude = ["claude-agent-sdk>=0.1.0"]
+openai = ["openai-agents>=0.0.1"]
+all = ["claude-agent-sdk>=0.1.0", "openai-agents>=0.0.1"]
+
+[project.scripts]
+web-team = "orchestrator.__main__:main"
+
+[tool.setuptools]
+packages = ["orchestrator", "orchestrator.backends"]
