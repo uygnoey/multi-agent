@@ -1,4 +1,5 @@
 """CLI 진입점: python -m orchestrator ..."""
+
 from __future__ import annotations
 
 import argparse
@@ -33,6 +34,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--budget", type=float, help="세션당 예산(USD) 상한 (지원 백엔드)")
     p.add_argument("--model", help="모델 override (미지정 시 백엔드 기본값)")
     p.add_argument("--poll-interval", type=float, default=20.0, help="PM/PL 감독 주기(초)")
+    p.add_argument(
+        "--delegate",
+        action="store_true",
+        help="역할 세션이 팀원을 네이티브 서브에이전트로 위임 호출 (Claude 백엔드)",
+    )
+    p.add_argument("--max-attempts", type=int, default=2, help="unit별 dev→test→qa 재작업 횟수")
+    p.add_argument("--retries", type=int, default=1, help="역할 호출 전이성 실패 재시도 횟수")
     p.add_argument("--mock", action="store_true", help="무비용 mock 백엔드로 전체 실행")
     p.add_argument("--check", action="store_true", help="백엔드 가용성 진단 후 종료")
     return p.parse_args(argv)
@@ -68,6 +76,9 @@ def build_config(a: argparse.Namespace) -> RunConfig:
         model=a.model,
         poll_interval=a.poll_interval,
         mock=a.mock,
+        delegate=a.delegate,
+        max_attempts=a.max_attempts,
+        retries=a.retries,
     )
 
 
@@ -77,13 +88,12 @@ def _print_summary(snap: dict, cfg: RunConfig) -> None:
     print(f"project-dir : {cfg.project_dir}")
     print(f"phase       : {snap.get('phase')}")
     for u in units:
-        print(
-            f"  {u['id']:<6} {u['status']:<11} test={str(u.get('test_status')):<5} "
-            f"{u['title']}"
-        )
+        print(f"  {u['id']:<6} {u['status']:<11} test={str(u.get('test_status')):<5} {u['title']}")
     done = sum(1 for u in units if u["status"] == "done")
     print(f"units       : {done}/{len(units)} done")
+    print(f"cost        : ${snap.get('total_cost_usd', 0.0):.4f}")
     print(f"board       : {cfg.project_dir / '.orchestrator' / 'board.json'}")
+    print(f"report      : {cfg.project_dir / '.orchestrator' / 'report.md'}")
 
 
 def main(argv=None) -> int:

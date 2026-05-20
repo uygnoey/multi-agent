@@ -1,4 +1,5 @@
 """경로/기본값, 역할→(페이즈, 툴셋) 매핑, 실행 설정."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -56,7 +57,19 @@ MAX_TURNS = {
 }
 
 DEFAULT_BACKEND = "mock"
-VALID_BACKENDS = ("claude-sdk", "claude-cli", "openai-agents", "codex", "mock")
+VALID_BACKENDS = ("claude-sdk", "claude-cli", "claude-team", "openai-agents", "codex", "mock")
+
+# Backends able to dispatch native Claude Code subagents via the Task tool.
+DELEGATION_CAPABLE = ("claude-sdk", "claude-cli", "claude-team")
+DELEGATION_TOOL = "Task"
+
+# Which teammates a role may delegate to when --delegate is on (depth-1 only).
+DELEGATES: dict[str, tuple[str, ...]] = {
+    "backend-developer": ("dba",),
+    "frontend-developer": ("backend-developer",),
+    "architecture-engineer": ("dba",),
+    "test-engineer": ("qa",),
+}
 
 
 @dataclass
@@ -71,6 +84,10 @@ class RunConfig:
     model: str | None = None
     poll_interval: float = 20.0
     mock: bool = False
+    delegate: bool = False  # allow role sessions to call teammates as subagents
+    max_attempts: int = 2  # dev→test→qa rework attempts per unit
+    retries: int = 1  # transient backend-failure retries per role call
+    retry_backoff: float = 2.0  # seconds, exponential
 
     def backend_for(self, role: str) -> str:
         if self.mock:

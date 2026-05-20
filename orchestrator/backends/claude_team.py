@@ -1,7 +1,8 @@
-"""③ Claude Code 구독(CLI) 백엔드.
+"""claude-team backend: native Team Agents lead-dispatch.
 
-claude -p ... --output-format json (cwd=타깃에서 실행).
-ANTHROPIC_API_KEY 미설정 시 로그인된 구독을 사용한다. cwd 의 CLAUDE.md 자동 로드.
+Runs a single Claude Code "lead" session that dispatches the role as a native
+subagent via the Task tool. The role definition is loaded from the target's
+`.claude/agents/<role>.md` (exposed at scaffold time). Subscription or API key.
 """
 
 from __future__ import annotations
@@ -13,25 +14,29 @@ import shutil
 from .base import Backend, RoleRequest, RoleResult
 
 
-class ClaudeCLIBackend(Backend):
-    name = "claude-cli"
+class ClaudeTeamBackend(Backend):
+    name = "claude-team"
 
     def available(self) -> tuple[bool, str]:
         if not shutil.which("claude"):
             return False, "claude CLI 미설치 (npm i -g @anthropic-ai/claude-code)"
-        return True, "ready (로그인 구독 또는 ANTHROPIC_API_KEY)"
+        return True, "ready (native subagent dispatch)"
 
     async def run_role(self, req: RoleRequest) -> RoleResult:
+        lead_prompt = (
+            "You are the team lead orchestrating specialists. Use the Task tool to delegate "
+            f"the following task to the `{req.role}` subagent, then report its result. "
+            f"Do not do the work yourself — the `{req.role}` subagent must do it.\n\n"
+            f"{req.prompt}"
+        )
         cmd = [
             "claude",
             "-p",
-            req.prompt,
+            lead_prompt,
             "--output-format",
             "json",
-            "--append-system-prompt",
-            req.system_prompt,
             "--allowedTools",
-            ",".join(req.allowed_tools),
+            "Task,Read,Write,Edit,Bash",
             "--permission-mode",
             "acceptEdits",
         ]

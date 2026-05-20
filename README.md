@@ -19,7 +19,10 @@
   | Anthropic | `claude-sdk` (Claude Agent SDK) | `claude-cli` (`claude -p`) |
   | OpenAI | `openai-agents` (OpenAI Agents SDK) | `codex` (`codex exec`) |
 
-  무비용 검증용 `mock` 백엔드 포함.
+  추가로 네이티브 Team Agents 리드 디스패치용 `claude-team`, 무비용 검증용 `mock` 백엔드 포함.
+- **Team Agents (네이티브 서브에이전트, 두 방식)**: 같은 `.claude/agents/*.md` 정의를 실제 Claude Code 서브에이전트로도 활용한다.
+  - **리드 디스패치 (`--backend claude-team`)**: 리드 세션이 `Task` 툴로 각 역할 서브에이전트를 네이티브 디스패치.
+  - **역할 내 위임 (`--delegate`)**: 역할 세션이 동료(예: backend→dba)를 서브에이전트로 호출(깊이 1). claude-sdk 는 `ClaudeAgentOptions(agents=...)`, CLI 계열은 타깃 `.claude/agents/`(스캐폴딩 시 노출) + `Task` 툴로 동작.
 - **조정 = 공유 보드**: `<project-dir>/.orchestrator/board.json` 의 단일 writer 는 오케스트레이터.
   역할 세션은 타깃 파일을 편집하고 결과 JSON 만 남긴다(4종 공통 "cwd 파일 편집" 계약).
 
@@ -73,11 +76,14 @@ python -m orchestrator --spec examples/specs/sample-spec.md --project-dir /tmp/d
 |---|---|
 | `--spec PATH` | 기획서 마크다운 (필수) |
 | `--project-dir PATH` | 산출물 타깃 디렉터리 (필수). 새 디렉터리 권장 |
-| `--backend NAME` | 전역 기본 백엔드 (`claude-sdk`/`claude-cli`/`openai-agents`/`codex`/`mock`) |
+| `--backend NAME` | 전역 기본 백엔드 (`claude-sdk`/`claude-cli`/`claude-team`/`openai-agents`/`codex`/`mock`) |
 | `--role-backend ROLE=BACKEND` | 역할별 override (반복 가능) |
+| `--delegate` | 역할 세션이 팀원을 네이티브 서브에이전트로 위임 호출 (Claude 백엔드) |
 | `--mock` | 모든 역할을 mock 으로 (무비용) |
 | `--concurrency N` | 동시 처리 unit 수 (기본 3) |
 | `--max-units N` | 처리할 unit 수 상한 |
+| `--max-attempts N` | unit별 dev→test→qa 재작업 횟수 (기본 2) |
+| `--retries N` | 역할 호출 전이성 실패 재시도 횟수 (기본 1) |
 | `--budget USD` | 세션당 예산 상한 (지원 백엔드) |
 | `--model NAME` | 모델 override |
 | `--poll-interval SEC` | PM/PL 감독 주기 (기본 20초) |
@@ -88,10 +94,11 @@ python -m orchestrator --spec examples/specs/sample-spec.md --project-dir /tmp/d
 ```
 <project-dir>/
   CLAUDE.md  AGENTS.md          # 스캐폴딩된 공유 지침
+  .claude/agents/*.md           # 노출된 팀 에이전트 (네이티브 서브에이전트)
   docs/design/  docs/test/      # 설계 / 테스트 시트
   backend/  frontend/  db/  tests/
   .github/workflows/ci.yml
-  .orchestrator/                # 런 상태 (board.json, events.log, results/, directives.md)
+  .orchestrator/                # 런 상태 (board.json, events.log, results/, directives.md, report.md)
 ```
 
 ## 안전장치

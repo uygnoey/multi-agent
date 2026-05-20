@@ -4,6 +4,7 @@ Shared protocol (coding conventions, stack, result-file contract) already lives 
 the target's CLAUDE.md/AGENTS.md, so here we only compose the task instruction.
 This text is injected into every role call, so keep it concise and in English.
 """
+
 from __future__ import annotations
 
 _ROLE_INSTRUCTION = {
@@ -77,7 +78,8 @@ def compose_prompt(
         '{"status": "...", "artifacts": ["relative/path", ...], "notes": ["..."], '
         '"blockers": [], "units": []}\n'
         "```\n"
-        "- Most roles: set status to done/dev_done/tested as appropriate; artifacts = files created/edited.\n"
+        "- Most roles: set status to done/dev_done/tested as appropriate; "
+        "artifacts = files created/edited.\n"
         "- Architect only: include a `units` array of "
         '[{"id","title","description","deps":[],"roles":[]}].'
     )

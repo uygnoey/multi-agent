@@ -3,6 +3,7 @@
 pip install claude-agent-sdk / 인증 ANTHROPIC_API_KEY.
 import 는 lazy — 패키지가 없어도 모듈 로드/--check 는 동작한다.
 """
+
 from __future__ import annotations
 
 import os
@@ -31,6 +32,32 @@ def _make_options(cls, **kwargs):
                         break
             if not removed:
                 raise
+
+
+def _build_agents(teammates: list[dict]):
+    """Build {name: AgentDefinition} for SDK subagent delegation (resilient to signature)."""
+    try:
+        from claude_agent_sdk import AgentDefinition
+    except Exception:
+        return None
+    out = {}
+    for t in teammates:
+        kwargs = {
+            "description": t.get("description", t["name"]),
+            "prompt": t.get("prompt", ""),
+            "tools": t.get("tools", []),
+        }
+        if t.get("model"):
+            kwargs["model"] = t["model"]
+        try:
+            out[t["name"]] = AgentDefinition(**kwargs)
+        except TypeError:
+            kwargs.pop("model", None)
+            try:
+                out[t["name"]] = AgentDefinition(**kwargs)
+            except Exception:
+                return None
+    return out or None
 
 
 def _extract_text(msg) -> str:
@@ -79,6 +106,12 @@ class ClaudeSDKBackend(Backend):
             kwargs["model"] = req.model
         if req.budget is not None:
             kwargs["max_budget_usd"] = req.budget
+        if req.delegate and req.teammates:
+            agents = _build_agents(req.teammates)
+            if agents:
+                kwargs["agents"] = agents
+                if "Task" not in kwargs["allowed_tools"]:
+                    kwargs["allowed_tools"].append("Task")
         options = _make_options(ClaudeAgentOptions, **kwargs)
 
         final, cost = "", None

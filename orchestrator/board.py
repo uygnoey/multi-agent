@@ -3,6 +3,7 @@
 오케스트레이터만 이 파일을 갱신한다. 역할 세션은 타깃 repo 파일을 편집하고
 결과 JSON 만 남기며, 그 결과를 읽어 보드를 전이시키는 것은 오케스트레이터다.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -41,9 +42,7 @@ class Board:
     # ---- persistence ----
     def _flush(self) -> None:
         tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        tmp.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.path)
 
     async def init(self, spec_text: str, stack: dict) -> None:
@@ -55,6 +54,7 @@ class Board:
                 "spec_excerpt": spec_text[:2000],
                 "stack": stack,
                 "phase": "init",
+                "total_cost_usd": 0.0,
                 "units": [],
             }
             self._flush()
@@ -118,6 +118,40 @@ class Board:
         async with self._lock:
             self._data["phase"] = phase
             self._flush()
+
+    async def add_cost(self, amount: float) -> None:
+        async with self._lock:
+            self._data["total_cost_usd"] = round(
+                self._data.get("total_cost_usd", 0.0) + float(amount), 6
+            )
+            self._flush()
+
+    def write_report(self) -> Path:
+        """Write a human-readable run report to .orchestrator/report.md."""
+        d = self._data
+        units = d.get("units", [])
+        done = sum(1 for u in units if u["status"] == "done")
+        lines = [
+            "# Run Report",
+            "",
+            f"- phase: **{d.get('phase')}**",
+            f"- units done: **{done}/{len(units)}**",
+            f"- total cost: **${d.get('total_cost_usd', 0.0):.4f}**",
+            f"- stack: {d.get('stack')}",
+            "",
+            "## Units",
+            "",
+            "| id | status | test | artifacts | title |",
+            "|----|--------|------|-----------|-------|",
+        ]
+        for u in units:
+            lines.append(
+                f"| {u['id']} | {u['status']} | {u.get('test_status')} | "
+                f"{len(u.get('artifacts', []))} | {u.get('title', '')} |"
+            )
+        report = self.orch_dir / "report.md"
+        report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return report
 
     # ---- reads (best-effort snapshots) ----
     def units(self) -> list[dict]:

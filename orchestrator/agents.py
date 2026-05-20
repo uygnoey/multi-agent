@@ -3,6 +3,7 @@
 frontmatter 가 단순(name/description/tools/model)하므로 pyyaml 없이도 동작하는
 경량 파서를 쓴다. pyyaml 이 설치돼 있으면 그것을 우선 사용한다.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass

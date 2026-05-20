@@ -3,9 +3,10 @@
 모든 백엔드는 동일 계약을 따른다: 역할 세션이 타깃 cwd 안의 파일을 편집하고,
 필요하면 결과 JSON 을 result_path 에 남긴다. 오케스트레이터가 그것을 읽는다.
 """
+
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,9 @@ class RoleRequest:
     result_path: Path  # 절대경로
     result_rel: str  # cwd 기준 상대경로
     spec_text: str
+    delegate: bool = False
+    # 위임 가능 팀원 정의: [{name, description, prompt, tools, model}]
+    teammates: list[dict] = field(default_factory=list)
 
 
 @dataclass

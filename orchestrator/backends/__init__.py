@@ -1,9 +1,11 @@
 """백엔드 레지스트리: 이름 → 인스턴스, + 가용성 조회."""
+
 from __future__ import annotations
 
 from .base import Backend, RoleRequest, RoleResult
 from .claude_cli import ClaudeCLIBackend
 from .claude_sdk import ClaudeSDKBackend
+from .claude_team import ClaudeTeamBackend
 from .codex_cli import CodexCLIBackend
 from .mock import MockBackend
 from .openai_agents import OpenAIAgentsBackend
@@ -14,6 +16,7 @@ _REGISTRY: dict[str, Backend] = {
         MockBackend(),
         ClaudeSDKBackend(),
         ClaudeCLIBackend(),
+        ClaudeTeamBackend(),
         OpenAIAgentsBackend(),
         CodexCLIBackend(),
     ]
