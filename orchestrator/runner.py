@@ -230,6 +230,23 @@ class Runner:
         }
 
 
+# 성공으로 인정하는 status (이외의 값은 fail/failure/error/incomplete 등으로 보고 _ok=False)
+_SUCCESS_STATUSES = frozenset(
+    {
+        "done",
+        "designed",
+        "dev_done",
+        "tested",
+        "pass",
+        "passed",
+        "ok",
+        "success",
+        "complete",
+        "completed",
+    }
+)
+
+
 def _as_list(v) -> list:
     if isinstance(v, list):
         return v
@@ -248,7 +265,8 @@ def _coerce_result(data: dict, res) -> dict:
         data = {}
     status = str(data.get("status") or ("done" if res.ok else "failed")).strip().lower()
     blockers = [str(b) for b in _as_list(data.get("blockers"))]
-    ok = res.ok and status not in ("failed", "blocked", "error") and not blockers
+    # 실패 변형(fail/failure/error/...)을 다 나열하기보다 성공 status 만 허용(whitelist)
+    ok = res.ok and status in _SUCCESS_STATUSES and not blockers
     return {
         "status": status,
         "artifacts": [str(a) for a in _as_list(data.get("artifacts"))],

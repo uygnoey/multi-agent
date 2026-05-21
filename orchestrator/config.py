@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -63,6 +64,16 @@ ROLE_NAME_ALIASES = {
     "backend-dev": "backend-developer",
     "db": "dba",
     "database": "dba",
+    "database-admin": "dba",
+    "db-admin": "dba",
+    "dba-engineer": "dba",
+    "devops": "cicd",
+    "devops-engineer": "cicd",
+    "docs": "docs-writer",
+    "doc": "docs-writer",
+    "documentation": "docs-writer",
+    "writer": "docs-writer",
+    "tech-writer": "docs-writer",
     "testsheet": "testsheet-creator",
     "test-sheet": "testsheet-creator",
     "test": "test-engineer",
@@ -82,7 +93,11 @@ ROLE_NAME_ALIASES = {
 
 
 def normalize_role(name: str) -> str:
+    # 공백/언더스코어/슬래시 등 구분자를 하이픈으로 통일 → "backend developer"/"backend_developer"/
+    # "front end" 같은 흔한 변형도 매칭. (예: "front end" → "front-end" 별칭 → frontend-developer)
     n = str(name).strip().lower()
+    n = re.sub(r"[\s_/]+", "-", n)
+    n = re.sub(r"-{2,}", "-", n).strip("-")
     if n in ROLES:
         return n
     return ROLE_NAME_ALIASES.get(n, n)
@@ -149,6 +164,15 @@ class RunConfig:
     distribute: bool = False
     # True 면 미핀 역할을 풀에 번갈아(교차) 배정 → 두 모델이 섞여 상호 검증. distribute 보다 우선.
     cross_check: bool = False
+
+    def __post_init__(self):
+        # 숫자 옵션을 안전 범위로 정규화 (CLI/웹 어디서 와도 crash/hang/오작동 방지; 웹과 동작 일치)
+        self.concurrency = max(1, int(self.concurrency))
+        self.max_attempts = max(1, int(self.max_attempts))
+        self.retries = max(0, int(self.retries))
+        if self.max_units is not None:
+            mu = int(self.max_units)
+            self.max_units = mu if mu > 0 else None  # 0/음수 → 제한 없음
 
     def backends_for(self, role: str) -> list[str]:
         """역할에 대한 백엔드 후보를 우선순위 순서로 반환 (폴오버용)."""
