@@ -51,6 +51,11 @@ def build_command(py: str, spec_path: Path, project_dir: Path, opts: dict) -> li
         "--poll-interval",
         "600",
     ]
+    backends = opts.get("backends")
+    if backends:
+        cmd += ["--backends", ",".join(backends) if isinstance(backends, list) else str(backends)]
+    if opts.get("distribute"):
+        cmd.append("--distribute")
     if opts.get("mock"):
         cmd.append("--mock")
     if opts.get("delegate"):
@@ -169,6 +174,10 @@ def _make_handler(manager: RunManager):
             if backend not in VALID_BACKENDS:
                 self._json({"error": f"invalid backend: {backend}"}, 400)
                 return
+            for b in data.get("backends") or []:
+                if b not in VALID_BACKENDS:
+                    self._json({"error": f"invalid backend in priority list: {b}"}, 400)
+                    return
             run_id = manager.start(data.get("spec_text", ""), data)
             self._json({"run_id": run_id})
 
@@ -255,9 +264,14 @@ INDEX_HTML = r"""<!doctype html>
       <div><label>max-units (선택)</label><input type="text" id="maxUnits" placeholder="전체"/></div>
       <div><label>max-attempts</label><input type="text" id="maxAttempts" value="2"/></div>
     </div>
+    <div class="row">
+      <div style="flex:4"><label>백엔드 우선순위 (콤마 · 비우면 위 단일 백엔드)</label>
+        <input type="text" id="backends" placeholder="claude-cli,codex,claude-sdk,openai-agents"/></div>
+    </div>
     <div class="row" style="margin-top:10px;align-items:center">
       <label style="margin:0"><input type="checkbox" id="mock" checked/> mock (무비용)</label>
       <label style="margin:0"><input type="checkbox" id="delegate"/> delegate (팀 위임)</label>
+      <label style="margin:0"><input type="checkbox" id="distribute"/> distribute (풀 분산)</label>
       <span style="flex:1"></span>
       <button id="runBtn" onclick="startRun()">▶ 실행</button>
     </div>
@@ -299,8 +313,10 @@ async function startRun(){
   if(!f){$("launchMsg").textContent="기획서 파일을 선택하세요.";return}
   const spec_text=await f.text();
   $("runBtn").disabled=true;$("launchMsg").textContent="실행 시작 중…";
+  const blist=$("backends").value.split(",").map(s=>s.trim()).filter(Boolean);
   const body={spec_text,name:$("name").value||f.name.replace(/\.[^.]+$/,""),
-    backend:$("backend").value,concurrency:+$("concurrency").value||3,
+    backend:$("backend").value,backends:blist.length?blist:null,distribute:$("distribute").checked,
+    concurrency:+$("concurrency").value||3,
     max_units:$("maxUnits").value?+$("maxUnits").value:null,
     max_attempts:+$("maxAttempts").value||2,mock:$("mock").checked,delegate:$("delegate").checked};
   const r=await fetch("/api/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});

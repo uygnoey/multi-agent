@@ -20,6 +20,17 @@
   | OpenAI | `openai-agents` (OpenAI Agents SDK) | `codex` (`codex exec`) |
 
   추가로 네이티브 Team Agents 리드 디스패치용 `claude-team`, 무비용 검증용 `mock` 백엔드 포함.
+- **4종 동시 사용 + 우선순위 + 폴오버**: 한 런에서 백엔드를 풀로 묶어 동시에 쓴다.
+  ```bash
+  # 우선순위(폴오버): claude-cli 우선, 실패 시 codex→claude-sdk→openai-agents
+  --backends claude-cli,codex,claude-sdk,openai-agents
+  # 분산: 역할마다 다른 백엔드를 1순위로 라운드로빈 → 4종 동시 가동(+폴오버 유지)
+  --backends claude-cli,codex,claude-sdk,openai-agents --distribute
+  # 역할별 우선순위 지정도 가능
+  --role-backend frontend-developer=codex,claude-cli --role-backend dba=claude-sdk
+  ```
+  선택 규칙: 역할별 우선순위 > `--backends` 풀(분산 시 회전) > `--backend` 단일. 가용하지 않은
+  백엔드는 자동 스킵, 호출 실패 시 다음 우선순위로 폴오버한다(모니터/`events.log`에 표시).
 - **Team Agents (네이티브 서브에이전트, 두 방식)**: 같은 `.claude/agents/*.md` 정의를 실제 Claude Code 서브에이전트로도 활용한다.
   - **리드 디스패치 (`--backend claude-team`)**: 리드 세션이 `Task` 툴로 각 역할 서브에이전트를 네이티브 디스패치.
   - **역할 내 위임 (`--delegate`)**: 역할 세션이 동료(예: backend→dba)를 서브에이전트로 호출(깊이 1). claude-sdk 는 `ClaudeAgentOptions(agents=...)`, CLI 계열은 타깃 `.claude/agents/`(스캐폴딩 시 노출) + `Task` 툴로 동작.
@@ -76,8 +87,10 @@ python -m orchestrator --spec examples/specs/sample-spec.md --project-dir /tmp/d
 |---|---|
 | `--spec PATH` | 기획서 마크다운 (필수) |
 | `--project-dir PATH` | 산출물 타깃 디렉터리 (필수). 새 디렉터리 권장 |
-| `--backend NAME` | 전역 기본 백엔드 (`claude-sdk`/`claude-cli`/`claude-team`/`openai-agents`/`codex`/`mock`) |
-| `--role-backend ROLE=BACKEND` | 역할별 override (반복 가능) |
+| `--backend NAME` | 전역 기본 백엔드 (단일). `--backends` 미지정 시 사용 |
+| `--backends B1,B2,...` | **우선순위 풀**: 앞에서부터 가용 백엔드 사용, 실패 시 다음으로 폴오버 |
+| `--distribute` | 역할들을 풀에 라운드로빈 **분산**(4종 동시 가동) |
+| `--role-backend ROLE=B1[,B2,...]` | 역할별 백엔드(우선순위 리스트) override (반복 가능) |
 | `--delegate` | 역할 세션이 팀원을 네이티브 서브에이전트로 위임 호출 (Claude 백엔드) |
 | `--mock` | 모든 역할을 mock 으로 (무비용) |
 | `--concurrency N` | 동시 처리 unit 수 (기본 3) |
