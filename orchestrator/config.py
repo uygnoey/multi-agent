@@ -112,22 +112,6 @@ BACKEND_INFO = {
 DELEGATION_CAPABLE = ("claude-sdk", "claude-cli", "claude-team")
 DELEGATION_TOOL = "Task"
 
-# 교차 검증(--cross-check): 생산자(build)와 검증자(verify)를 서로 다른 프로바이더에 배치.
-# 풀 [P0, P1] 기준 build→P0, verify→P1 (실패 시 상대 프로바이더로 폴오버).
-# → 개발(build)을 한 프로바이더가, 그 결과 검증(verify)을 다른 프로바이더가 맡아 교차 검증.
-CROSS_GROUPS: dict[str, str] = {
-    "architecture-engineer": "build",
-    "frontend-developer": "build",
-    "backend-developer": "build",
-    "dba": "build",
-    "project-manager": "build",
-    "testsheet-creator": "verify",
-    "test-engineer": "verify",
-    "qa": "verify",
-    "project-leader": "verify",  # PL은 검토자 → PM과 반대 프로바이더
-    "cicd": "verify",
-}
-
 # Which teammates a role may delegate to when --delegate is on (depth-1 only).
 DELEGATES: dict[str, tuple[str, ...]] = {
     "backend-developer": ("dba",),
@@ -176,8 +160,11 @@ class RunConfig:
             # 풀을 역할별 선택값까지 합쳐 추론 (예: 기본 claude + QA=codex → {claude, codex})
             pool = self._cross_pool(base)
             if len(pool) >= 2:
-                build_side, verify_side = self._cross_sides(pool)
-                primary = build_side if CROSS_GROUPS.get(role, "build") == "build" else verify_side
+                # 핀(role_priority)은 위에서 early-return. 여기 오는 역할은 미핀이므로
+                # 미핀 역할들을 ROLES 순서로 번갈아(교차) 배정한다. (그룹 하드코딩 없음)
+                unpinned = [r for r in ROLES if not self.role_priority.get(r)]
+                idx = unpinned.index(role) if role in unpinned else 0
+                primary = pool[idx % len(pool)]
                 return [primary, *[b for b in pool if b != primary]]
         if self.distribute and len(base) > 1:
             try:
@@ -198,30 +185,6 @@ class RunConfig:
                 if p not in pool:
                     pool.append(p)
         return pool
-
-    def _cross_sides(self, base: list[str]) -> tuple[str, str]:
-        """교차 배치의 build/verify 측 프로바이더를 결정.
-
-        유저의 명시적 역할 선택(role_priority)을 시드로 삼는다. 예: PM(build 그룹)을
-        claude 로 골랐으면 build=claude, verify=다른 프로바이더. 아무 선택도 없으면
-        기본값 build=base[0], verify=base[1].
-        """
-        build_side = verify_side = None
-        for r, picks in self.role_priority.items():
-            if not picks or picks[0] not in base:
-                continue
-            grp = CROSS_GROUPS.get(r, "build")
-            if grp == "build" and build_side is None:
-                build_side = picks[0]
-            elif grp == "verify" and verify_side is None:
-                verify_side = picks[0]
-        if build_side and not verify_side:
-            verify_side = next((b for b in base if b != build_side), base[1])
-        if verify_side and not build_side:
-            build_side = next((b for b in base if b != verify_side), base[0])
-        if not build_side and not verify_side:
-            build_side, verify_side = base[0], base[1]
-        return build_side, verify_side
 
     def backend_for(self, role: str) -> str:
         return self.backends_for(role)[0]
