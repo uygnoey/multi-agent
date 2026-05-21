@@ -7,8 +7,8 @@ import asyncio
 import sys
 from pathlib import Path
 
-from .backends import all_backends
-from .config import DEFAULT_BACKEND, ROLES, VALID_BACKENDS, RunConfig
+from .backends import ALIASES, backend_status, resolve
+from .config import BACKEND_INFO, DEFAULT_BACKEND, ROLES, VALID_BACKENDS, RunConfig
 from .scheduler import Scheduler
 
 
@@ -20,7 +20,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--spec", type=Path, help="기획서 마크다운 경로")
     p.add_argument("--project-dir", type=Path, help="산출물을 생성할 타깃 디렉터리")
     p.add_argument(
-        "--backend", default=DEFAULT_BACKEND, choices=VALID_BACKENDS, help="전역 기본 백엔드"
+        "--backend",
+        default=DEFAULT_BACKEND,
+        choices=(*VALID_BACKENDS, *ALIASES),
+        metavar="NAME",
+        help="전역 기본 백엔드 (단일). 별칭 허용 (claude-code, openai-sdk)",
     )
     p.add_argument(
         "--backends",
@@ -70,14 +74,15 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def cmd_check() -> int:
     print("backend availability:")
-    for name, b in all_backends().items():
-        ok, reason = b.available()
-        print(f"  {'✅' if ok else '❌'} {name:<14} {reason}")
+    for s in backend_status():
+        mark = "✅" if s["ok"] else "❌"
+        info = BACKEND_INFO.get(s["name"], "")
+        print(f"  {mark} {s['name']:<14} {info:<40} {s['reason']}")
     return 0
 
 
 def _parse_backend_list(value: str) -> list[str]:
-    names = [b.strip() for b in value.split(",") if b.strip()]
+    names = [resolve(b.strip()) for b in value.split(",") if b.strip()]
     for b in names:
         if b not in VALID_BACKENDS:
             raise SystemExit(f"알 수 없는 백엔드: {b} (가능: {', '.join(VALID_BACKENDS)})")
@@ -99,7 +104,7 @@ def build_config(a: argparse.Namespace) -> RunConfig:
     return RunConfig(
         spec_path=a.spec.resolve(),
         project_dir=a.project_dir.resolve(),
-        default_backend=a.backend,
+        default_backend=resolve(a.backend),
         backend_priority=backend_priority,
         role_priority=role_priority,
         distribute=a.distribute,

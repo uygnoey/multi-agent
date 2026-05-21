@@ -23,14 +23,47 @@ _REGISTRY: dict[str, Backend] = {
 }
 
 
+# 직관적 별칭 → 정식 이름 (둘 다 허용)
+ALIASES = {
+    "claude-code": "claude-cli",
+    "claude-code-cli": "claude-cli",
+    "openai-sdk": "openai-agents",
+    "openai": "openai-agents",
+    "codex-cli": "codex",
+}
+
+
+def resolve(name: str) -> str:
+    return ALIASES.get(name, name)
+
+
 def get_backend(name: str) -> Backend:
-    if name not in _REGISTRY:
+    canonical = resolve(name)
+    if canonical not in _REGISTRY:
         raise ValueError(f"unknown backend: {name} (valid: {', '.join(_REGISTRY)})")
-    return _REGISTRY[name]
+    return _REGISTRY[canonical]
 
 
 def all_backends() -> dict[str, Backend]:
     return dict(_REGISTRY)
 
 
-__all__ = ["Backend", "RoleRequest", "RoleResult", "get_backend", "all_backends"]
+def backend_status() -> list[dict]:
+    """각 백엔드의 가용성 [{name, ok, reason}] (--check / web / TUI 공용)."""
+    out = []
+    for name, b in _REGISTRY.items():
+        ok, reason = b.available()
+        out.append({"name": name, "ok": ok, "reason": reason})
+    return out
+
+
+__all__ = [
+    "Backend",
+    "RoleRequest",
+    "RoleResult",
+    "get_backend",
+    "all_backends",
+    "backend_status",
+    "resolve",
+    "ALIASES",
+]
