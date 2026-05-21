@@ -79,6 +79,25 @@ def test_stop_without_pid_returns_false(tmp_path):
     assert m.stop("x-1") is False  # pid 없음 → False (예외 없이)
 
 
+def test_stop_kills_running_process(tmp_path):
+    import subprocess
+    import time
+
+    m = webui.RunManager(tmp_path / "runs")
+    orch = m.project_dir("r-1") / ".orchestrator"
+    orch.mkdir(parents=True)
+    proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    (orch / "run.pid").write_text(str(proc.pid), encoding="utf-8")
+
+    assert m.stop("r-1") is True
+    for _ in range(30):  # SIGTERM 으로 곧 종료
+        if proc.poll() is not None:
+            break
+        time.sleep(0.1)
+    assert proc.poll() is not None  # 실제로 종료됨
+    assert not (orch / "run.pid").exists()  # 상태 즉시 stopped
+
+
 def test_new_run_id_is_unique():
     assert webui.new_run_id("x") != webui.new_run_id("x")  # 같은 초에도 유일
 
