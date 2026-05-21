@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>멀티 에이전트 아키텍처</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo", sans-serif;
+      background: #0d1117;
+      color: #e6edf3;
+    }
+    header {
+      padding: 20px 28px;
+      border-bottom: 1px solid #30363d;
+    }
+    h1 { margin: 0; font-size: 20px; }
+    p.sub { margin: 6px 0 0; color: #8b949e; font-size: 13px; }
+    .diagram-wrap {
+      display: flex;
+      justify-content: center;
+      padding: 32px 16px 64px;
+      overflow-x: auto;
+    }
+    .mermaid { width: 100%; max-width: 1100px; }
+    footer { text-align: center; color: #6e7681; font-size: 12px; padding-bottom: 32px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>플랫폼 개발 멀티 에이전트 오케스트레이션</h1>
+    <p class="sub">기획서 → 공유 보드 기반 협업 · 상시 감독 + 3단계 병렬 워크플로우</p>
+  </header>
+
+  <div class="diagram-wrap">
+    <pre class="mermaid">
+flowchart TB
+    SPEC["기획서<br/>docs/planning/spec.md"] --> BOARD[("공유 보드<br/>.orchestrator/board.json<br/>+ board MCP 툴")]
+
+    subgraph SUP["상시 감독 (persistent asyncio tasks)"]
+        PM["1. Project Manager<br/>ClaudeSDKClient 루프"]
+        PL["2. Project Leader<br/>ClaudeSDKClient 루프"]
+    end
+    PM <--> BOARD
+    PL <--> BOARD
+
+    subgraph A["Phase A — 병렬"]
+        ARCH["3. Architecture Engineer<br/>설계 + 작업단위 분해"]
+        TS["7. Testsheet Creator<br/>기획서 기반 E2E 시트"]
+    end
+    BOARD --> ARCH --> BOARD
+    BOARD --> TS --> BOARD
+
+    subgraph B["Phase B — unit별 동시 개발"]
+        FE["4. Frontend"]
+        BE["5. Backend"]
+        DBA["9. DBA"]
+    end
+    BOARD -->|"status=designed"| FE & BE & DBA
+    FE & BE & DBA -->|"status=dev_done"| BOARD
+
+    subgraph C["Phase C — unit 완료 시 트리거"]
+        TEST["8. Test Engineer<br/>테스트 코드"]
+        QA["6. QA<br/>실행 + 검증"]
+    end
+    BOARD -->|"dev_done"| TEST --> QA -->|"tested/done"| BOARD
+
+    CICD["10. CI/CD<br/>파이프라인"] <--> BOARD
+    </pre>
+  </div>
+
+  <footer>마우스 휠/트랙패드로 가로 스크롤 · 확대는 브라우저 ⌘+ / ⌘-</footer>
+
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "dark",
+      flowchart: { useMaxWidth: true, htmlLabels: true, curve: "basis" }
+    });
+  </script>
+</body>
+</html>

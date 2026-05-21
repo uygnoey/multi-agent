@@ -1,0 +1,19 @@
+# OS / editor
+.DS_Store
+
+# Local Claude Code settings (per-user)
+.claude/settings.local.json
+
+# Framework repo
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.egg-info/
+build/
+dist/
+
+# Local run outputs / demo targets
+runs/
+/tmp-demo/
