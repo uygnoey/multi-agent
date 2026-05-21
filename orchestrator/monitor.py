@@ -16,6 +16,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
+import subprocess
+import sys
+import threading
 import unicodedata
 from pathlib import Path
 
@@ -33,6 +37,58 @@ def _run_alive(orch_dir: Path) -> bool:
     except (OSError, ValueError):
         return False
     return True
+
+
+def _stop_run(orch_dir: Path) -> bool:
+    """run.pid 프로세스 그룹 종료 (SIGTERM → 4s 후 SIGKILL). 웹 stop 과 동일 기준."""
+    pf = orch_dir / "run.pid"
+    if not pf.exists():
+        return False
+    try:
+        pid = int(pf.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        pgid = os.getpgid(pid)
+    except Exception:
+        pgid = None
+
+    def _kill(sig):
+        try:
+            os.killpg(pgid, sig) if pgid is not None else os.kill(pid, sig)
+        except Exception:
+            pass
+
+    _kill(signal.SIGTERM)
+    threading.Timer(4.0, lambda: _kill(signal.SIGKILL)).start()
+    try:
+        pf.unlink()
+    except Exception:
+        pass
+    return True
+
+
+def _rerun(orch_dir: Path) -> tuple[bool, str]:
+    """저장된 rerun.json(argv)으로 같은 project-dir 에서 오케스트레이터를 다시 실행."""
+    f = orch_dir / "rerun.json"
+    if not f.exists():
+        return False, "재실행 정보 없음 (rerun.json 없음 — 이 run 은 재실행 불가)"
+    try:
+        argv = json.loads(f.read_text(encoding="utf-8")).get("argv") or []
+    except Exception:
+        return False, "rerun.json 파싱 실패"
+    if not argv:
+        return False, "재실행 인자 없음"
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "orchestrator", *argv],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        return True, "재실행 시작됨 — 곧 갱신됩니다"
+    except Exception as e:
+        return False, f"재실행 실패: {e}"
 
 
 def _read_board(orch_dir: Path) -> dict:
@@ -182,11 +238,12 @@ def _draw_list(stdscr, board, roles, sel, orch_dir, alive) -> None:
         attr = curses.A_REVERSE if i == sel else (curses.A_BOLD if running else 0)
         _safe_add(stdscr, row + i, 1, line, attr)
 
+    action = "s: stop" if alive else "r: rerun"
     _safe_add(
         stdscr,
         h - 1,
         0,
-        " ↑/↓ move   Enter: open   a: artifacts   c: backends   q: quit ",
+        f" ↑/↓ move  Enter: open  {action}  a: artifacts  c: backends  q: quit ",
         curses.A_REVERSE,
     )
 
@@ -299,6 +356,7 @@ def run_tui(project_dir: Path, interval: float = 1.0) -> None:
         scroll = 0
         detail_follow = True  # 상세 로그: 기본은 최신 따라가기(스트리밍)
         max_scroll = 0
+        status_msg = ""
         while True:
             board = _read_board(orch)
             alive = _run_alive(orch)
@@ -319,6 +377,9 @@ def run_tui(project_dir: Path, interval: float = 1.0) -> None:
                 scroll, max_scroll = _draw_detail(
                     stdscr, board, orch, detail_role, scroll, detail_follow
                 )
+            if status_msg and mode in ("list", "detail"):
+                hh, _ww = stdscr.getmaxyx()
+                _safe_add(stdscr, hh - 2, 1, "→ " + status_msg, curses.A_BOLD)
             stdscr.refresh()
 
             try:
@@ -350,6 +411,18 @@ def run_tui(project_dir: Path, interval: float = 1.0) -> None:
                     mode, scroll = "artifacts", 0
                 elif c == ord("c"):
                     mode = "backends"
+                elif c == ord("s"):  # 정지 (실행 중일 때만)
+                    if alive:
+                        status_msg = (
+                            "정지 요청됨 (SIGTERM→SIGKILL)" if _stop_run(orch) else "정지 실패"
+                        )
+                    else:
+                        status_msg = "이미 정지 상태"
+                elif c == ord("r"):  # 재실행 (정지 상태에서만)
+                    if alive:
+                        status_msg = "실행 중 — 먼저 s 로 정지하세요"
+                    else:
+                        _, status_msg = _rerun(orch)
             else:  # detail: 기본은 최신 따라가기, ↑로 보면 멈춤, G 로 다시 따라가기
                 if c in (ord("b"), 27, curses.KEY_LEFT):
                     mode = "list"

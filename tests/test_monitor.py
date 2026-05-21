@@ -47,3 +47,17 @@ def test_wrap_line_soft_wraps_by_display_width():
     assert _wrap_line("abcdefghij", 4) == ["abcd", "efgh", "ij"]  # ASCII
     assert _wrap_line("가나다", 4) == ["가나", "다"]  # CJK 폭 2칸
     assert _wrap_line("", 10) == [""]  # 빈 줄 유지
+
+
+def test_tui_stop_and_rerun_helpers(tmp_path):
+    from orchestrator.monitor import _rerun, _stop_run
+
+    orch = tmp_path / ".orchestrator"
+    orch.mkdir()
+    assert _stop_run(orch) is False  # run.pid 없음 → False (예외 없이)
+    ok, msg = _rerun(orch)
+    assert ok is False and ("재실행" in msg or "rerun" in msg.lower())  # rerun.json 없음
+    (orch / "rerun.json").write_text('{"argv":["--help"]}', encoding="utf-8")
+    # rerun.json 있으면 launch 시도 (argv 파싱 성공 경로)
+    ok2, _ = _rerun(orch)
+    assert ok2 is True

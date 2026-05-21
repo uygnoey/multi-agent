@@ -379,6 +379,14 @@ def _make_handler(manager: RunManager):
             if u.path == "/api/rerun":
                 run = data.get("run", "")
                 try:
+                    alive = bool(run) and manager.is_running(run)
+                except ValueError:
+                    self._json({"error": "invalid run id"}, 400)
+                    return
+                if not run or alive:
+                    self._json({"error": "실행 중인 run 은 재실행 불가 — 먼저 정지하세요"}, 409)
+                    return
+                try:
                     rid = manager.rerun(run)
                 except ValueError:
                     self._json({"error": "invalid run id"}, 400)
@@ -647,7 +655,8 @@ async function tick(){
     const runN=(s.roles||[]).filter(r=>(ag[r]||{}).status==="running").length;
     $("runCount").textContent=runN+"개";
     $("running").textContent=s.running?"running":"stopped";
-    $("stopBtn").style.display=s.running?"":"none";
+    $("stopBtn").style.display=s.running?"":"none";       // 실행 중에만 정지
+    $("rerunBtn").style.display=s.running?"none":"";      // 정지 상태에서만 재실행
     // 에이전트 카드 — 각 카드에 모델·비용·유닛 + 실시간 로그(프롬프트·스트리밍·결과)
     const logs=s.agent_logs||{};
     $("agentCards").innerHTML=(s.roles||[]).map(r=>{const a=ag[r]||{};
