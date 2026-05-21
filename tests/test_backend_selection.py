@@ -66,6 +66,35 @@ def test_cross_check_splits_build_and_verify():
     assert sorted(cfg.backends_for("qa")) == sorted(pool)
 
 
+def test_cross_check_seeded_by_user_pick():
+    # 유저가 PM=claude-cli 만 골랐고 나머지는 auto → 이 선택을 시드로 교차 배치.
+    pool = ["codex", "claude-cli"]
+    cfg = _cfg(
+        backend_priority=pool,
+        cross_check=True,
+        role_priority={"project-manager": ["claude-cli"]},
+    )
+    # 명시 선택은 그대로
+    assert cfg.backends_for("project-manager")[0] == "claude-cli"
+    # PM(build 그룹)=claude → build측=claude, verify측=codex
+    assert cfg.backends_for("backend-developer")[0] == "claude-cli"  # build
+    assert cfg.backends_for("dba")[0] == "claude-cli"  # build
+    assert cfg.backends_for("project-leader")[0] == "codex"  # verify (PM과 반대)
+    assert cfg.backends_for("qa")[0] == "codex"  # verify
+    assert cfg.backends_for("test-engineer")[0] == "codex"  # verify
+
+
+def test_explicit_picks_always_win():
+    # 유저가 각 역할을 다 골랐으면 cross_check 와 무관하게 그 선택을 따른다.
+    cfg = _cfg(
+        backend_priority=["codex", "claude-cli"],
+        cross_check=True,
+        role_priority={"qa": ["codex"], "backend-developer": ["claude-cli"]},
+    )
+    assert cfg.backends_for("qa") == ["codex"]
+    assert cfg.backends_for("backend-developer") == ["claude-cli"]
+
+
 class _FakeBackend:
     def __init__(self, name, ok):
         self.name = name

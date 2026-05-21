@@ -172,7 +172,8 @@ class RunConfig:
             return [self.role_backend[role]]
         base = list(self.backend_priority) if self.backend_priority else [self.default_backend]
         if self.cross_check and len(base) >= 2:
-            primary = base[0] if CROSS_GROUPS.get(role, "build") == "build" else base[1]
+            build_side, verify_side = self._cross_sides(base)
+            primary = build_side if CROSS_GROUPS.get(role, "build") == "build" else verify_side
             return [primary, *[b for b in base if b != primary]]
         if self.distribute and len(base) > 1:
             try:
@@ -181,6 +182,30 @@ class RunConfig:
                 idx = 0
             base = base[idx:] + base[:idx]
         return base
+
+    def _cross_sides(self, base: list[str]) -> tuple[str, str]:
+        """교차 배치의 build/verify 측 프로바이더를 결정.
+
+        유저의 명시적 역할 선택(role_priority)을 시드로 삼는다. 예: PM(build 그룹)을
+        claude 로 골랐으면 build=claude, verify=다른 프로바이더. 아무 선택도 없으면
+        기본값 build=base[0], verify=base[1].
+        """
+        build_side = verify_side = None
+        for r, picks in self.role_priority.items():
+            if not picks or picks[0] not in base:
+                continue
+            grp = CROSS_GROUPS.get(r, "build")
+            if grp == "build" and build_side is None:
+                build_side = picks[0]
+            elif grp == "verify" and verify_side is None:
+                verify_side = picks[0]
+        if build_side and not verify_side:
+            verify_side = next((b for b in base if b != build_side), base[1])
+        if verify_side and not build_side:
+            build_side = next((b for b in base if b != verify_side), base[0])
+        if not build_side and not verify_side:
+            build_side, verify_side = base[0], base[1]
+        return build_side, verify_side
 
     def backend_for(self, role: str) -> str:
         return self.backends_for(role)[0]

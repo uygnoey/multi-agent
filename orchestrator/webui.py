@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .backends import backend_status
+from .backends import backend_status, resolve
 from .config import BACKEND_INFO, FRAMEWORK_ROOT, ROLES, VALID_BACKENDS
 from .monitor import _read_agent_log, _read_board
 
@@ -55,6 +55,9 @@ def build_command(py: str, spec_path: Path, project_dir: Path, opts: dict) -> li
     backends = opts.get("backends")
     if backends:
         cmd += ["--backends", ",".join(backends) if isinstance(backends, list) else str(backends)]
+    for role, prov in (opts.get("role_backends") or {}).items():
+        if prov:
+            cmd += ["--role-backend", f"{role}={prov}"]
     if opts.get("distribute"):
         cmd.append("--distribute")
     if opts.get("cross_check"):
@@ -146,7 +149,7 @@ def _make_handler(manager: RunManager):
                 rows = backend_status()
                 for r in rows:
                     r["info"] = BACKEND_INFO.get(r["name"], "")
-                self._json({"backends": rows})
+                self._json({"backends": rows, "roles": list(ROLES)})
             elif u.path == "/api/state":
                 run = (q.get("run") or [""])[0]
                 board = _read_board(manager.project_dir(run) / ".orchestrator") if run else {}
@@ -185,6 +188,13 @@ def _make_handler(manager: RunManager):
             for b in data.get("backends") or []:
                 if b not in VALID_BACKENDS:
                     self._json({"error": f"invalid backend in priority list: {b}"}, 400)
+                    return
+            for role, prov in (data.get("role_backends") or {}).items():
+                if role not in ROLES:
+                    self._json({"error": f"invalid role: {role}"}, 400)
+                    return
+                if prov and resolve(prov) not in VALID_BACKENDS:
+                    self._json({"error": f"invalid backend for {role}: {prov}"}, 400)
                     return
             run_id = manager.start(data.get("spec_text", ""), data)
             self._json({"run_id": run_id})
@@ -277,6 +287,10 @@ INDEX_HTML = r"""<!doctype html>
         <input type="text" id="backends" placeholder="claude-cli,codex,claude-sdk,openai-agents"/></div>
     </div>
     <div id="backendStatus" class="muted" style="margin-top:8px;font-size:12px">백엔드 상태 확인 중…</div>
+    <details style="margin-top:8px">
+      <summary class="muted" style="cursor:pointer">역할별 프로바이더 직접 지정 (auto = 미지정 → cross-check 시 교차 배치)</summary>
+      <div id="roleGrid" class="row" style="flex-wrap:wrap;margin-top:8px"></div>
+    </details>
     <div class="row" style="margin-top:10px;align-items:center">
       <label style="margin:0"><input type="checkbox" id="mock" checked/> mock (무비용)</label>
       <label style="margin:0"><input type="checkbox" id="delegate"/> delegate (팀 위임)</label>
@@ -316,14 +330,26 @@ INDEX_HTML = r"""<!doctype html>
 let CUR=null, AGENT=null;
 const $=id=>document.getElementById(id);
 async function loadChecks(){
-  let rows=[];
-  try{rows=((await (await fetch("/api/check")).json()).backends)||[]}catch(e){}
+  let data={backends:[],roles:[]};
+  try{data=await (await fetch("/api/check")).json()}catch(e){}
+  const rows=data.backends||[];
   const sel=$("backend");sel.innerHTML="";
   rows.forEach(r=>{const o=document.createElement("option");o.value=r.name;
     o.text=r.name+" — "+r.info+(r.ok?"  ✅":"  ❌");sel.appendChild(o)});
   const bad=rows.filter(r=>!r.ok);
   $("backendStatus").innerHTML="백엔드: "+rows.map(r=>(r.ok?"✅":"❌")+" "+r.name).join("&nbsp;&nbsp;")+
     (bad.length?"<br>미가용 — "+bad.map(r=>r.name+": "+r.reason).join(" · "):"");
+  // 역할별 프로바이더 그리드 (auto + 백엔드들)
+  const names=rows.map(r=>r.name);
+  const grid=$("roleGrid");grid.innerHTML="";
+  (data.roles||[]).forEach(role=>{
+    const d=document.createElement("div");d.style.minWidth="210px";
+    const s=document.createElement("select");s.dataset.role=role;s.style.width="100%";
+    const a=document.createElement("option");a.value="";a.text="auto";s.appendChild(a);
+    names.forEach(n=>{const o=document.createElement("option");o.value=n;o.text=n;s.appendChild(o)});
+    const lab=document.createElement("label");lab.textContent=role;
+    d.appendChild(lab);d.appendChild(s);grid.appendChild(d);
+  });
 }
 
 async function startRun(){
@@ -332,8 +358,10 @@ async function startRun(){
   const spec_text=await f.text();
   $("runBtn").disabled=true;$("launchMsg").textContent="실행 시작 중…";
   const blist=$("backends").value.split(",").map(s=>s.trim()).filter(Boolean);
+  const role_backends={};
+  document.querySelectorAll("#roleGrid select").forEach(s=>{if(s.value)role_backends[s.dataset.role]=s.value});
   const body={spec_text,name:$("name").value||f.name.replace(/\.[^.]+$/,""),
-    backend:$("backend").value,backends:blist.length?blist:null,
+    backend:$("backend").value,backends:blist.length?blist:null,role_backends,
     distribute:$("distribute").checked,cross_check:$("crossCheck").checked,
     concurrency:+$("concurrency").value||3,
     max_units:$("maxUnits").value?+$("maxUnits").value:null,
