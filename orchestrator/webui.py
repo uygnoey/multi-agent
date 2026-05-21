@@ -181,7 +181,10 @@ class RunManager:
         return run_id
 
     def stop(self, run_id: str) -> bool:
-        """run 의 프로세스 그룹을 종료 (run.pid 또는 추적 중인 proc 기준)."""
+        """run 의 프로세스 그룹을 종료. SIGTERM(유예) 후 SIGKILL(강제)로 확실히 종료.
+
+        오케스트레이터가 SIGTERM 을 트랩(graceful)해 안 죽는 경우가 있어 SIGKILL 폴백 필수.
+        """
         pid = None
         orch = self.project_dir(run_id) / ".orchestrator"
         pf = orch / "run.pid"
@@ -197,14 +200,26 @@ class RunManager:
         if not pid:
             return False
         try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-            return True
+            pgid = os.getpgid(pid)
         except Exception:
+            pgid = None
+
+        def _kill(sig):
             try:
-                os.kill(pid, signal.SIGTERM)
-                return True
+                if pgid is not None:
+                    os.killpg(pgid, sig)
+                else:
+                    os.kill(pid, sig)
             except Exception:
-                return False
+                pass
+
+        _kill(signal.SIGTERM)
+        threading.Timer(4.0, lambda: _kill(signal.SIGKILL)).start()  # 트랩 대비 강제 종료
+        try:
+            pf.unlink()  # 상태를 즉시 stopped 로 반영
+        except Exception:
+            pass
+        return True
 
     def rerun(self, run_id: str) -> str:
         """저장된 spec + opts 로 새 run 을 시작."""
