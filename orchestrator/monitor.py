@@ -71,8 +71,9 @@ def render_snapshot(board: dict, roles: list[str], alive: bool | None = None) ->
 
     run_n = sum(1 for r in roles if status_of(agents.get(r, {})) == "running")
     toks = board.get("total_tokens", 0)
+    est = " est." if board.get("cost_estimated") else ""
     lines = [
-        f"phase={phase}   cost=${cost:.4f}   tokens={toks:,}   "
+        f"phase={phase}   cost=${cost:.4f}{est}   tokens={toks:,}   "
         f"units={done}/{len(units)}   running_agents={run_n}",
         "",
         f"   {'agent':<22}{'state':<9}{'model/backend':<20}"
@@ -126,8 +127,9 @@ def _draw_list(stdscr, board, roles, sel, orch_dir, alive) -> None:
         stdscr,
         1,
         0,
-        f" phase:{phase}  cost:${cost:.4f}  tokens:{board.get('total_tokens', 0):,}  "
-        f"units:{done}/{len(units)}  동시실행:{run_n}  [{'running' if alive else 'stopped'}]",
+        f" phase:{phase}  cost:${cost:.4f}{' est.' if board.get('cost_estimated') else ''}  "
+        f"tokens:{board.get('total_tokens', 0):,}  units:{done}/{len(units)}  "
+        f"동시실행:{run_n}  [{'running' if alive else 'stopped'}]",
         curses.A_BOLD,
     )
     _safe_add(stdscr, 2, 1, f"📁 {orch_dir.parent}", curses.A_DIM)

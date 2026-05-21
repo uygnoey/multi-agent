@@ -7,6 +7,7 @@ subagent via the Task tool. The role definition is loaded from the target's
 
 from __future__ import annotations
 
+import os
 import shutil
 
 from .base import Backend, RoleRequest, RoleResult, run_subprocess
@@ -61,4 +62,5 @@ class ClaudeTeamBackend(Backend):
             cost_usd=cost,
             model=model or req.model,
             tokens=tokens,
+            cost_estimated=not os.environ.get("ANTHROPIC_API_KEY"),
         )

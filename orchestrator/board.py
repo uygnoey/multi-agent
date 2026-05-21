@@ -60,6 +60,7 @@ class Board:
                 "phase": "init",
                 "total_cost_usd": 0.0,
                 "total_tokens": 0,
+                "cost_estimated": False,
                 "agents": {},
                 "artifacts": [],  # 설계/공통 산출물 (특정 unit 에 속하지 않는)
                 "units": [],
@@ -158,6 +159,7 @@ class Board:
         activity: str | None = None,
         model: str | None = None,
         tokens_add: int | None = None,
+        cost_est: bool = False,
     ) -> None:
         async with self._lock:
             agents = self._data.setdefault("agents", {})
@@ -167,6 +169,7 @@ class Board:
                     "status": "idle",
                     "calls": 0,
                     "cost_usd": 0.0,
+                    "cost_est": False,
                     "tokens": 0,
                     "current_unit": None,
                     "backend": None,
@@ -185,6 +188,9 @@ class Board:
                 a["model"] = model
             if cost_add:
                 a["cost_usd"] = round(a["cost_usd"] + float(cost_add), 6)
+            if cost_est:
+                a["cost_est"] = True
+                self._data["cost_estimated"] = True
             if tokens_add:
                 a["tokens"] = a.get("tokens", 0) + int(tokens_add)
                 self._data["total_tokens"] = self._data.get("total_tokens", 0) + int(tokens_add)

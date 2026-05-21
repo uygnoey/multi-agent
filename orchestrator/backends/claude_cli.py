@@ -7,6 +7,7 @@ ANTHROPIC_API_KEY 미설정 시 로그인된 구독을 사용한다. cwd 의 CLA
 from __future__ import annotations
 
 import json
+import os
 import shutil
 
 from .base import Backend, RoleRequest, RoleResult, run_subprocess
@@ -102,4 +103,5 @@ class ClaudeCLIBackend(Backend):
             cost_usd=cost,
             model=model or req.model,
             tokens=tokens,
+            cost_estimated=not os.environ.get("ANTHROPIC_API_KEY"),  # 구독이면 추정치
         )

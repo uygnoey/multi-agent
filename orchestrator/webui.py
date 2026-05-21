@@ -641,7 +641,7 @@ async function tick(){
     const done=(b.units||[]).filter(u=>u.status==="done").length;
     $("projDir").textContent=proj||"—";
     $("phase").textContent=b.phase||"—";
-    $("cost").textContent="$"+(b.total_cost_usd||0).toFixed(4);
+    $("cost").textContent="$"+(b.total_cost_usd||0).toFixed(4)+(b.cost_estimated?" est.":"");
     $("tok").textContent=(b.total_tokens||0).toLocaleString();
     $("units").textContent=done+"/"+((b.units||[]).length);
     const runN=(s.roles||[]).filter(r=>(ag[r]||{}).status==="running").length;
@@ -652,7 +652,7 @@ async function tick(){
     const logs=s.agent_logs||{};
     $("agentCards").innerHTML=(s.roles||[]).map(r=>{const a=ag[r]||{};
       const run=a.status==="running";
-      const meta=[(a.model||a.backend||"—"),"$"+(+(a.cost_usd||0)).toFixed(4),
+      const meta=[(a.model||a.backend||"—"),"$"+(+(a.cost_usd||0)).toFixed(4)+(a.cost_est?" est.":""),
         (a.tokens?(+a.tokens).toLocaleString()+" tok":null),"calls "+(a.calls||0),
         (a.current_unit&&a.current_unit!=="global")?("unit "+a.current_unit):null].filter(Boolean).join(" · ");
       return '<div class="agent-card'+(run?" run":"")+'"><h5>'+statusDot(a.status)+esc(r)+
