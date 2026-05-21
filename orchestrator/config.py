@@ -198,9 +198,10 @@ class RunConfig:
             # 풀을 역할별 선택값까지 합쳐 추론 (예: 기본 claude + QA=codex → {claude, codex})
             pool = self._cross_pool(base)
             if len(pool) >= 2:
-                # 핀(role_priority)은 위에서 early-return. 여기 오는 역할은 미핀이므로
-                # 미핀 역할들을 ROLES 순서로 번갈아(교차) 배정한다. (그룹 하드코딩 없음)
-                unpinned = [r for r in ROLES if not self.role_priority.get(r)]
+                # 핀(role_priority/role_backend)은 위에서 early-return. 여기 오는 역할은
+                # 미핀이므로 미핀 역할들을 ROLES 순서로 번갈아(교차) 배정한다. (그룹 하드코딩 없음)
+                # role_backend 핀도 핀으로 간주해 미핀 목록에서 제외 → 오프셋 왜곡 방지 (#138)
+                unpinned = [r for r in ROLES if not self._is_pinned(r)]
                 idx = unpinned.index(role) if role in unpinned else 0
                 primary = pool[idx % len(pool)]
                 return [primary, *[b for b in pool if b != primary]]
@@ -212,16 +213,25 @@ class RunConfig:
             base = base[idx:] + base[:idx]
         return base
 
+    def _is_pinned(self, role: str) -> bool:
+        """역할이 명시적으로 핀되었는지 여부 (role_priority 또는 레거시 role_backend; #138)."""
+        return bool(self.role_priority.get(role)) or role in self.role_backend
+
     def _cross_pool(self, base: list[str]) -> list[str]:
         """교차 배치용 백엔드 풀 = base + 역할별 명시 선택값(중복 제거, 순서 유지).
 
         단일 백엔드 + 일부 역할만 지정한 경우에도 교차가 성립하도록 풀을 넓힌다.
+        role_priority 뿐 아니라 레거시 role_backend(역할별 단일 핀)도 풀에 포함해
+        프로그래매틱 호출부(role_backend)와 CLI/웹(role_priority)의 교차 분포를 일치시킨다 (#137).
         """
         pool = list(base)
         for picks in self.role_priority.values():
             for p in picks:
                 if p not in pool:
                     pool.append(p)
+        for backend in self.role_backend.values():
+            if backend not in pool:
+                pool.append(backend)
         return pool
 
     def backend_for(self, role: str) -> str:

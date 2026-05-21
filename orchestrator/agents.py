@@ -22,14 +22,17 @@ class AgentDef:
 
 def _split_frontmatter(text: str) -> tuple[str, str]:
     # 첫 줄이 정확히 '---' 여야 frontmatter (----- 같은 구분선/수평선 오인 방지)
-    if text.split("\n", 1)[0].strip() != "---":
+    lines = text.split("\n")
+    if lines[0].strip() != "---":
         return "", text
-    end = text.find("\n---", 3)
-    if end == -1:
-        return "", text
-    fm = text[3:end].strip("\n")
-    body = text[end + 4 :].lstrip("\n")
-    return fm, body
+    # 닫는 펜스는 그 줄 자체가 정확히 '---'(뒤 공백 허용)인 줄이어야 한다 (#136).
+    # '---extra' / '----' 같은 본문 줄을 닫는 마커로 오인하지 않도록 줄 단위로 찾는다.
+    for i in range(1, len(lines)):
+        if lines[i].rstrip() == "---":
+            fm = "\n".join(lines[1:i])
+            body = "\n".join(lines[i + 1 :]).lstrip("\n")
+            return fm, body
+    return "", text
 
 
 def _parse_meta(fm: str) -> dict:

@@ -115,6 +115,20 @@ def _validate_rerun_argv(argv) -> tuple[bool, str]:
     return True, ""
 
 
+def _num(value, fallback: float = 0.0) -> float:
+    """board.json 의 숫자 필드를 안전하게 float 로 강제 변환 (#142).
+
+    수동 편집/부분 손상으로 비숫자(null/문자열/list 등)가 들어와도 포매팅(:.4f / :,)이
+    터지지 않도록 try float() 후 실패 시 fallback 으로 떨어진다.
+    """
+    try:
+        if isinstance(value, bool):  # bool 은 int 의 서브클래스 → 비용/토큰으로 취급하지 않음
+            return fallback
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
 def _read_board(orch_dir: Path) -> dict:
     """board.json 을 읽는다. 파일 없음과 손상을 구분한다 (#70).
 
@@ -131,7 +145,7 @@ def _read_board(orch_dir: Path) -> dict:
         return {"_corrupt": True}
 
 
-def _read_agent_log(orch_dir: Path, role: str, n: int = 400) -> str:
+def _read_agent_log(orch_dir: Path, role: str, n: int = 500) -> str:
     p = orch_dir / "agents" / f"{role}.log"
     if not p.exists():
         return ""
@@ -141,13 +155,35 @@ def _read_agent_log(orch_dir: Path, role: str, n: int = 400) -> str:
         return ""
 
 
+# 상세 뷰 로그 mtime 캐시: 같은 파일이 안 바뀌었으면 매 refresh 마다 다시 읽지 않는다 (#36).
+# {경로: (mtime, size, tail_text)}
+_LOG_CACHE: dict[str, tuple[float, int, str]] = {}
+
+
+def _read_agent_log_cached(orch_dir: Path, role: str, n: int = 500) -> str:
+    """파일이 바뀌었을 때(mtime/size)만 다시 읽어 큰 로그에서 redraw 가 느려지지 않게 한다 (#36)."""
+    p = orch_dir / "agents" / f"{role}.log"
+    key = str(p)
+    try:
+        stat = p.stat()
+    except OSError:
+        _LOG_CACHE.pop(key, None)
+        return ""
+    cached = _LOG_CACHE.get(key)
+    if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+        return cached[2]
+    text = _read_agent_log(orch_dir, role, n=n)
+    _LOG_CACHE[key] = (stat.st_mtime, stat.st_size, text)
+    return text
+
+
 def render_snapshot(board: dict, roles: list[str], alive: bool | None = None) -> str:
     """Pure text snapshot of the agent table (used by --once and tests).
 
     alive=False 면 죽은 run 으로 보고 running 에이전트를 stopped 로 표시(웹과 동일).
     """
     phase = board.get("phase", "?")
-    cost = board.get("total_cost_usd", 0.0)
+    cost = _num(board.get("total_cost_usd", 0.0))  # 비숫자 손상값에도 :.4f 안 터지게 (#142)
     units = board.get("units", [])
     done = sum(1 for u in units if u.get("status") == "done")
     agents = board.get("agents", {})
@@ -157,7 +193,7 @@ def render_snapshot(board: dict, roles: list[str], alive: bool | None = None) ->
         return "stopped" if (alive is False and st == "running") else st
 
     run_n = sum(1 for r in roles if status_of(agents.get(r, {})) == "running")
-    toks = board.get("total_tokens", 0)
+    toks = int(_num(board.get("total_tokens", 0)))
     est = " est." if board.get("cost_estimated") else ""
     state = _state_label(bool(alive), phase, board.get("warnings") or [], units)
     lines = [
@@ -174,10 +210,11 @@ def render_snapshot(board: dict, roles: list[str], alive: bool | None = None) ->
         icon = "●" if st == "running" else "○"
         model = (a.get("model") or a.get("backend") or "")[:18]
         unit = a.get("current_unit") or ""
-        tok = f"{a.get('tokens', 0):,}" if a.get("tokens") else "-"
+        a_tok = int(_num(a.get("tokens", 0)))
+        tok = f"{a_tok:,}" if a_tok else "-"
         lines.append(
-            f" {icon} {r:<22}{st:<9}{model:<20}{a.get('cost_usd', 0.0):>9.4f}  "
-            f"{tok:>9}  {a.get('calls', 0):>5}  {unit}"
+            f" {icon} {r:<22}{st:<9}{model:<20}{_num(a.get('cost_usd', 0.0)):>9.4f}  "
+            f"{tok:>9}  {int(_num(a.get('calls', 0))):>5}  {unit}"
         )
     return "\n".join(lines)
 
@@ -244,7 +281,7 @@ def _draw_list(stdscr, board, roles, sel, orch_dir, alive) -> None:
 
     h, w = stdscr.getmaxyx()
     phase = board.get("phase", "—")
-    cost = board.get("total_cost_usd", 0.0)
+    cost = _num(board.get("total_cost_usd", 0.0))  # 손상값 가드 (#142)
     units = board.get("units", [])
     done = sum(1 for u in units if u.get("status") == "done")
     agents = board.get("agents", {})
@@ -261,7 +298,7 @@ def _draw_list(stdscr, board, roles, sel, orch_dir, alive) -> None:
         1,
         0,
         f" phase:{phase}  cost:${cost:.4f}{' est.' if board.get('cost_estimated') else ''}  "
-        f"tokens:{board.get('total_tokens', 0):,}  units:{done}/{len(units)}  "
+        f"tokens:{int(_num(board.get('total_tokens', 0))):,}  units:{done}/{len(units)}  "
         f"동시실행:{run_n}  [{_state_label(alive, phase, board.get('warnings') or [], units)}]",
         curses.A_BOLD,
     )
@@ -283,10 +320,11 @@ def _draw_list(stdscr, board, roles, sel, orch_dir, alive) -> None:
         icon = "●" if running else "○"
         model = (a.get("model") or a.get("backend") or "-")[:16]
         unit = a.get("current_unit") or "-"
-        tok = f"{a.get('tokens', 0):,}" if a.get("tokens") else "-"
+        a_tok = int(_num(a.get("tokens", 0)))
+        tok = f"{a_tok:,}" if a_tok else "-"
         line = (
-            f"{icon} {r:<22}{st:<9}{model:<18}{a.get('cost_usd', 0.0):>9.4f}  "
-            f"{tok:>9}  {a.get('calls', 0):>5}  {unit}"
+            f"{icon} {r:<22}{st:<9}{model:<18}{_num(a.get('cost_usd', 0.0)):>9.4f}  "
+            f"{tok:>9}  {int(_num(a.get('calls', 0))):>5}  {unit}"
         )
         attr = curses.A_REVERSE if i == sel else (curses.A_BOLD if running else 0)
         _safe_add(stdscr, row + i, 1, line, attr)
@@ -369,19 +407,23 @@ def _draw_detail(stdscr, board: dict, orch_dir: Path, role: str, scroll: int, fo
     st = a.get("status", "idle")
     running = st == "running"
 
+    a_cost = _num(a.get("cost_usd", 0.0))  # 손상값 가드 (#142)
+    a_tok = int(_num(a.get("tokens", 0)))
+    a_calls = int(_num(a.get("calls", 0)))
     _safe_add(stdscr, 0, 0, f" AGENT: {role} ", curses.A_REVERSE | curses.A_BOLD)
     _safe_add(
         stdscr,
         1,
         0,
-        f" state: {st}    model: {a.get('model') or '-'}    $cost: {a.get('cost_usd', 0.0):.4f}"
-        f"    tokens: {a.get('tokens', 0):,}    calls: {a.get('calls', 0)}"
+        f" state: {st}    model: {a.get('model') or '-'}    $cost: {a_cost:.4f}"
+        f"    tokens: {a_tok:,}    calls: {a_calls}"
         f"    unit: {a.get('current_unit') or '-'}    backend: {a.get('backend') or '-'}",
         curses.A_BOLD if running else 0,
     )
     _safe_add(stdscr, 2, 1, "activity (live):", curses.A_DIM)
 
-    log = _read_agent_log(orch_dir, role, n=2000)
+    # 매 refresh 마다 2000줄을 다시 읽지 않고, mtime 이 바뀐 경우에만 최근 500줄을 재로드 (#36)
+    log = _read_agent_log_cached(orch_dir, role, n=500)
     body = log.splitlines() if log else ["(아직 활동 없음 — 이 에이전트가 시작되면 채워집니다)"]
     last_msg = a.get("last_message") or ""
     if last_msg:

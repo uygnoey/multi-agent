@@ -390,17 +390,19 @@ def test_expose_team_agents_writes_when_missing(tmp_path):
     assert one.exists()
 
 
-# ---- #91: scaffold 가 기존 spec.md 를 덮어쓰지 않음 -------------------------
+# ---- #140: scaffold 가 spec.md 를 현재 run 내용으로 항상 (재)기록 ----------
+# (이전 #91 의 "기존 spec.md 보존" 동작은 stale 메타데이터 버그(#140)로 판명돼 뒤집힘.
+#  spec.md 는 오케스트레이터 생성물이므로 새 spec 으로 돌리면 항상 갱신돼야 한다.)
 
 
-def test_scaffold_preserves_existing_spec_md(tmp_path):
+def test_scaffold_rewrites_existing_spec_md(tmp_path):
     target = tmp_path / "proj"
     scaffold(target, "first spec", STACK)
     spec_md = target / ".orchestrator" / "spec.md"
     assert spec_md.read_text(encoding="utf-8") == "first spec"
-    # 같은 디렉터리로 재스캐폴드 → 기존 spec.md 보존
+    # 같은 디렉터리로 재스캐폴드 → 새 spec 으로 갱신 (stale 방지; #140)
     scaffold(target, "DIFFERENT spec", STACK)
-    assert spec_md.read_text(encoding="utf-8") == "first spec"
+    assert spec_md.read_text(encoding="utf-8") == "DIFFERENT spec"
 
 
 # ---- #92: gitignore 검사는 라인 단위 (주석/부분일치 오인 방지) --------------

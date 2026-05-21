@@ -415,7 +415,12 @@ class Board:
         return report
 
     def write_deliverables(self) -> list[str]:
-        """보드 상태로 개발 산출물 문서를 EN/KO 양쪽으로 생성 (백엔드 무관 보장)."""
+        """보드 상태로 개발 산출물 문서를 EN/KO 양쪽으로 생성 (보드 요약은 fallback).
+
+        docs-writer 백엔드가 이미 docs/DELIVERABLES.md/.ko.md 를 작성한 경우 그 풍부한
+        산출물을 덮어쓰지 않는다. 파일이 없을 때만 보드 요약을 써서 fallback 을 보장하고,
+        실제로 디스크에 존재하는 경로만 반환한다(스케줄러가 전역 아티팩트로 추가).
+        """
         d = self._data
         units = d.get("units", [])
         done = sum(1 for u in units if u["status"] == "done")
@@ -482,9 +487,21 @@ class Board:
             + unit_files()
             + ["실행 방법은 `docs/RUN_GUIDE.ko.md` 참고."]
         )
-        (docs_dir / "DELIVERABLES.md").write_text("\n".join(en) + "\n", encoding="utf-8")
-        (docs_dir / "DELIVERABLES.ko.md").write_text("\n".join(ko) + "\n", encoding="utf-8")
-        return ["docs/DELIVERABLES.md", "docs/DELIVERABLES.ko.md"]
+        # 에이전트가 작성한 산출물을 보드 요약으로 덮어쓰지 않는다.
+        # 파일이 없을 때만 보드 요약을 써서 항상 fallback 이 존재하도록 보장한다.
+        en_path = docs_dir / "DELIVERABLES.md"
+        ko_path = docs_dir / "DELIVERABLES.ko.md"
+        if not en_path.exists():
+            en_path.write_text("\n".join(en) + "\n", encoding="utf-8")
+        if not ko_path.exists():
+            ko_path.write_text("\n".join(ko) + "\n", encoding="utf-8")
+        # 실제로 존재하는 경로만 반환(에이전트가 쓴 것이든 보드가 쓴 것이든 모두 포함).
+        written: list[str] = []
+        if en_path.exists():
+            written.append("docs/DELIVERABLES.md")
+        if ko_path.exists():
+            written.append("docs/DELIVERABLES.ko.md")
+        return written
 
     # ---- reads (best-effort snapshots) ----
     def units(self) -> list[dict]:

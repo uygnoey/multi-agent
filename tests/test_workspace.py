@@ -33,17 +33,19 @@ def test_gitignore_seeds_orchestrator(tmp_path: Path):
     assert ".orchestrator/" in gi
 
 
-def test_scaffold_is_non_destructive_for_existing_claude_md(tmp_path: Path):
+def test_scaffold_rewrites_orchestrator_generated_claude_md(tmp_path: Path):
+    # CLAUDE.md/AGENTS.md are orchestrator-generated (embed current stack/spec), so a new
+    # run against a reused dir must (re)write them with the current content (#140/#141).
     target = tmp_path / "proj"
     target.mkdir()
-    sentinel = "# my own CLAUDE.md, do not touch\n"
-    (target / "CLAUDE.md").write_text(sentinel, encoding="utf-8")
+    stale = "# stale CLAUDE.md from a previous run\n"
+    (target / "CLAUDE.md").write_text(stale, encoding="utf-8")
 
-    scaffold(target, "spec", STACK)
+    scaffold(target, "the current spec body", STACK)
 
-    # Pre-existing CLAUDE.md is preserved verbatim.
-    assert (target / "CLAUDE.md").read_text(encoding="utf-8") == sentinel
-    # But AGENTS.md (absent before) is created.
+    refreshed = (target / "CLAUDE.md").read_text(encoding="utf-8")
+    assert refreshed != stale  # stale content replaced
+    assert "the current spec body" in refreshed  # current spec excerpt embedded
     assert (target / "AGENTS.md").exists()
 
 

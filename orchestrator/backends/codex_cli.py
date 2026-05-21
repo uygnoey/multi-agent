@@ -14,6 +14,11 @@ import shutil
 import uuid
 from pathlib import Path
 
+try:  # Python 3.11+ 에는 표준 tomllib 가 있다.
+    import tomllib  # type: ignore
+except ModuleNotFoundError:  # 3.10 이하 → 정규식 기반 안전 fallback 사용
+    tomllib = None  # type: ignore
+
 from .base import Backend, RoleRequest, RoleResult, run_subprocess
 
 
@@ -67,26 +72,74 @@ def load_pricing() -> dict:
     return dict(_FALLBACK_PRICING)
 
 
+def _root_model_from_text(text: str) -> str | None:
+    """#143 fallback: 첫 [section] 헤더 이전(=root table)에 나오는 model 키만 인정한다.
+
+    tomllib 가 없거나 파싱이 실패할 때 사용. 프로필/하위 섹션의 model 을
+    전역 기본값으로 오인하지 않도록, 섹션 헤더를 만나면 더 이상 보지 않는다.
+    """
+    for raw in text.splitlines():
+        s = raw.strip()
+        if s.startswith("[") and "]" in s:
+            # root table 종료 — 이후 등장하는 model 은 하위 섹션 소속이므로 무시
+            break
+        if s.startswith("model") and "=" in s and not s.startswith("model_"):
+            key = s.split("=", 1)[0].strip()
+            if key == "model":  # 'model = ...' 의 LHS 가 정확히 model 일 때만
+                return s.split("=", 1)[1].strip().strip("\"'") or None
+    return None
+
+
 def _codex_default_model() -> str:
-    """~/.codex/config.toml 의 기본 모델 (없으면 gpt-5.5)."""
+    """~/.codex/config.toml 의 최상위(root table) 기본 모델 (없으면 gpt-5.5).
+
+    #143: 라인 단위 스캔은 [profiles.xxx] 같은 무관한 섹션의 model 키를 전역
+    기본값으로 오인할 수 있다. 표준 tomllib(3.11+) 로 root table 의 model 만
+    읽고, tomllib 미가용/파싱 실패 시 첫 섹션 이전의 model 만 인정한다.
+    """
     try:
         cfg = Path.home() / ".codex" / "config.toml"
-        if cfg.exists():
-            for line in cfg.read_text(encoding="utf-8").splitlines():
-                s = line.strip()
-                if s.startswith("model") and "=" in s and not s.startswith("model_"):
-                    return s.split("=", 1)[1].strip().strip("\"'")
+        if not cfg.exists():
+            return "gpt-5.5"
+        text = cfg.read_text(encoding="utf-8")
+        if tomllib is not None:
+            try:
+                data = tomllib.loads(text)
+                val = data.get("model")  # root table 의 model 키만
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+                return "gpt-5.5"
+            except Exception:
+                pass  # 파싱 실패 → fallback 으로 진행
+        val = _root_model_from_text(text)
+        if val:
+            return val
     except Exception:
         pass
     return "gpt-5.5"
 
 
+# model 키 뒤에 붙는 날짜 스냅샷 접미사: '-2026', '-2026-05', '-2026-05-21' 등.
+_DATE_SUFFIX = re.compile(r"^-\d{4}(?:-\d{2}){0,2}$")
+
+
 def _price_for(model: str):
+    """#144: 단순 startswith prefix 매칭은 알 수 없는 변형(예: gpt-5.5-pro)을
+    더 짧은 키(gpt-5.5)로 오인 과금할 수 있다. ① 정확 매칭 우선, ② 날짜 접미사만
+    붙은 dated 스냅샷(gpt-5.5-2026...)은 base 모델로 매핑, ③ 그 외는 None(미지정).
+    """
     pricing = load_pricing()
-    m = (model or "").lower()
-    for key in sorted(pricing, key=len, reverse=True):  # 긴 키 우선 매칭
-        if m.startswith(key):
+    m = (model or "").lower().strip()
+    if not m:
+        return None
+    # ① 정확 매칭 — 'gpt-5.5-pro' 는 'gpt-5.5' 가 아니라 'gpt-5.5-pro' 로만 매칭
+    if m in pricing:
+        return pricing[m]
+    # ② 날짜 접미사 dated 스냅샷만 base 모델로 인정 (긴 키 우선: pro 가 base 보다 먼저)
+    for key in sorted(pricing, key=len, reverse=True):
+        if m.startswith(key) and _DATE_SUFFIX.match(m[len(key) :]):
             return pricing[key]
+    # ③ 알 수 없는 변형(gpt-5.5-turbo, gpt-5.6 등) → 추정치 없음
     return None
 
 

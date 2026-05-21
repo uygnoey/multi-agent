@@ -195,7 +195,8 @@ class Runner:
 
         # 감독(PM/PL)은 결과파일을 안 남겨도 자연스럽다. 그 외 역할은 결과 JSON 이 계약.
         result_required = spec.phase != PHASE_SUPERVISOR
-        outcome = self._read_result(result_path, res, result_required)
+        # 페이즈/역할을 넘겨 _ok 판정을 페이즈별 계약에 맞춘다 (#97).
+        outcome = self._read_result(result_path, res, result_required, phase=spec.phase, role=role)
         cost = f" ${role_cost:.4f}" if role_cost else ""
         await self.board.log_event(
             role,
@@ -233,13 +234,20 @@ class Runner:
         return last
 
     @staticmethod
-    def _read_result(result_path, res, result_required: bool = True) -> dict:
+    def _read_result(
+        result_path,
+        res,
+        result_required: bool = True,
+        phase: str | None = None,
+        role: str | None = None,
+    ) -> dict:
         # 백엔드 호출이 성공한 경우에만 결과파일을 신뢰한다. 실패 시 남아있는
         # 부분/이전 결과파일을 성공으로 오탐하지 않도록 합성 실패 결과를 쓴다.
+        # phase/role 을 _coerce_result 로 전달해 페이즈별 계약(아키텍트=units 필수 등)을 반영 (#97).
         if res.ok and result_path.exists():
             try:
                 data = json.loads(result_path.read_text(encoding="utf-8"))
-                return _coerce_result(data, res)
+                return _coerce_result(data, res, phase=phase, role=role)
             except Exception:
                 # 결과파일이 있는데 깨졌으면 계약 위반 → 성공으로 오탐하지 않는다
                 return {
@@ -271,7 +279,8 @@ class Runner:
         }
 
 
-# 성공으로 인정하는 status (이외의 값은 fail/failure/error/incomplete 등으로 보고 _ok=False)
+# 성공으로 인정하는 status 의 기준선(baseline). 페이즈 무관하게 우선 이 화이트리스트로 거른다
+# — 여기 없는 값(fail/failure/error/incomplete 등)이거나 blocker 가 있으면 _ok=False (#97).
 _SUCCESS_STATUSES = frozenset(
     {
         "done",
@@ -286,6 +295,19 @@ _SUCCESS_STATUSES = frozenset(
         "completed",
     }
 )
+
+# 페이즈별 성공 status (#97). baseline 통과 후 추가로 페이즈 계약에 맞는지 확인한다.
+# 보수적으로 — mock 백엔드(designed/dev_done/tested/done) 와 기존 테스트를 깨지 않도록
+# 각 페이즈의 '정상' 값 + 범용 완료 표현(done/complete/completed/ok/success)을 함께 허용한다.
+# 명백히 잘못된 조합(예: 설계 역할이 dev_done, 개발 역할이 designed)만 추가로 _ok=False 로 잡는다.
+_GENERIC_DONE = frozenset({"done", "ok", "success", "complete", "completed"})
+_PHASE_SUCCESS_STATUSES: dict[str, frozenset[str]] = {
+    "design": _GENERIC_DONE | {"designed", "pass", "passed", "tested"},
+    "dev": _GENERIC_DONE | {"dev_done", "pass", "passed"},
+    "test": _GENERIC_DONE | {"tested", "pass", "passed"},
+    "cicd": _GENERIC_DONE | {"pass", "passed"},
+    "docs": _GENERIC_DONE | {"pass", "passed"},
+}
 
 
 def _as_list(v) -> list:
@@ -329,11 +351,17 @@ def _safe_rel_artifact(raw) -> str | None:
     return s
 
 
-def _coerce_result(data: dict, res) -> dict:
+def _coerce_result(data: dict, res, phase: str | None = None, role: str | None = None) -> dict:
     """Normalize an agent-written result file to the expected schema.
 
     status 를 소문자 정규화하고, 에이전트가 status=failed/blocked/error 또는 blockers 를 보고하면
     (백엔드 호출이 성공했더라도) _ok=False 로 내린다. 그래야 스케줄러 판정이 제대로 잡힌다.
+
+    phase/role 이 주어지면(#97) baseline 화이트리스트 통과 후 추가로 페이즈별 계약을 검사한다:
+    - status 가 해당 페이즈의 성공 집합에 들어야 한다(명백히 어긋난 조합만 추가로 거른다).
+    - 아키텍트(설계 페이즈, 핵심 역할)는 units 배열이 비어있지 않아야 한다(#98 과 동일한 설계 계약).
+      같은 design 페이즈라도 testsheet-creator 는 units 를 만들지 않으므로 units 검사 대상이 아니다.
+    phase 미지정 시 기존 동작(baseline 화이트리스트만) 그대로 — 기존 테스트 호환.
     """
     if not isinstance(data, dict):
         # [] / "done" / 숫자 같은 비-객체 JSON 은 계약 위반 → 성공으로 보지 않는다
@@ -348,8 +376,21 @@ def _coerce_result(data: dict, res) -> dict:
     status = str(data.get("status") or ("done" if res.ok else "failed")).strip().lower()
     # 빈/공백 blocker 슬롯은 무시 (LLM 이 빈 칸을 남겨도 불필요한 실패가 나지 않게)
     blockers = [s for b in _as_list(data.get("blockers")) if (s := str(b).strip())]
-    # 실패 변형(fail/failure/error/...)을 다 나열하기보다 성공 status 만 허용(whitelist)
+    units = [u for u in _as_list(data.get("units")) if isinstance(u, dict)]
+    # 1) baseline: 실패 변형을 다 나열하기보다 성공 status 만 허용(whitelist) — 기존 동작 유지
     ok = res.ok and status in _SUCCESS_STATUSES and not blockers
+    # 2) 페이즈별 계약 추가 검사(#97). baseline 을 통과한 경우에만 좁힌다(over-tighten 방지).
+    if ok and phase is not None:
+        allowed = _PHASE_SUCCESS_STATUSES.get(phase)
+        if allowed is not None and status not in allowed:
+            # 예: 개발 역할이 'designed', 설계 역할이 'dev_done' 같은 어긋난 조합
+            ok = False
+            blockers = [*blockers, f"status '{status}' not valid for phase '{phase}'"]
+        elif role == "architecture-engineer" and not units:
+            # 아키텍트 계약: spec 을 units 로 분해해야 성공 (#97/#98).
+            # testsheet-creator 는 같은 design 페이즈라도 units 가 없어 정상이므로 제외.
+            ok = False
+            blockers = [*blockers, "architect result has no units (contract violation)"]
     # 아티팩트: str 만, 절대경로/'..' 등 안전하지 않은 값 drop (보드 정책과 일치; #11)
     artifacts = [s for a in _as_list(data.get("artifacts")) if (s := _safe_rel_artifact(a))]
     return {
@@ -357,6 +398,6 @@ def _coerce_result(data: dict, res) -> dict:
         "artifacts": artifacts,
         "notes": [str(n) for n in _as_list(data.get("notes"))],
         "blockers": blockers,
-        "units": [u for u in _as_list(data.get("units")) if isinstance(u, dict)],
+        "units": units,
         "_ok": ok,
     }
