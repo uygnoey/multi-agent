@@ -1,7 +1,8 @@
-"""타깃 프로젝트 스캐폴딩 (비파괴적).
+"""타깃 프로젝트 스캐폴딩.
 
 - 디렉터리 생성, .orchestrator/ 초기화
-- templates/CLAUDE.md·AGENTS.md 를 타깃 루트에 기록 (이미 있으면 건드리지 않음)
+- spec.md·CLAUDE.md·AGENTS.md 를 현재 run 의 spec/stack 으로 항상 (재)기록 (#140/#141)
+- 사용자 작성 파일(.claude/agents/*.md)은 보존 (#12)
 - 타깃 .gitignore 에 .orchestrator/ 시드
 """
 
@@ -49,16 +50,14 @@ def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
     orch = project_dir / ".orchestrator"
     (orch / "results").mkdir(parents=True, exist_ok=True)
     (orch / "qa").mkdir(parents=True, exist_ok=True)
-    # 이미 있는 spec.md 는 덮어쓰지 않음 (재사용 디렉터리의 기존 run 메타데이터 보존; #91)
-    spec_md = orch / "spec.md"
-    if not spec_md.exists():
-        spec_md.write_text(spec_text, encoding="utf-8")
+    # spec.md / CLAUDE.md / AGENTS.md 는 오케스트레이터가 현재 run 의 spec·stack 을 박아 넣는
+    # 생성물이다. 재사용 디렉터리에 새 spec 을 돌리면 이전 값이 stale 해지므로 항상 현재
+    # 내용으로 (재)기록한다 (#140/#141). 사용자가 직접 쓴 .claude/agents/*.md 만 보존(#12).
+    (orch / "spec.md").write_text(spec_text, encoding="utf-8")
 
     stack_str = _fmt_stack(stack)
     for fname in ("CLAUDE.md", "AGENTS.md"):
         target = project_dir / fname
-        if target.exists():
-            continue  # 비파괴적
         tpl = TEMPLATES_DIR / fname
         base = tpl.read_text(encoding="utf-8") if tpl.exists() else f"# {fname}\n"
         target.write_text(

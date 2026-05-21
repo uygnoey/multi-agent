@@ -106,7 +106,10 @@ def _run_alive(orch_dir) -> bool:
         os.kill(pid, 0)  # signal 0 = 존재/권한 확인 (죽었으면 OSError)
     except OSError:
         return False
-    return True
+    # #135: 좀비(종료됐지만 reap 안 됨)는 os.kill(pid,0) 이 계속 성공하므로 stop 의 _alive()
+    #       판정과 어긋난다. is_running/_run_alive 와 stop cleanup 이 일치하도록 좀비는
+    #       종료로 본다 (그렇지 않으면 프로세스가 끝났는데도 UI 가 계속 "running" 으로 남는다).
+    return not _is_zombie(pid)
 
 
 def slugify(name: str) -> str:
@@ -119,11 +122,35 @@ def new_run_id(name: str) -> str:
     return f"{slugify(name)}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}"
 
 
+def _coerce_int(value, default: int) -> int:
+    """#38: 손상된 _run_opts.json 의 숫자 옵션을 관대하게 정수로 변환.
+
+    int()/float() 가 그대로 raise 하면 rerun 이 사용자에게 내부 예외 문자열을 노출한다
+    (예: "invalid literal for int() with base 10: 'abc'"). 변환 불가/None/빈값이면
+    default 로 폴백해, 손상된 옵션이 있어도 명령이 깨지지 않고 합리적으로 동작하게 한다.
+    """
+    if value in (None, ""):
+        return default
+    try:
+        return int(float(value))  # "3.0" 같은 문자열도 허용
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_float(value, default):
+    """#38: 손상된 _run_opts.json 의 실수 옵션을 관대하게 변환 (변환 불가 시 default)."""
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def build_command(py: str, spec_path: Path, project_dir: Path, opts: dict) -> list[str]:
     # #61: poll-interval 은 opts 에서 읽되 웹 기본은 600(감독 주기를 길게). 없으면 600.
-    poll = opts.get("poll_interval")
-    if poll in (None, ""):
-        poll = 600
+    # #38: 손상된 _run_opts.json(예: poll_interval="abc")이 와도 int() 가 raise 하지 않도록 관대하게 변환.
+    poll = _coerce_int(opts.get("poll_interval"), 600)
     cmd = [
         py,
         "-m",
@@ -135,7 +162,7 @@ def build_command(py: str, spec_path: Path, project_dir: Path, opts: dict) -> li
         "--backend",
         str(opts.get("backend", "mock")),
         "--concurrency",
-        str(int(opts.get("concurrency", 3))),
+        str(_coerce_int(opts.get("concurrency"), 3)),
         "--poll-interval",
         str(poll),
     ]
@@ -158,17 +185,24 @@ def build_command(py: str, spec_path: Path, project_dir: Path, opts: dict) -> li
         cmd.append("--mock")
     if opts.get("delegate"):
         cmd.append("--delegate")
-    if opts.get("max_units"):
-        cmd += ["--max-units", str(int(opts["max_units"]))]
+    # #38: max_units/max_attempts 도 손상값을 관대하게 변환. max_units 는 0/음수면 "전체"로
+    #      간주해 플래그를 생략(폴백 0). max_attempts 는 기본 2 로 폴백.
+    if _coerce_int(opts.get("max_units"), 0) > 0:
+        cmd += ["--max-units", str(_coerce_int(opts.get("max_units"), 0))]
     if opts.get("max_attempts"):
-        cmd += ["--max-attempts", str(int(opts["max_attempts"]))]
+        cmd += ["--max-attempts", str(_coerce_int(opts.get("max_attempts"), 2))]
     # #62: timeout/retries/budget/model 도 있으면 CLI 로 전달 (웹 실행에서도 사용 가능).
+    # #38: float()/int() 가 손상값에 raise 하지 않도록 관대하게 변환(변환 불가 시 옵션 생략).
     if opts.get("timeout") not in (None, ""):
-        cmd += ["--timeout", str(float(opts["timeout"]))]
+        tv = _coerce_float(opts.get("timeout"), None)
+        if tv is not None:
+            cmd += ["--timeout", str(tv)]
     if opts.get("retries") not in (None, ""):
-        cmd += ["--retries", str(int(opts["retries"]))]
+        cmd += ["--retries", str(_coerce_int(opts.get("retries"), 0))]
     if opts.get("budget") not in (None, ""):
-        cmd += ["--budget", str(float(opts["budget"]))]
+        bv = _coerce_float(opts.get("budget"), None)
+        if bv is not None:
+            cmd += ["--budget", str(bv)]
     if opts.get("model"):
         cmd += ["--model", str(opts["model"])]
     return cmd
@@ -315,8 +349,14 @@ class RunManager:
                     _remove_pidfile()
                     return
                 time.sleep(0.1)
-            # 트랩 대비 강제 종료 후 pidfile 제거
+            # 트랩 대비 강제 종료. SIGKILL 은 비동기라 즉시 죽지 않을 수 있으니 잠깐 사멸을
+            # 확인한 뒤(있다면 좀비 reap 포함) pidfile 을 제거한다. #135: 어떤 경우에도
+            # 최종적으로 pidfile 은 반드시 제거되어 "running" 잔상이 남지 않게 한다.
             _kill(signal.SIGKILL)
+            for _ in range(20):  # ≈1초: SIGKILL 후 커널 teardown 대기
+                if not _alive():
+                    break
+                time.sleep(0.05)
             _remove_pidfile()
 
         threading.Thread(target=_supervise, daemon=True).start()
@@ -522,8 +562,12 @@ def _make_handler(manager: RunManager):
                 except ValueError:
                     self._json({"error": "invalid run id"}, 400)
                     return
-                except Exception as e:
-                    self._json({"error": str(e)}, 400)
+                except Exception:
+                    # #38: 내부 예외 텍스트(int() 변환 오류 등)를 그대로 노출하지 않고
+                    #      깔끔한 메시지로 응답한다. (build_command 는 이미 손상값을 관대히 처리)
+                    self._json(
+                        {"error": "재실행 실패 — 저장된 실행 옵션이 손상되었을 수 있습니다"}, 400
+                    )
                     return
                 self._json({"run_id": rid})
                 return
