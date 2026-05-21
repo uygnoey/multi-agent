@@ -12,3 +12,5 @@ select = ["E", "F", "I", "UP", "B"]
 
 [lint.per-file-ignores]
 "tests/*" = ["E501", "B"]
+# webui.py embeds a single-file HTML/CSS/JS UI as a string literal (long lines are intentional).
+"orchestrator/webui.py" = ["E501"]
