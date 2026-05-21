@@ -37,6 +37,11 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="역할들을 --backends 풀에 라운드로빈 분산 (4종 동시 가동)",
     )
     p.add_argument(
+        "--cross-check",
+        action="store_true",
+        help="생산자(개발)·검증자(test/QA)를 서로 다른 프로바이더에 배치 (교차 검증, 풀 2개+)",
+    )
+    p.add_argument(
         "--role-backend",
         action="append",
         default=[],
@@ -108,6 +113,7 @@ def build_config(a: argparse.Namespace) -> RunConfig:
         backend_priority=backend_priority,
         role_priority=role_priority,
         distribute=a.distribute,
+        cross_check=a.cross_check,
         max_units=a.max_units,
         concurrency=a.concurrency,
         budget=a.budget,

@@ -52,6 +52,20 @@ ROLES_SAMPLE = [
 ]
 
 
+def test_cross_check_splits_build_and_verify():
+    pool = ["codex", "claude-cli"]
+    cfg = _cfg(backend_priority=pool, cross_check=True)
+    # 생산자(build) → pool[0]=codex, 검증자(verify) → pool[1]=claude-cli
+    for build_role in ("backend-developer", "frontend-developer", "dba", "architecture-engineer"):
+        assert cfg.backends_for(build_role)[0] == "codex"
+    for verify_role in ("test-engineer", "qa", "testsheet-creator"):
+        assert cfg.backends_for(verify_role)[0] == "claude-cli"
+    # PM / PL 은 서로 다른 프로바이더 (교차 감독)
+    assert cfg.backends_for("project-manager")[0] != cfg.backends_for("project-leader")[0]
+    # 후보는 여전히 전체 풀(상대 프로바이더로 폴오버)
+    assert sorted(cfg.backends_for("qa")) == sorted(pool)
+
+
 class _FakeBackend:
     def __init__(self, name, ok):
         self.name = name

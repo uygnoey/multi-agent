@@ -73,6 +73,22 @@ BACKEND_INFO = {
 DELEGATION_CAPABLE = ("claude-sdk", "claude-cli", "claude-team")
 DELEGATION_TOOL = "Task"
 
+# 교차 검증(--cross-check): 생산자(build)와 검증자(verify)를 서로 다른 프로바이더에 배치.
+# 풀 [P0, P1] 기준 build→P0, verify→P1 (실패 시 상대 프로바이더로 폴오버).
+# → 개발(build)을 한 프로바이더가, 그 결과 검증(verify)을 다른 프로바이더가 맡아 교차 검증.
+CROSS_GROUPS: dict[str, str] = {
+    "architecture-engineer": "build",
+    "frontend-developer": "build",
+    "backend-developer": "build",
+    "dba": "build",
+    "project-manager": "build",
+    "testsheet-creator": "verify",
+    "test-engineer": "verify",
+    "qa": "verify",
+    "project-leader": "verify",  # PL은 검토자 → PM과 반대 프로바이더
+    "cicd": "verify",
+}
+
 # Which teammates a role may delegate to when --delegate is on (depth-1 only).
 DELEGATES: dict[str, tuple[str, ...]] = {
     "backend-developer": ("dba",),
@@ -104,6 +120,8 @@ class RunConfig:
     role_priority: dict[str, list[str]] = field(default_factory=dict)
     # True 면 역할들을 우선순위 목록에 라운드로빈으로 분산(모든 백엔드 동시 가동).
     distribute: bool = False
+    # True 면 생산자/검증자를 서로 다른 프로바이더에 배치(교차 검증). distribute 보다 우선.
+    cross_check: bool = False
 
     def backends_for(self, role: str) -> list[str]:
         """역할에 대한 백엔드 후보를 우선순위 순서로 반환 (폴오버용)."""
@@ -114,6 +132,9 @@ class RunConfig:
         if role in self.role_backend:
             return [self.role_backend[role]]
         base = list(self.backend_priority) if self.backend_priority else [self.default_backend]
+        if self.cross_check and len(base) >= 2:
+            primary = base[0] if CROSS_GROUPS.get(role, "build") == "build" else base[1]
+            return [primary, *[b for b in base if b != primary]]
         if self.distribute and len(base) > 1:
             try:
                 idx = list(ROLES).index(role) % len(base)

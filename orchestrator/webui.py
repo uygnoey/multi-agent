@@ -57,6 +57,8 @@ def build_command(py: str, spec_path: Path, project_dir: Path, opts: dict) -> li
         cmd += ["--backends", ",".join(backends) if isinstance(backends, list) else str(backends)]
     if opts.get("distribute"):
         cmd.append("--distribute")
+    if opts.get("cross_check"):
+        cmd.append("--cross-check")
     if opts.get("mock"):
         cmd.append("--mock")
     if opts.get("delegate"):
@@ -279,6 +281,7 @@ INDEX_HTML = r"""<!doctype html>
       <label style="margin:0"><input type="checkbox" id="mock" checked/> mock (무비용)</label>
       <label style="margin:0"><input type="checkbox" id="delegate"/> delegate (팀 위임)</label>
       <label style="margin:0"><input type="checkbox" id="distribute"/> distribute (풀 분산)</label>
+      <label style="margin:0"><input type="checkbox" id="crossCheck"/> cross-check (교차 검증)</label>
       <span style="flex:1"></span>
       <button id="runBtn" onclick="startRun()">▶ 실행</button>
     </div>
@@ -330,7 +333,8 @@ async function startRun(){
   $("runBtn").disabled=true;$("launchMsg").textContent="실행 시작 중…";
   const blist=$("backends").value.split(",").map(s=>s.trim()).filter(Boolean);
   const body={spec_text,name:$("name").value||f.name.replace(/\.[^.]+$/,""),
-    backend:$("backend").value,backends:blist.length?blist:null,distribute:$("distribute").checked,
+    backend:$("backend").value,backends:blist.length?blist:null,
+    distribute:$("distribute").checked,cross_check:$("crossCheck").checked,
     concurrency:+$("concurrency").value||3,
     max_units:$("maxUnits").value?+$("maxUnits").value:null,
     max_attempts:+$("maxAttempts").value||2,mock:$("mock").checked,delegate:$("delegate").checked};
