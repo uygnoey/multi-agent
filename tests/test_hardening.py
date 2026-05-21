@@ -97,6 +97,16 @@ def test_board_tracks_tokens(tmp_path):
     assert snap["agents"]["backend-developer"]["tokens"] == 1500
 
 
+def test_codex_cost_from_token_pricing():
+    from orchestrator.backends.codex_cli import codex_cost
+
+    # OpenAI 공식 표 기준 (uncached_input*price + cached*price + output*price)
+    assert codex_cost("gpt-5.5", 100_000, 20_000, 10_000) == 0.71
+    assert codex_cost("gpt-5.4-mini", 100_000, 20_000, 10_000) == 0.1065
+    assert codex_cost("gpt-5.5-pro-2026", 1000, 0, 1000) is not None  # prefix 매칭
+    assert codex_cost("unknown-model", 1, 1, 1) is None  # 단가표에 없으면 None
+
+
 def test_board_cost_estimated_flag(tmp_path):
     board = Board(tmp_path / "p")
     asyncio.run(board.init("s", {}))
