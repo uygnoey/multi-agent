@@ -157,6 +157,11 @@ def _print_summary(snap: dict, cfg: RunConfig) -> None:
     done = sum(1 for u in units if u["status"] == "done")
     print(f"units       : {done}/{len(units)} done")
     print(f"cost        : ${snap.get('total_cost_usd', 0.0):.4f}")
+    warnings = snap.get("warnings") or []
+    if warnings:  # 설계/CI/docs 등 실패성 완료를 터미널에서도 놓치지 않게
+        print(f"result      : ⚠ DONE WITH {len(warnings)} WARNING(S)")
+        for w in warnings:
+            print(f"  ⚠ {w}")
     print(f"board       : {cfg.project_dir / '.orchestrator' / 'board.json'}")
     print(f"report      : {cfg.project_dir / '.orchestrator' / 'report.md'}")
 

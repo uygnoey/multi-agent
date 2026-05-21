@@ -222,6 +222,14 @@ class Scheduler:
         if not deps:
             return True
         uid = unit["id"]
+        # 보드에 없는 dep 은 조용히 넘기지 않고 경고로 표면화 (architect 누락/오타 대비)
+        known_ids = {u["id"] for u in self.board.units()}
+        unknown = [d for d in deps if d not in known_ids]
+        if unknown:
+            await self.board.add_warning(f"{uid}: 존재하지 않는 의존성 무시됨: {unknown}")
+            deps = [d for d in deps if d in known_ids]
+            if not deps:
+                return True
         # 단순 시간초과가 아니라 '진행이 멈췄을 때'만 포기한다(stall). dep 가 아직 작업 중이면
         # (상태가 바뀌거나 에이전트가 활동 중이면) 계속 기다린다 — 한 role 호출이 상태를 붙잡는
         # 최대 시간(session_timeout)보다 넉넉한 윈도. timeout 인자를 주면 그 값을 stall 로 쓴다.

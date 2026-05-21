@@ -92,6 +92,42 @@ def test_wait_for_deps_keeps_waiting_while_progressing(tmp_path, sample_spec_pat
     assert asyncio.run(go()) is True
 
 
+def test_coerce_result_marks_failure_from_status_and_blockers():
+    ok = RoleResult(ok=True)
+    assert runner_mod._coerce_result({"status": "done"}, ok)["_ok"] is True
+    assert runner_mod._coerce_result({"status": "failed"}, ok)["_ok"] is False
+    assert runner_mod._coerce_result({"status": "FAILED"}, ok)["_ok"] is False  # 대소문자
+    assert runner_mod._coerce_result({"status": "done", "blockers": ["x"]}, ok)["_ok"] is False
+    assert runner_mod._coerce_result({"status": "DONE"}, ok)["status"] == "done"  # 정규화
+
+
+def test_read_result_broken_json_is_failure(tmp_path):
+    # 백엔드 ok=True 라도 결과파일이 깨졌으면 성공으로 오탐하지 않는다.
+    rp = tmp_path / "r.json"
+    rp.write_text("{not valid json", encoding="utf-8")
+    out = runner_mod.Runner._read_result(rp, RoleResult(ok=True))
+    assert out["_ok"] is False and out["status"] == "failed"
+
+
+def test_add_units_handles_numeric_scalar_deps_roles(tmp_path):
+    board = Board(tmp_path / "p")
+    asyncio.run(board.init("s", {}))
+    asyncio.run(board.add_units([{"id": "U1", "title": "a", "deps": 1, "roles": 123}]))
+    u = board.units()[0]
+    assert u["deps"] == ["1"]  # 숫자 scalar 도 크래시 없이 정규화
+    assert isinstance(u["roles"], list)
+
+
+def test_wait_for_deps_warns_on_unknown_dep(tmp_path, sample_spec_path):
+    cfg = RunConfig(spec_path=sample_spec_path, project_dir=tmp_path / "p", mock=True)
+    sched = Scheduler(cfg)
+    asyncio.run(sched.board.init("s", {}))
+    asyncio.run(sched.board.add_units([{"id": "U2", "title": "b"}]))  # U1 은 board 에 없음
+    ok = asyncio.run(sched._wait_for_deps({"id": "U2", "deps": ["U1"]}))
+    assert ok is True  # 알 수 없는 dep 은 무한 대기 X
+    assert any("U1" in w for w in sched.board.snapshot()["warnings"])  # 경고로 표면화
+
+
 def test_add_units_normalizes_scalar_deps_and_roles(tmp_path):
     # architect 가 "deps":"U0", "roles":"backend-developer" 처럼 스칼라를 줘도 문자 분해되면 안 됨.
     board = Board(tmp_path / "p")
