@@ -314,11 +314,18 @@ def _make_handler(manager: RunManager):
                     board = _read_board(orch)
                     events = _read_events(orch)
                     agent_logs = _read_agent_logs(orch, list(ROLES))
+                running = manager.is_running(run) if run else False
+                # 런이 죽었는데 board 에 "running" 으로 남은 에이전트는 stopped 로 표시
+                # (정상 종료 중 취소되거나 강제 종료된 경우 — 실제로는 안 돌고 있음)
+                if run and not running:
+                    for a in board.get("agents", {}).values():
+                        if a.get("status") == "running":
+                            a["status"] = "stopped"
                 self._json(
                     {
                         "roles": list(ROLES),
                         "board": board,
-                        "running": manager.is_running(run),
+                        "running": running,
                         "project_dir": str(proj) if proj else "",
                         "events": events,
                         "agent_logs": agent_logs if run else {},
