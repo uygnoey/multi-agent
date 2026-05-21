@@ -24,3 +24,6 @@ web-team-web = "orchestrator.webui:main"
 
 [tool.setuptools]
 packages = ["orchestrator", "orchestrator.backends"]
+
+[tool.setuptools.package-data]
+orchestrator = ["codex_pricing.json"]
