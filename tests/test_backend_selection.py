@@ -8,7 +8,7 @@ from pathlib import Path
 from orchestrator import runner as runner_mod
 from orchestrator.backends.base import RoleResult
 from orchestrator.board import Board
-from orchestrator.config import RunConfig
+from orchestrator.config import ROLES, RunConfig
 
 DUMMY = Path("/x")
 
@@ -52,48 +52,25 @@ ROLES_SAMPLE = [
 ]
 
 
-def test_cross_check_splits_build_and_verify():
+def test_cross_check_alternates_no_hardcoded_groups():
+    # 그룹 하드코딩 없음: 미핀 역할들을 두 프로바이더에 번갈아(교차) 배정.
     pool = ["codex", "claude-cli"]
     cfg = _cfg(backend_priority=pool, cross_check=True)
-    # 생산자(build) → pool[0]=codex, 검증자(verify) → pool[1]=claude-cli
-    for build_role in ("backend-developer", "frontend-developer", "dba", "architecture-engineer"):
-        assert cfg.backends_for(build_role)[0] == "codex"
-    for verify_role in ("test-engineer", "qa", "testsheet-creator"):
-        assert cfg.backends_for(verify_role)[0] == "claude-cli"
-    # PM / PL 은 서로 다른 프로바이더 (교차 감독)
-    assert cfg.backends_for("project-manager")[0] != cfg.backends_for("project-leader")[0]
-    # 후보는 여전히 전체 풀(상대 프로바이더로 폴오버)
+    firsts = [cfg.backends_for(r)[0] for r in ROLES]
+    assert set(firsts) == set(pool)  # 두 프로바이더 모두 사용 (한쪽 몰림 X)
+    assert 4 <= firsts.count("codex") <= 6  # 대략 반반 (교차)
+    # 후보는 전체 풀(상대 프로바이더로 폴오버)
     assert sorted(cfg.backends_for("qa")) == sorted(pool)
 
 
-def test_cross_check_seeded_by_user_pick():
-    # 유저가 PM=claude-cli 만 골랐고 나머지는 auto → 이 선택을 시드로 교차 배치.
-    pool = ["codex", "claude-cli"]
-    cfg = _cfg(
-        backend_priority=pool,
-        cross_check=True,
-        role_priority={"project-manager": ["claude-cli"]},
-    )
-    # 명시 선택은 그대로
-    assert cfg.backends_for("project-manager")[0] == "claude-cli"
-    # PM(build 그룹)=claude → build측=claude, verify측=codex
-    assert cfg.backends_for("backend-developer")[0] == "claude-cli"  # build
-    assert cfg.backends_for("dba")[0] == "claude-cli"  # build
-    assert cfg.backends_for("project-leader")[0] == "codex"  # verify (PM과 반대)
-    assert cfg.backends_for("qa")[0] == "codex"  # verify
-    assert cfg.backends_for("test-engineer")[0] == "codex"  # verify
-
-
-def test_cross_check_infers_pool_from_single_default_plus_role_pick():
-    # 웹 케이스: 단일 기본 claude-cli + QA만 codex + cross_check, --backends 미지정
-    # → 풀을 {claude-cli, codex}로 추론해 교차되어야 한다 (예전엔 풀이 1개라 교차 무시됨).
+def test_cross_check_honors_pin_and_crosses_rest():
+    # 웹 케이스: 단일 기본 claude-cli + QA만 codex + cross_check (--backends 미지정).
     cfg = _cfg(default_backend="claude-cli", cross_check=True, role_priority={"qa": ["codex"]})
-    assert cfg.backends_for("qa")[0] == "codex"  # 명시
-    assert cfg.backends_for("test-engineer")[0] == "codex"  # verify → codex (QA 시드)
-    assert cfg.backends_for("project-leader")[0] == "codex"  # verify
-    assert cfg.backends_for("backend-developer")[0] == "claude-cli"  # build
-    assert cfg.backends_for("architecture-engineer")[0] == "claude-cli"  # build
-    assert cfg.backends_for("project-manager")[0] == "claude-cli"  # build
+    assert cfg.backends_for("qa")[0] == "codex"  # 핀 준수
+    firsts = [cfg.backends_for(r)[0] for r in ROLES]
+    # 나머지가 전부 claude 로 몰리지 않고 두 프로바이더가 교차 사용된다
+    assert set(firsts) == {"claude-cli", "codex"}
+    assert firsts.count("codex") >= 2 and firsts.count("claude-cli") >= 2
 
 
 def test_explicit_picks_always_win():
