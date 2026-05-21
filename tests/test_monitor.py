@@ -39,3 +39,11 @@ def test_agents_tracked_after_mock_run(tmp_path, sample_spec_path):
     assert _read_board(orch).get("agents"), "monitor reads agents from board.json"
     log = _read_agent_log(orch, "backend-developer")
     assert "done" in log  # activity log captured start/done lines
+
+
+def test_wrap_line_soft_wraps_by_display_width():
+    from orchestrator.monitor import _wrap_line
+
+    assert _wrap_line("abcdefghij", 4) == ["abcd", "efgh", "ij"]  # ASCII
+    assert _wrap_line("가나다", 4) == ["가나", "다"]  # CJK 폭 2칸
+    assert _wrap_line("", 10) == [""]  # 빈 줄 유지

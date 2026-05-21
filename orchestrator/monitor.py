@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import unicodedata
 from pathlib import Path
 
 from .backends import backend_status
@@ -106,6 +107,29 @@ def _safe_add(win, y: int, x: int, text: str, attr: int = 0) -> None:
             pass
 
 
+def _disp_width(ch: str) -> int:
+    """터미널 표시 폭 (CJK/전각은 2칸)."""
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def _wrap_line(text: str, width: int) -> list[str]:
+    """한 줄을 표시 폭 기준으로 soft-wrap (좁은 화면에서 잘리지 않게)."""
+    text = text.replace("\t", "    ")
+    if width < 2:
+        return [text]
+    out, cur, cur_w = [], "", 0
+    for ch in text:
+        cw = _disp_width(ch)
+        if cur_w + cw > width:
+            out.append(cur)
+            cur, cur_w = ch, cw
+        else:
+            cur += ch
+            cur_w += cw
+    out.append(cur)
+    return out
+
+
 def _draw_list(stdscr, board, roles, sel, orch_dir, alive) -> None:
     import curses
 
@@ -170,7 +194,7 @@ def _draw_list(stdscr, board, roles, sel, orch_dir, alive) -> None:
 def _draw_artifacts(stdscr, board: dict, orch_dir: Path, scroll: int) -> int:
     import curses
 
-    h, _w = stdscr.getmaxyx()
+    h, w = stdscr.getmaxyx()
     proj = str(orch_dir.parent)
     body = [f"📁 {proj}", ""]
     glob = board.get("artifacts", [])
@@ -190,6 +214,8 @@ def _draw_artifacts(stdscr, board: dict, orch_dir: Path, scroll: int) -> int:
     _safe_add(stdscr, 0, 0, " ARTIFACTS (생성된 파일) ", curses.A_REVERSE | curses.A_BOLD)
     top = 2
     view_h = max(1, h - top - 1)
+    view_w = max(2, w - 2)
+    body = [seg for line in body for seg in _wrap_line(line, view_w)]  # soft-wrap
     scroll = min(scroll, max(0, len(body) - view_h))
     for j, line in enumerate(body[scroll : scroll + view_h]):
         _safe_add(stdscr, top + j, 1, line)
@@ -245,6 +271,8 @@ def _draw_detail(stdscr, board: dict, orch_dir: Path, role: str, scroll: int, fo
 
     top = 3
     view_h = max(1, h - top - 1)
+    view_w = max(2, w - 2)
+    body = [seg for line in body for seg in _wrap_line(line, view_w)]  # soft-wrap
     max_scroll = max(0, len(body) - view_h)
     scroll = max_scroll if follow else min(scroll, max_scroll)  # follow → 맨 아래
     for j, line in enumerate(body[scroll : scroll + view_h]):
