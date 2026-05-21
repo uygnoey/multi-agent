@@ -110,13 +110,21 @@ class Scheduler:
             await self.board.log_event("scheduler", "Phase D: CI/CD")
             cicd_out = await self.runner.run_role("cicd")
             await self.board.add_global_artifacts(cicd_out.get("artifacts", []))
+
+            # 모든 작업 완료 → 감독(PM/PL)을 graceful 종료(현재 tick 끝까지 대기, 취소 X).
+            # 감독이 다 멈춘 뒤에야 done — done 시점엔 어떤 에이전트도 돌고 있지 않다.
+            await self.board.set_phase("finishing")
+            self._stop.set()
+            await asyncio.gather(*sup_tasks, return_exceptions=True)
+            sup_tasks = []
             await self.board.set_phase("done")
         finally:
             self._stop.set()
             for t in sup_tasks:
                 t.cancel()
-            await asyncio.gather(*sup_tasks, return_exceptions=True)
-            # 취소로 idle 처리 못 한 감독 등, running 으로 남은 에이전트 정리
+            if sup_tasks:
+                await asyncio.gather(*sup_tasks, return_exceptions=True)
+            # (예외 경로 등) running 으로 남은 에이전트 정리
             for role, a in self.board.agents().items():
                 if a.get("status") == "running":
                     await self.board.agent_update(role, status="idle", activity="run ended")
