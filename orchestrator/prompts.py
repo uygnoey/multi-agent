@@ -25,10 +25,9 @@ _ROLE_INSTRUCTION = {
     "cicd": "Set up the build/test/deploy pipeline (.github/workflows/).",
     "docs-writer": (
         "From the ACTUAL code/design, write the full human-readable deliverable set in EN and KO "
-        "(docs/<NAME>.md + <NAME>.ko.md): index, ERD (mermaid erDiagram), SEQUENCE (mermaid "
-        "sequenceDiagram), DB_TABLES (테이블 정의서), API (API 정의서), USER_MANUAL (사용자 매뉴얼), "
-        "DEPLOY (배포 가이드), RUN_GUIDE (실행 가이드), ARCHITECTURE. Use mermaid diagrams and tables; "
-        "match real tables/endpoints/commands — no filler."
+        "(docs/<NAME>.md + <NAME>.ko.md): index, ERD (mermaid erDiagram), "
+        "SEQUENCE (mermaid sequenceDiagram), DB_TABLES, API, USER_MANUAL, DEPLOY, RUN_GUIDE, "
+        "ARCHITECTURE. Use mermaid diagrams and tables; match real tables/endpoints/commands."
     ),
     "project-manager": (
         "Review the current board and recent events, then write a short, actionable directive "

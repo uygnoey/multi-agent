@@ -129,7 +129,8 @@ python -m orchestrator --watch --project-dir /tmp/demo-web
 - **리스트 뷰**: 10개 역할의 상태(● 실행중 / ○ 대기)·누적 비용·호출수·현재 unit
 - **↑/↓**(또는 j/k) 이동, **Enter** 로 해당 에이전트 상세 진입
 - **상세 뷰**: 그 에이전트가 실시간으로 무엇을 하는지(활동 로그)·비용·백엔드. **b/Esc** 로 리스트 복귀, **q** 종료
-- **c**: 백엔드 가용성 체크 뷰 (✅/❌ + 설명)
+- **a**: 산출물(파일) 뷰 · **c**: 백엔드 가용성 체크 (✅/❌)
+- 헤더에 phase·비용·units·**동시 실행 수**·상태(running/stopped), 에이전트별 **모델** 표시
 - 헤드리스/CI: `python -m orchestrator.monitor --project-dir <dir> --once` 로 1회 텍스트 스냅샷
 
 ## 웹 UI

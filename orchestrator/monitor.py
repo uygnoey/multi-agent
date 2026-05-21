@@ -15,10 +15,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 from .backends import backend_status
 from .config import BACKEND_INFO, ROLES
+
+
+def _run_alive(orch_dir: Path) -> bool:
+    """run.pid 의 프로세스가 살아있는지 (웹 UI 와 동일 기준)."""
+    pf = orch_dir / "run.pid"
+    if not pf.exists():
+        return False
+    try:
+        os.kill(int(pf.read_text(encoding="utf-8").strip()), 0)
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def _read_board(orch_dir: Path) -> dict:
@@ -41,24 +54,37 @@ def _read_agent_log(orch_dir: Path, role: str, n: int = 400) -> str:
         return ""
 
 
-def render_snapshot(board: dict, roles: list[str]) -> str:
-    """Pure text snapshot of the agent table (used by --once and tests)."""
+def render_snapshot(board: dict, roles: list[str], alive: bool | None = None) -> str:
+    """Pure text snapshot of the agent table (used by --once and tests).
+
+    alive=False 면 죽은 run 으로 보고 running 에이전트를 stopped 로 표시(웹과 동일).
+    """
     phase = board.get("phase", "?")
     cost = board.get("total_cost_usd", 0.0)
     units = board.get("units", [])
     done = sum(1 for u in units if u.get("status") == "done")
     agents = board.get("agents", {})
 
-    lines = [f"phase={phase}   cost=${cost:.4f}   units={done}/{len(units)}", ""]
-    lines.append(f"   {'agent':<22}{'state':<9}{'$cost':>9}{'calls':>6}  unit")
-    lines.append("   " + "-" * 52)
+    def status_of(a):
+        st = a.get("status", "-")
+        return "stopped" if (alive is False and st == "running") else st
+
+    run_n = sum(1 for r in roles if status_of(agents.get(r, {})) == "running")
+    lines = [
+        f"phase={phase}   cost=${cost:.4f}   units={done}/{len(units)}   running_agents={run_n}",
+        "",
+        f"   {'agent':<22}{'state':<9}{'model/backend':<22}{'$cost':>9}{'calls':>6}  unit",
+        "   " + "-" * 74,
+    ]
     for r in roles:
         a = agents.get(r, {})
-        st = a.get("status", "-")
+        st = status_of(a)
         icon = "●" if st == "running" else "○"
+        model = (a.get("model") or a.get("backend") or "")[:20]
         unit = a.get("current_unit") or ""
         lines.append(
-            f" {icon} {r:<22}{st:<9}{a.get('cost_usd', 0.0):>9.4f}{a.get('calls', 0):>6}  {unit}"
+            f" {icon} {r:<22}{st:<9}{model:<22}{a.get('cost_usd', 0.0):>9.4f}"
+            f"{a.get('calls', 0):>6}  {unit}"
         )
     return "\n".join(lines)
 
@@ -75,7 +101,7 @@ def _safe_add(win, y: int, x: int, text: str, attr: int = 0) -> None:
             pass
 
 
-def _draw_list(stdscr, board: dict, roles: list[str], sel: int) -> None:
+def _draw_list(stdscr, board, roles, sel, orch_dir, alive) -> None:
     import curses
 
     h, w = stdscr.getmaxyx()
@@ -85,26 +111,42 @@ def _draw_list(stdscr, board: dict, roles: list[str], sel: int) -> None:
     done = sum(1 for u in units if u.get("status") == "done")
     agents = board.get("agents", {})
 
+    def status_of(a):
+        st = a.get("status", "idle")
+        return "stopped" if (not alive and st == "running") else st
+
+    run_n = sum(1 for r in roles if status_of(agents.get(r, {})) == "running")
+
     _safe_add(stdscr, 0, 0, " MULTI-AGENT MONITOR ", curses.A_REVERSE | curses.A_BOLD)
     _safe_add(
         stdscr,
         1,
         0,
-        f" phase: {phase}    total cost: ${cost:.4f}    units: {done}/{len(units)}",
+        f" phase:{phase}  cost:${cost:.4f}  units:{done}/{len(units)}  "
+        f"동시실행:{run_n}  [{'running' if alive else 'stopped'}]",
         curses.A_BOLD,
     )
+    _safe_add(stdscr, 2, 1, f"📁 {orch_dir.parent}", curses.A_DIM)
     _safe_add(
-        stdscr, 3, 1, f"{'AGENT':<24}{'STATE':<10}{'$COST':>9}{'CALLS':>6}  UNIT", curses.A_DIM
+        stdscr,
+        4,
+        1,
+        f"{'AGENT':<22}{'STATE':<9}{'MODEL/BACKEND':<20}{'$COST':>9}{'CALLS':>5}  UNIT",
+        curses.A_DIM,
     )
 
-    row = 4
+    row = 5
     for i, r in enumerate(roles):
         a = agents.get(r, {})
-        st = a.get("status", "idle")
+        st = status_of(a)
         running = st == "running"
         icon = "●" if running else "○"
+        model = (a.get("model") or a.get("backend") or "-")[:18]
         unit = a.get("current_unit") or "-"
-        line = f"{icon} {r:<22}{st:<10}{a.get('cost_usd', 0.0):>9.4f}{a.get('calls', 0):>6}  {unit}"
+        line = (
+            f"{icon} {r:<22}{st:<9}{model:<20}{a.get('cost_usd', 0.0):>9.4f}"
+            f"{a.get('calls', 0):>5}  {unit}"
+        )
         attr = curses.A_REVERSE if i == sel else (curses.A_BOLD if running else 0)
         _safe_add(stdscr, row + i, 1, line, attr)
 
@@ -112,9 +154,39 @@ def _draw_list(stdscr, board: dict, roles: list[str], sel: int) -> None:
         stdscr,
         h - 1,
         0,
-        " ↑/↓ move   Enter: open   c: backends   q: quit ",
+        " ↑/↓ move   Enter: open   a: artifacts   c: backends   q: quit ",
         curses.A_REVERSE,
     )
+
+
+def _draw_artifacts(stdscr, board: dict, orch_dir: Path, scroll: int) -> int:
+    import curses
+
+    h, _w = stdscr.getmaxyx()
+    proj = str(orch_dir.parent)
+    body = [f"📁 {proj}", ""]
+    glob = board.get("artifacts", [])
+    if glob:
+        body.append("[ 설계·공통 / design & shared ]")
+        body += [f"  {proj}/{a}" for a in glob]
+        body.append("")
+    for u in board.get("units", []):
+        arts = u.get("artifacts", [])
+        if arts:
+            body.append(f"[ {u['id']} — {u.get('title', '')} ]  ({u.get('status')})")
+            body += [f"  {proj}/{a}" for a in arts]
+            body.append("")
+    if len(body) <= 2:
+        body.append("(아직 생성된 산출물 없음)")
+
+    _safe_add(stdscr, 0, 0, " ARTIFACTS (생성된 파일) ", curses.A_REVERSE | curses.A_BOLD)
+    top = 2
+    view_h = max(1, h - top - 1)
+    scroll = min(scroll, max(0, len(body) - view_h))
+    for j, line in enumerate(body[scroll : scroll + view_h]):
+        _safe_add(stdscr, top + j, 1, line)
+    _safe_add(stdscr, h - 1, 0, " ↑/↓ scroll   b/Esc: back   q: quit ", curses.A_REVERSE)
+    return scroll
 
 
 def _draw_backends(stdscr) -> None:
@@ -146,8 +218,9 @@ def _draw_detail(stdscr, board: dict, orch_dir: Path, role: str, scroll: int) ->
         stdscr,
         1,
         0,
-        f" state: {st}    $cost: {a.get('cost_usd', 0.0):.4f}    calls: {a.get('calls', 0)}"
-        f"    unit: {a.get('current_unit') or '-'}    backend: {a.get('backend') or '-'}",
+        f" state: {st}    model: {a.get('model') or '-'}    $cost: {a.get('cost_usd', 0.0):.4f}"
+        f"    calls: {a.get('calls', 0)}    unit: {a.get('current_unit') or '-'}"
+        f"    backend: {a.get('backend') or '-'}",
         curses.A_BOLD if running else 0,
     )
     _safe_add(stdscr, 2, 1, "activity (live):", curses.A_DIM)
@@ -184,9 +257,12 @@ def run_tui(project_dir: Path, interval: float = 1.0) -> None:
         scroll = 0
         while True:
             board = _read_board(orch)
+            alive = _run_alive(orch)
             stdscr.erase()
             if mode == "backends":
                 _draw_backends(stdscr)
+            elif mode == "artifacts":
+                scroll = _draw_artifacts(stdscr, board, orch, scroll)
             elif not board:
                 _safe_add(stdscr, 0, 0, " MULTI-AGENT MONITOR ", curses.A_REVERSE)
                 _safe_add(stdscr, 2, 1, f"run 대기 중… {orch / 'board.json'} 가 아직 없습니다.")
@@ -194,7 +270,7 @@ def run_tui(project_dir: Path, interval: float = 1.0) -> None:
                     stdscr, 3, 1, "오케스트레이터 실행 시 자동 갱신.  c: 백엔드 체크   q: 종료"
                 )
             elif mode == "list":
-                _draw_list(stdscr, board, roles, sel)
+                _draw_list(stdscr, board, roles, sel, orch, alive)
             else:
                 scroll = _draw_detail(stdscr, board, orch, detail_role, scroll)
             stdscr.refresh()
@@ -210,6 +286,13 @@ def run_tui(project_dir: Path, interval: float = 1.0) -> None:
             if mode == "backends":
                 if c in (ord("b"), 27, ord("c"), curses.KEY_LEFT):
                     mode = "list"
+            elif mode == "artifacts":
+                if c in (ord("b"), 27, ord("a"), curses.KEY_LEFT):
+                    mode = "list"
+                elif c in (curses.KEY_DOWN, ord("j")):
+                    scroll += 1
+                elif c in (curses.KEY_UP, ord("k")):
+                    scroll = max(0, scroll - 1)
             elif mode == "list":
                 if c in (curses.KEY_DOWN, ord("j")):
                     sel = min(len(roles) - 1, sel + 1)
@@ -217,6 +300,8 @@ def run_tui(project_dir: Path, interval: float = 1.0) -> None:
                     sel = max(0, sel - 1)
                 elif c in (curses.KEY_ENTER, 10, 13, curses.KEY_RIGHT):
                     mode, detail_role, scroll = "detail", roles[sel], 0
+                elif c == ord("a"):
+                    mode, scroll = "artifacts", 0
                 elif c == ord("c"):
                     mode = "backends"
             else:
@@ -245,7 +330,7 @@ def main(argv=None) -> int:
         if not board:
             print(f"(no run state at {orch / 'board.json'})")
             return 1
-        print(render_snapshot(board, list(ROLES)))
+        print(render_snapshot(board, list(ROLES), _run_alive(orch)))
         return 0
 
     try:
