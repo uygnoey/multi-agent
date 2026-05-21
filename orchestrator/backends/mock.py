@@ -88,20 +88,9 @@ class MockBackend(Backend):
                 "    steps:\n      - run: echo mock-ci\n",
             )
         elif role == "docs-writer":
-            write(
-                "docs/RUN_GUIDE.md",
-                "# Run Guide (mock)\n\n## Prerequisites\n- Python 3.10+, Node 18+\n\n"
-                "## Install & Run\n```bash\npip install -r backend/requirements.txt\n"
-                "uvicorn app.main:app --app-dir backend --port 8000\n```\n\n"
-                "## Tests\n`pytest tests/`\n",
-            )
-            write(
-                "docs/RUN_GUIDE.ko.md",
-                "# 실행 가이드 (mock)\n\n## 사전 준비\n- Python 3.10+, Node 18+\n\n"
-                "## 설치 및 실행\n```bash\npip install -r backend/requirements.txt\n"
-                "uvicorn app.main:app --app-dir backend --port 8000\n```\n\n"
-                "## 테스트\n`pytest tests/`\n",
-            )
+            for name, (en, ko) in _mock_doc_set().items():
+                write(f"docs/{name}.md", en)
+                write(f"docs/{name}.ko.md", ko)
 
         result = {
             "status": status,
@@ -143,6 +132,69 @@ def _derive_units(spec_text: str) -> list[dict]:
         }
         for i, f in enumerate(feats, 1)
     ]
+
+
+def _mock_doc_set() -> dict[str, tuple[str, str]]:
+    """무비용 mock 의 전체 문서 세트 샘플 (EN, KO). 실 백엔드는 실제 코드 기준으로 작성."""
+    erd = (
+        "```mermaid\nerDiagram\n  USERS ||--o{ TASKS : owns\n"
+        "  USERS { int id PK\n string email\n string password_hash }\n"
+        "  TASKS { int id PK\n int user_id FK\n string title\n string status }\n```\n"
+    )
+    seq = (
+        "```mermaid\nsequenceDiagram\n  participant U as User\n  participant F as Frontend\n"
+        "  participant B as Backend\n  U->>F: login(email, pw)\n  F->>B: POST /api/auth/login\n"
+        "  B-->>F: token\n  F-->>U: 로그인 완료\n```\n"
+    )
+    arch = "```mermaid\nflowchart LR\n  FE[React/Vite] -->|REST| BE[FastAPI]\n  BE --> DB[(SQLite)]\n```\n"
+    tables = (
+        "| column | type | null | key | description |\n|---|---|---|---|---|\n"
+        "| id | INTEGER | NO | PK | 고유 id |\n| email | TEXT | NO | UNIQUE | 사용자 이메일 |\n"
+        "| password_hash | TEXT | NO |  | 해시된 비밀번호 |\n"
+    )
+    api = (
+        "| method | path | auth | request | response |\n|---|---|---|---|---|\n"
+        "| POST | /api/auth/login | - | {email,password} | {token} |\n"
+        "| GET | /api/tasks | Bearer | - | [Task] |\n"
+    )
+    return {
+        "index": (
+            "# Deliverables (mock sample)\n\n- [ERD](ERD.md) · [SEQUENCE](SEQUENCE.md) · "
+            "[DB_TABLES](DB_TABLES.md) · [API](API.md)\n- [USER_MANUAL](USER_MANUAL.md) · "
+            "[DEPLOY](DEPLOY.md) · [RUN_GUIDE](RUN_GUIDE.md) · [ARCHITECTURE](ARCHITECTURE.md)\n",
+            "# 산출물 문서 (mock 샘플)\n\n- [ERD](ERD.ko.md) · [시퀀스](SEQUENCE.ko.md) · "
+            "[DB 테이블 정의서](DB_TABLES.ko.md) · [API 정의서](API.ko.md)\n- "
+            "[사용자 매뉴얼](USER_MANUAL.ko.md) · [배포 가이드](DEPLOY.ko.md) · "
+            "[실행 가이드](RUN_GUIDE.ko.md) · [아키텍처](ARCHITECTURE.ko.md)\n",
+        ),
+        "ERD": (f"# ERD\n\n{erd}", f"# ERD (개체-관계도)\n\n{erd}"),
+        "SEQUENCE": (
+            f"# Sequence Diagrams\n\n## Login\n{seq}",
+            f"# 시퀀스 다이어그램\n\n## 로그인\n{seq}",
+        ),
+        "DB_TABLES": (
+            f"# DB Tables\n\n## users\n{tables}",
+            f"# DB 테이블 정의서\n\n## users\n{tables}",
+        ),
+        "API": (f"# API\n\n{api}", f"# API 정의서\n\n{api}"),
+        "USER_MANUAL": (
+            "# User Manual\n\n1. Sign up / log in.\n2. Create tasks.\n3. Move tasks on the board.\n",
+            "# 사용자 매뉴얼\n\n1. 회원가입 / 로그인.\n2. 태스크 생성.\n3. 보드에서 상태 이동.\n",
+        ),
+        "DEPLOY": (
+            "# Deploy Guide\n\n- Env vars: `DB_PATH`, secrets via env.\n- CI: `.github/workflows/ci.yml`.\n"
+            "- Build & deploy: container or host.\n",
+            "# 배포 가이드\n\n- 환경변수: `DB_PATH`, 비밀값은 env.\n- CI: `.github/workflows/ci.yml`.\n"
+            "- 빌드·배포: 컨테이너 또는 호스트.\n",
+        ),
+        "RUN_GUIDE": (
+            "# Run Guide\n\n```bash\npip install -r backend/requirements.txt\n"
+            "uvicorn app.main:app --app-dir backend --port 8000\n```\n`pytest tests/`\n",
+            "# 실행 가이드\n\n```bash\npip install -r backend/requirements.txt\n"
+            "uvicorn app.main:app --app-dir backend --port 8000\n```\n`pytest tests/`\n",
+        ),
+        "ARCHITECTURE": (f"# Architecture\n\n{arch}", f"# 아키텍처\n\n{arch}"),
+    }
 
 
 def _mock_e2e(spec_text: str) -> str:

@@ -14,3 +14,5 @@ select = ["E", "F", "I", "UP", "B"]
 "tests/*" = ["E501", "B"]
 # webui.py embeds a single-file HTML/CSS/JS UI as a string literal (long lines are intentional).
 "orchestrator/webui.py" = ["E501"]
+# mock.py embeds sample document content (mermaid/markdown) as string literals.
+"orchestrator/backends/mock.py" = ["E501"]
