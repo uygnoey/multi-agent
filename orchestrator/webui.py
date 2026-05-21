@@ -30,6 +30,17 @@ MAX_BODY_BYTES = 4 * 1024 * 1024  # 요청 바디 상한 (메모리 고갈 방�
 MAX_SPEC_BYTES = 1024 * 1024  # 기획서 텍스트 상한
 
 
+def _read_events(orch_dir, n: int = 300) -> str:
+    """events.log 의 최근 n 줄 (실시간 로그 패널용)."""
+    p = orch_dir / "events.log"
+    if not p.exists():
+        return ""
+    try:
+        return "\n".join(p.read_text(encoding="utf-8", errors="replace").splitlines()[-n:])
+    except Exception:
+        return ""
+
+
 def slugify(name: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9_-]+", "-", (name or "").strip()).strip("-").lower()
     return s or "run"
@@ -178,13 +189,26 @@ def _make_handler(manager: RunManager):
                 self._json({"backends": rows, "roles": list(ROLES)})
             elif u.path == "/api/state":
                 run = (q.get("run") or [""])[0]
-                try:
-                    board = _read_board(manager.project_dir(run) / ".orchestrator") if run else {}
-                except ValueError:
-                    self._json({"error": "invalid run id"}, 400)
-                    return
+                proj = None
+                board = {}
+                events = ""
+                if run:
+                    try:
+                        proj = manager.project_dir(run)
+                    except ValueError:
+                        self._json({"error": "invalid run id"}, 400)
+                        return
+                    orch = proj / ".orchestrator"
+                    board = _read_board(orch)
+                    events = _read_events(orch)
                 self._json(
-                    {"roles": list(ROLES), "board": board, "running": manager.is_running(run)}
+                    {
+                        "roles": list(ROLES),
+                        "board": board,
+                        "running": manager.is_running(run),
+                        "project_dir": str(proj) if proj else "",
+                        "events": events,
+                    }
                 )
             elif u.path == "/api/agent":
                 run = (q.get("run") or [""])[0]
@@ -345,32 +369,31 @@ INDEX_HTML = r"""<!doctype html>
     <p class="muted" id="launchMsg"></p>
   </section>
 
-  <!-- Monitor: list -->
-  <section id="listView" class="card hide">
+  <!-- Monitor: 단일 대시보드 (클릭 불필요, 모두 항상 표시) -->
+  <section id="dash" class="card hide">
+    <div class="muted" style="margin-bottom:6px">
+      📁 결과물 저장 위치: <b id="projDir" style="user-select:all">—</b>
+    </div>
     <div class="row" style="align-items:center;margin-bottom:8px">
       <div class="muted">phase <b id="phase">—</b></div>
       <div class="muted">cost <b class="cost" id="cost">$0</b></div>
       <div class="muted">units <b id="units">0/0</b></div>
       <div class="muted">상태 <span class="pill" id="running">—</span></div>
     </div>
-    <table><thead><tr><th>agent</th><th>state</th><th>$cost</th><th>calls</th><th>unit</th></tr></thead>
-      <tbody id="agentRows"></tbody></table>
-    <p class="muted">행을 클릭하면 그 에이전트가 실시간으로 무엇을 하는지 봅니다.</p>
-  </section>
 
-  <!-- Monitor: detail -->
-  <section id="detailView" class="card hide">
-    <button class="secondary" onclick="back()">← 뒤로 (리스트)</button>
-    <h3 id="dRole" style="margin:12px 0 4px"></h3>
-    <div class="row muted" style="margin-bottom:8px">
-      <div>state <b id="dState">—</b></div><div>cost <b class="cost" id="dCost">$0</b></div>
-      <div>calls <b id="dCalls">0</b></div><div>unit <b id="dUnit">—</b></div><div>backend <b id="dBackend">—</b></div>
-    </div>
-    <pre id="dLog">(활동 로그)</pre>
+    <h4 style="margin:6px 0">에이전트 (실시간)</h4>
+    <table><thead><tr><th>agent</th><th>state</th><th>$cost</th><th>calls</th><th>unit</th><th>최근 활동</th></tr></thead>
+      <tbody id="agentRows"></tbody></table>
+
+    <h4 style="margin:14px 0 6px">실시간 로그</h4>
+    <pre id="liveLog" style="max-height:38vh">(로그 대기 중…)</pre>
+
+    <h4 style="margin:14px 0 6px">산출물 (생성된 파일)</h4>
+    <div id="artifacts" class="muted" style="font-size:12px">(아직 없음)</div>
   </section>
 </main>
 <script>
-let CUR=null, AGENT=null;
+let CUR=null;
 const $=id=>document.getElementById(id);
 async function loadChecks(){
   let data={backends:[],roles:[]};
@@ -420,39 +443,40 @@ async function refreshRuns(){
   j.runs.forEach(r=>{const o=document.createElement("option");o.value=r.id;o.text=r.id;sel.appendChild(o)});
   if(CUR)sel.value=CUR;
 }
-function showLaunch(){CUR=null;AGENT=null;$("launch").classList.remove("hide");
-  $("listView").classList.add("hide");$("detailView").classList.add("hide")}
-function selectRun(id){if(!id)return;CUR=id;AGENT=null;$("runSel").value=id;
-  $("launch").classList.add("hide");$("detailView").classList.add("hide");$("listView").classList.remove("hide")}
-function openAgent(role){AGENT=role;$("listView").classList.add("hide");$("detailView").classList.remove("hide")}
-function back(){AGENT=null;$("detailView").classList.add("hide");$("listView").classList.remove("hide")}
+function showLaunch(){CUR=null;$("launch").classList.remove("hide");$("dash").classList.add("hide")}
+function selectRun(id){if(!id)return;CUR=id;$("runSel").value=id;
+  $("launch").classList.add("hide");$("dash").classList.remove("hide")}
 
 function statusDot(s){return '<span class="dot'+(s==="running"?" run":"")+'"></span>'}
+function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
 async function tick(){
   if(!CUR)return;
   try{
     const s=await (await fetch("/api/state?run="+encodeURIComponent(CUR))).json();
-    const b=s.board||{};const ag=b.agents||{};
+    const b=s.board||{};const ag=b.agents||{};const proj=s.project_dir||"";
     const done=(b.units||[]).filter(u=>u.status==="done").length;
+    $("projDir").textContent=proj||"—";
     $("phase").textContent=b.phase||"—";
     $("cost").textContent="$"+(b.total_cost_usd||0).toFixed(4);
     $("units").textContent=done+"/"+((b.units||[]).length);
     $("running").textContent=s.running?"running":"stopped";
-    if(!AGENT){
-      $("agentRows").innerHTML=(s.roles||[]).map(r=>{const a=ag[r]||{};
-        return '<tr class="agent" onclick="openAgent(\''+r+'\')"><td>'+statusDot(a.status)+r+
-          '</td><td>'+(a.status||"idle")+'</td><td class="cost">$'+(+(a.cost_usd||0)).toFixed(4)+
-          '</td><td>'+(a.calls||0)+'</td><td>'+(a.current_unit||"-")+'</td></tr>'}).join("");
-    }else{
-      const j=await (await fetch("/api/agent?run="+encodeURIComponent(CUR)+"&role="+AGENT)).json();
-      const a=j.agent||{};
-      $("dRole").textContent=AGENT;$("dState").textContent=a.status||"idle";
-      $("dCost").textContent="$"+(+(a.cost_usd||0)).toFixed(4);$("dCalls").textContent=a.calls||0;
-      $("dUnit").textContent=a.current_unit||"-";$("dBackend").textContent=a.backend||"-";
-      let log=j.log||"(아직 활동 없음)";
-      if(a.last_message)log+="\n\n── last message ──\n"+a.last_message;
-      $("dLog").textContent=log;
-    }
+    // 에이전트 표 — 최근 활동(last_message)을 인라인으로 (클릭 불필요)
+    $("agentRows").innerHTML=(s.roles||[]).map(r=>{const a=ag[r]||{};
+      const act=(a.last_message||"").replace(/\s+/g," ").slice(0,90);
+      return '<tr><td>'+statusDot(a.status)+r+'</td><td>'+(a.status||"idle")+
+        '</td><td class="cost">$'+(+(a.cost_usd||0)).toFixed(4)+'</td><td>'+(a.calls||0)+
+        '</td><td>'+(a.current_unit||"-")+'</td><td class="muted" title="'+esc(a.last_message||"")+
+        '">'+esc(act)+'</td></tr>'}).join("");
+    // 실시간 로그 — 항상 표시 + 자동 스크롤
+    const log=$("liveLog");const atBottom=log.scrollTop+log.clientHeight>=log.scrollHeight-30;
+    log.textContent=s.events||"(로그 대기 중…)";
+    if(atBottom)log.scrollTop=log.scrollHeight;
+    // 산출물 — 어디 저장됐는지 파일 경로로
+    let html="<div>보드/런상태: <b style='user-select:all'>"+esc(proj)+"/.orchestrator/</b></div>";
+    (b.units||[]).forEach(u=>{const arts=u.artifacts||[];if(arts.length){
+      html+="<div style='margin-top:6px'><b>"+esc(u.id)+"</b> ("+esc(u.status)+", "+arts.length+" files)<br>"+
+        arts.map(a=>"&nbsp;&nbsp;"+esc(proj)+"/"+esc(a)).join("<br>")+"</div>"}});
+    $("artifacts").innerHTML=html;
   }catch(e){}
 }
 loadChecks();refreshRuns();setInterval(tick,1000);
