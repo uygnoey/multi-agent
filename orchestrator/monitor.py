@@ -213,7 +213,11 @@ def _draw_backends(stdscr) -> None:
     _safe_add(stdscr, h - 1, 0, " b/Esc: back   q: quit ", curses.A_REVERSE)
 
 
-def _draw_detail(stdscr, board: dict, orch_dir: Path, role: str, scroll: int) -> int:
+def _draw_detail(stdscr, board: dict, orch_dir: Path, role: str, scroll: int, follow: bool):
+    """에이전트 상세 로그. follow=True 면 최신(맨 아래)을 자동으로 따라간다(스트리밍).
+
+    (effective_scroll, max_scroll) 를 반환해 호출자가 스크롤 상태를 갱신할 수 있게 한다.
+    """
     import curses
 
     h, w = stdscr.getmaxyx()
@@ -233,7 +237,7 @@ def _draw_detail(stdscr, board: dict, orch_dir: Path, role: str, scroll: int) ->
     )
     _safe_add(stdscr, 2, 1, "activity (live):", curses.A_DIM)
 
-    log = _read_agent_log(orch_dir, role)
+    log = _read_agent_log(orch_dir, role, n=2000)
     body = log.splitlines() if log else ["(아직 활동 없음 — 이 에이전트가 시작되면 채워집니다)"]
     last_msg = a.get("last_message") or ""
     if last_msg:
@@ -242,12 +246,14 @@ def _draw_detail(stdscr, board: dict, orch_dir: Path, role: str, scroll: int) ->
     top = 3
     view_h = max(1, h - top - 1)
     max_scroll = max(0, len(body) - view_h)
-    scroll = min(scroll, max_scroll)
+    scroll = max_scroll if follow else min(scroll, max_scroll)  # follow → 맨 아래
     for j, line in enumerate(body[scroll : scroll + view_h]):
         _safe_add(stdscr, top + j, 1, line)
 
-    _safe_add(stdscr, h - 1, 0, " ↑/↓ scroll   b/Esc: back   q: quit ", curses.A_REVERSE)
-    return scroll
+    foot = " ↑/↓ scroll   G: 최신따라가기   b/Esc: back   q: quit "
+    foot += "  ● LIVE(따라가는 중)" if follow else "  ⏸ paused(↑로 위로 봄)"
+    _safe_add(stdscr, h - 1, 0, foot, curses.A_REVERSE)
+    return scroll, max_scroll
 
 
 def run_tui(project_dir: Path, interval: float = 1.0) -> None:
@@ -263,6 +269,8 @@ def run_tui(project_dir: Path, interval: float = 1.0) -> None:
         sel = 0
         detail_role = None
         scroll = 0
+        detail_follow = True  # 상세 로그: 기본은 최신 따라가기(스트리밍)
+        max_scroll = 0
         while True:
             board = _read_board(orch)
             alive = _run_alive(orch)
@@ -280,7 +288,9 @@ def run_tui(project_dir: Path, interval: float = 1.0) -> None:
             elif mode == "list":
                 _draw_list(stdscr, board, roles, sel, orch, alive)
             else:
-                scroll = _draw_detail(stdscr, board, orch, detail_role, scroll)
+                scroll, max_scroll = _draw_detail(
+                    stdscr, board, orch, detail_role, scroll, detail_follow
+                )
             stdscr.refresh()
 
             try:
@@ -307,18 +317,22 @@ def run_tui(project_dir: Path, interval: float = 1.0) -> None:
                 elif c in (curses.KEY_UP, ord("k")):
                     sel = max(0, sel - 1)
                 elif c in (curses.KEY_ENTER, 10, 13, curses.KEY_RIGHT):
-                    mode, detail_role, scroll = "detail", roles[sel], 0
+                    mode, detail_role, scroll, detail_follow = "detail", roles[sel], 0, True
                 elif c == ord("a"):
                     mode, scroll = "artifacts", 0
                 elif c == ord("c"):
                     mode = "backends"
-            else:
+            else:  # detail: 기본은 최신 따라가기, ↑로 보면 멈춤, G 로 다시 따라가기
                 if c in (ord("b"), 27, curses.KEY_LEFT):
                     mode = "list"
-                elif c in (curses.KEY_DOWN, ord("j")):
-                    scroll += 1
                 elif c in (curses.KEY_UP, ord("k")):
+                    detail_follow = False
                     scroll = max(0, scroll - 1)
+                elif c in (curses.KEY_DOWN, ord("j")):
+                    scroll = min(scroll + 1, max_scroll)
+                    detail_follow = scroll >= max_scroll  # 맨 아래 도달 시 다시 따라가기
+                elif c in (ord("G"), curses.KEY_END):
+                    detail_follow = True
 
     curses.wrapper(_loop)
 
