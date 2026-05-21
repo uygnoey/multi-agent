@@ -20,6 +20,8 @@
   | OpenAI | `openai-agents` (OpenAI Agents SDK) | `codex` (`codex exec`) |
 
   추가로 네이티브 Team Agents 리드 디스패치용 `claude-team`, 무비용 검증용 `mock` 백엔드 포함.
+  (`claude-cli` = **Claude Code**. 별칭 허용: `claude-code`→claude-cli, `openai-sdk`→openai-agents.
+  가용성은 `--check` / TUI `c` 키 / 웹 상태 패널에서 확인.)
 - **4종 동시 사용 + 우선순위 + 폴오버**: 한 런에서 백엔드를 풀로 묶어 동시에 쓴다.
   ```bash
   # 우선순위(폴오버): claude-cli 우선, 실패 시 codex→claude-sdk→openai-agents
@@ -122,6 +124,7 @@ python -m orchestrator --watch --project-dir /tmp/demo-web
 - **리스트 뷰**: 10개 역할의 상태(● 실행중 / ○ 대기)·누적 비용·호출수·현재 unit
 - **↑/↓**(또는 j/k) 이동, **Enter** 로 해당 에이전트 상세 진입
 - **상세 뷰**: 그 에이전트가 실시간으로 무엇을 하는지(활동 로그)·비용·백엔드. **b/Esc** 로 리스트 복귀, **q** 종료
+- **c**: 백엔드 가용성 체크 뷰 (✅/❌ + 설명)
 - 헤드리스/CI: `python -m orchestrator.monitor --project-dir <dir> --once` 로 1회 텍스트 스냅샷
 
 ## 웹 UI
@@ -134,7 +137,8 @@ python -m orchestrator --web --port 8765          # 또는: web-team-web --port 
 # 브라우저에서 http://localhost:8765 접속
 ```
 
-- **새 실행** 패널: 기획서(.md/.txt) 업로드 + 백엔드·동시성·mock·delegate·max-units 설정 → ▶ 실행
+- **백엔드 상태 패널**: 각 백엔드 가용성(✅/❌)·설명을 실행 전에 확인 (`/api/check`)
+- **새 실행** 패널: 기획서(.md/.txt) 업로드 + 백엔드·우선순위·동시성·mock·delegate·max-units 설정 → ▶ 실행
 - **모니터**: phase·총비용·units, 에이전트 표(● 실행중/○ 대기·$비용·calls·unit) → 행 클릭 시 상세
 - **상세**: 그 에이전트의 실시간 활동 로그·비용·백엔드 → 뒤로 버튼으로 리스트 복귀
 - 실행 결과물은 `--base-dir`(기본 `~/agent-runs`)/`<run-id>/` 에 생성됨

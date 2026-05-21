@@ -59,6 +59,16 @@ MAX_TURNS = {
 DEFAULT_BACKEND = "mock"
 VALID_BACKENDS = ("claude-sdk", "claude-cli", "claude-team", "openai-agents", "codex", "mock")
 
+# 사람이 읽을 백엔드 설명 (UI 라벨 · --check 출력 공용)
+BACKEND_INFO = {
+    "mock": "무비용 더미 (검증용)",
+    "claude-cli": "Claude Code CLI · 구독/API키",
+    "claude-team": "Claude Code 네이티브 서브에이전트(Team)",
+    "claude-sdk": "Claude Agent SDK · API키",
+    "openai-agents": "OpenAI Agents SDK · API키",
+    "codex": "OpenAI Codex CLI · 구독/API키",
+}
+
 # Backends able to dispatch native Claude Code subagents via the Task tool.
 DELEGATION_CAPABLE = ("claude-sdk", "claude-cli", "claude-team")
 DELEGATION_TOOL = "Task"

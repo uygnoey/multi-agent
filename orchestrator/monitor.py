@@ -17,7 +17,8 @@ import argparse
 import json
 from pathlib import Path
 
-from .config import ROLES
+from .backends import backend_status
+from .config import BACKEND_INFO, ROLES
 
 
 def _read_board(orch_dir: Path) -> dict:
@@ -111,9 +112,25 @@ def _draw_list(stdscr, board: dict, roles: list[str], sel: int) -> None:
         stdscr,
         h - 1,
         0,
-        " ↑/↓ move   Enter: open   q: quit ",
+        " ↑/↓ move   Enter: open   c: backends   q: quit ",
         curses.A_REVERSE,
     )
+
+
+def _draw_backends(stdscr) -> None:
+    import curses
+
+    h, _w = stdscr.getmaxyx()
+    _safe_add(stdscr, 0, 0, " BACKEND AVAILABILITY ", curses.A_REVERSE | curses.A_BOLD)
+    row = 2
+    for s in backend_status():
+        ok = s["ok"]
+        icon = "✅" if ok else "❌"
+        info = BACKEND_INFO.get(s["name"], "")
+        attr = 0 if ok else curses.A_DIM
+        _safe_add(stdscr, row, 1, f"{icon} {s['name']:<14}{info:<40}{s['reason']}", attr)
+        row += 1
+    _safe_add(stdscr, h - 1, 0, " b/Esc: back   q: quit ", curses.A_REVERSE)
 
 
 def _draw_detail(stdscr, board: dict, orch_dir: Path, role: str, scroll: int) -> int:
@@ -168,10 +185,14 @@ def run_tui(project_dir: Path, interval: float = 1.0) -> None:
         while True:
             board = _read_board(orch)
             stdscr.erase()
-            if not board:
+            if mode == "backends":
+                _draw_backends(stdscr)
+            elif not board:
                 _safe_add(stdscr, 0, 0, " MULTI-AGENT MONITOR ", curses.A_REVERSE)
                 _safe_add(stdscr, 2, 1, f"run 대기 중… {orch / 'board.json'} 가 아직 없습니다.")
-                _safe_add(stdscr, 3, 1, "오케스트레이터를 실행하면 자동으로 채워집니다. (q: 종료)")
+                _safe_add(
+                    stdscr, 3, 1, "오케스트레이터 실행 시 자동 갱신.  c: 백엔드 체크   q: 종료"
+                )
             elif mode == "list":
                 _draw_list(stdscr, board, roles, sel)
             else:
@@ -186,13 +207,18 @@ def run_tui(project_dir: Path, interval: float = 1.0) -> None:
                 continue
             if c == ord("q"):
                 break
-            if mode == "list":
+            if mode == "backends":
+                if c in (ord("b"), 27, ord("c"), curses.KEY_LEFT):
+                    mode = "list"
+            elif mode == "list":
                 if c in (curses.KEY_DOWN, ord("j")):
                     sel = min(len(roles) - 1, sel + 1)
                 elif c in (curses.KEY_UP, ord("k")):
                     sel = max(0, sel - 1)
                 elif c in (curses.KEY_ENTER, 10, 13, curses.KEY_RIGHT):
                     mode, detail_role, scroll = "detail", roles[sel], 0
+                elif c == ord("c"):
+                    mode = "backends"
             else:
                 if c in (ord("b"), 27, curses.KEY_LEFT):
                     mode = "list"

@@ -22,7 +22,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .config import FRAMEWORK_ROOT, ROLES, VALID_BACKENDS
+from .backends import backend_status
+from .config import BACKEND_INFO, FRAMEWORK_ROOT, ROLES, VALID_BACKENDS
 from .monitor import _read_agent_log, _read_board
 
 
@@ -139,6 +140,11 @@ def _make_handler(manager: RunManager):
                 self._send(200, INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
             elif u.path == "/api/runs":
                 self._json({"runs": list_runs(manager.base_dir)})
+            elif u.path == "/api/check":
+                rows = backend_status()
+                for r in rows:
+                    r["info"] = BACKEND_INFO.get(r["name"], "")
+                self._json({"backends": rows})
             elif u.path == "/api/state":
                 run = (q.get("run") or [""])[0]
                 board = _read_board(manager.project_dir(run) / ".orchestrator") if run else {}
@@ -268,6 +274,7 @@ INDEX_HTML = r"""<!doctype html>
       <div style="flex:4"><label>백엔드 우선순위 (콤마 · 비우면 위 단일 백엔드)</label>
         <input type="text" id="backends" placeholder="claude-cli,codex,claude-sdk,openai-agents"/></div>
     </div>
+    <div id="backendStatus" class="muted" style="margin-top:8px;font-size:12px">백엔드 상태 확인 중…</div>
     <div class="row" style="margin-top:10px;align-items:center">
       <label style="margin:0"><input type="checkbox" id="mock" checked/> mock (무비용)</label>
       <label style="margin:0"><input type="checkbox" id="delegate"/> delegate (팀 위임)</label>
@@ -305,8 +312,16 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 let CUR=null, AGENT=null;
 const $=id=>document.getElementById(id);
-const BACKENDS=["mock","claude-cli","claude-team","claude-sdk","openai-agents","codex"];
-BACKENDS.forEach(b=>{const o=document.createElement("option");o.value=o.text=b;$("backend").appendChild(o)});
+async function loadChecks(){
+  let rows=[];
+  try{rows=((await (await fetch("/api/check")).json()).backends)||[]}catch(e){}
+  const sel=$("backend");sel.innerHTML="";
+  rows.forEach(r=>{const o=document.createElement("option");o.value=r.name;
+    o.text=r.name+" — "+r.info+(r.ok?"  ✅":"  ❌");sel.appendChild(o)});
+  const bad=rows.filter(r=>!r.ok);
+  $("backendStatus").innerHTML="백엔드: "+rows.map(r=>(r.ok?"✅":"❌")+" "+r.name).join("&nbsp;&nbsp;")+
+    (bad.length?"<br>미가용 — "+bad.map(r=>r.name+": "+r.reason).join(" · "):"");
+}
 
 async function startRun(){
   const f=$("specFile").files[0];
@@ -365,7 +380,7 @@ async function tick(){
     }
   }catch(e){}
 }
-refreshRuns();setInterval(tick,1000);
+loadChecks();refreshRuns();setInterval(tick,1000);
 </script>
 </body></html>
 """
