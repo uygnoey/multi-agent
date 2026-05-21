@@ -8,11 +8,62 @@ codex exec ... --cd <타깃> --sandbox workspace-write --json -o <out> --skip-gi
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import uuid
+from pathlib import Path
 
 from .base import Backend, RoleRequest, RoleResult, run_subprocess
+
+# OpenAI 공식 표준(short context) 가격, 1M 토큰당 USD: (input, cached_input, output).
+# codex 는 USD 를 안 주므로 토큰 usage × 단가로 추정 계산한다 (가격은 변동 가능 — 2026-05 기준).
+CODEX_PRICING = {
+    "gpt-5.5-pro": (30.0, 30.0, 180.0),
+    "gpt-5.5": (5.0, 0.5, 30.0),
+    "gpt-5.4-mini": (0.75, 0.075, 4.5),
+    "gpt-5.4-nano": (0.20, 0.02, 1.25),
+    "gpt-5.4": (2.5, 0.25, 15.0),
+    "gpt-5.3-codex": (1.75, 0.175, 14.0),
+}
+
+
+def _codex_default_model() -> str:
+    """~/.codex/config.toml 의 기본 모델 (없으면 gpt-5.5)."""
+    try:
+        cfg = Path.home() / ".codex" / "config.toml"
+        if cfg.exists():
+            for line in cfg.read_text(encoding="utf-8").splitlines():
+                s = line.strip()
+                if s.startswith("model") and "=" in s and not s.startswith("model_"):
+                    return s.split("=", 1)[1].strip().strip("\"'")
+    except Exception:
+        pass
+    return "gpt-5.5"
+
+
+def _price_for(model: str):
+    m = (model or "").lower()
+    for key in sorted(CODEX_PRICING, key=len, reverse=True):  # 긴 키 우선 매칭
+        if m.startswith(key):
+            return CODEX_PRICING[key]
+    return None
+
+
+def codex_cost(model: str, input_tokens: int, cached_input_tokens: int, output_tokens: int):
+    """토큰 usage × 모델 단가로 추정 비용(USD). 단가표에 없으면 None.
+
+    uncached_input = input - cached. reasoning_output 은 output 에 포함된 것으로 본다(중복 계산 X).
+    """
+    p = _price_for(model)
+    if not p:
+        return None
+    in_price, cached_price, out_price = p
+    uncached = max(0, (input_tokens or 0) - (cached_input_tokens or 0))
+    cost = (
+        uncached / 1e6 * in_price
+        + (cached_input_tokens or 0) / 1e6 * cached_price
+        + (output_tokens or 0) / 1e6 * out_price
+    )
+    return round(cost, 6)
 
 
 class CodexCLIBackend(Backend):
@@ -67,27 +118,26 @@ class CodexCLIBackend(Backend):
                 final = out_path.read_text(encoding="utf-8")[:2000]
             except Exception:
                 pass
-        # codex usage(토큰) + (제공 시) USD 캡처. 구독이면 cost 는 추정치로 표기.
-        tokens = None
-        cost = None
+        # codex 는 USD 를 안 주므로 turn.completed 의 usage(토큰)로 비용을 추정 계산.
+        usage = {}
         for line in out.splitlines():
             try:
                 o = json.loads(line)
             except Exception:
                 continue
-            u = o.get("usage") or {}
-            if o.get("type") == "turn.completed":
-                tokens = (u.get("input_tokens") or 0) + (u.get("output_tokens") or 0)
-            # 일부/향후 버전이 USD 를 줄 경우 (usage 안이든 이벤트 레벨이든) 캡처
-            for src in (u, o):
-                for k in ("total_cost_usd", "cost_usd", "cost"):
-                    if isinstance(src.get(k), (int, float)):
-                        cost = src[k]
+            if o.get("type") == "turn.completed" and isinstance(o.get("usage"), dict):
+                usage = o["usage"]
+        model = req.model or _codex_default_model()
+        inp = usage.get("input_tokens") or 0
+        cached = usage.get("cached_input_tokens") or 0
+        out_t = usage.get("output_tokens") or 0
+        tokens = (inp + out_t) or None
+        cost = codex_cost(model, inp, cached, out_t) if usage else None
         return RoleResult(
             ok=True,
             final_message=final or "codex exec ok",
-            model=req.model,
+            model=model,
             tokens=tokens,
             cost_usd=cost,
-            cost_estimated=cost is not None and not os.environ.get("CODEX_API_KEY"),
+            cost_estimated=cost is not None,  # 가격표 기반 추정치 → est.
         )
