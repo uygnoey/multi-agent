@@ -116,6 +116,10 @@ class Scheduler:
             for t in sup_tasks:
                 t.cancel()
             await asyncio.gather(*sup_tasks, return_exceptions=True)
+            # 취소로 idle 처리 못 한 감독 등, running 으로 남은 에이전트 정리
+            for role, a in self.board.agents().items():
+                if a.get("status") == "running":
+                    await self.board.agent_update(role, status="idle", activity="run ended")
             self.board.write_report()
             try:
                 (self.board.orch_dir / "run.pid").unlink()  # 종료 표시
