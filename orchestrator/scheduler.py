@@ -185,6 +185,7 @@ class Scheduler:
                 await self.board.add_artifacts(uid, o.get("artifacts", []))
             if any(not o.get("_ok", True) for o in dev_outcomes):
                 await self.board.set_status(uid, BLOCKED, "dev failed")
+                await self.board.add_warning(f"{uid}: 개발(dev) 실패 → blocked")
                 return False
             await self.board.set_status(uid, DEV_DONE)
             return True

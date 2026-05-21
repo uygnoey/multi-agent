@@ -30,8 +30,8 @@ class Runner:
         self.cfg = cfg
         self.board = board
 
-    def _candidates(self, role: str) -> list[str]:
-        """우선순위 순서의 백엔드 후보. 가용한 것만 남기되, 없으면 첫 후보로 명확히 실패시킨다."""
+    def _candidates(self, role: str) -> tuple[list[str], list[str]]:
+        """(가용 후보, skip된 후보) 반환. 가용이 없으면 첫 후보로 명확히 실패시킨다."""
         cands = self.cfg.backends_for(role) or [self.cfg.default_backend or "mock"]
 
         def _ok(name: str) -> bool:
@@ -41,7 +41,8 @@ class Runner:
                 return False
 
         avail = [c for c in cands if _ok(c)]
-        return avail or cands[:1]
+        skipped = [c for c in cands if c not in avail]
+        return (avail or cands[:1]), skipped
 
     def _build_teammates(self, role: str) -> list[dict]:
         out = []
@@ -101,7 +102,9 @@ class Runner:
             recent_events=self.board.recent_events(12) if unit is None else "",
         )
 
-        candidates = self._candidates(role)
+        candidates, skipped = self._candidates(role)
+        if skipped:  # 왜 특정 provider 가 빠졌는지 run artifact 에서 추적 가능하게
+            await self.board.log_event(role, f"backend skipped (unavailable): {skipped}")
         res: RoleResult | None = None
         chosen = candidates[0]
         role_cost = 0.0

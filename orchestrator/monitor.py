@@ -70,6 +70,8 @@ def _stop_run(orch_dir: Path) -> bool:
 
 def _rerun(orch_dir: Path) -> tuple[bool, str]:
     """저장된 rerun.json(argv)으로 같은 project-dir 에서 오케스트레이터를 다시 실행."""
+    if _run_alive(orch_dir):  # 실행 중이면 같은 .orchestrator 동시 쓰기 방지
+        return False, "이미 실행 중 — 먼저 정지(s) 후 재실행"
     f = orch_dir / "rerun.json"
     if not f.exists():
         return False, "재실행 정보 없음 (rerun.json 없음 — 이 run 은 재실행 불가)"

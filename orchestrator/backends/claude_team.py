@@ -37,7 +37,8 @@ class ClaudeTeamBackend(Backend):
             "stream-json",
             "--verbose",
             "--allowedTools",
-            "Task,Read,Write,Edit,Bash",
+            # 역할 allowed_tools + 리드 디스패치용 Task (읽기전용 역할에 쓰기/실행 안 열리게)
+            ",".join(dict.fromkeys(["Task", *req.allowed_tools])),
             "--permission-mode",
             "acceptEdits",
         ]
