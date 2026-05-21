@@ -92,6 +92,26 @@ def test_wait_for_deps_keeps_waiting_while_progressing(tmp_path, sample_spec_pat
     assert asyncio.run(go()) is True
 
 
+def test_read_result_missing_file_fails_required_role(tmp_path):
+    # dev/test/cicd/docs/architect 등은 결과 JSON 이 계약 — 안 쓰면 res.ok 라도 실패.
+    rp = tmp_path / "missing.json"  # 존재하지 않음
+    out = runner_mod.Runner._read_result(rp, RoleResult(ok=True), result_required=True)
+    assert out["_ok"] is False
+    assert any("contract" in b for b in out["blockers"])
+
+
+def test_read_result_missing_file_ok_for_supervisor(tmp_path):
+    # 감독(PM/PL)은 결과파일을 안 남겨도 정상.
+    rp = tmp_path / "missing.json"
+    out = runner_mod.Runner._read_result(rp, RoleResult(ok=True), result_required=False)
+    assert out["_ok"] is True
+
+
+def test_blank_blockers_not_treated_as_failure():
+    out = runner_mod._coerce_result({"status": "done", "blockers": ["", "  "]}, RoleResult(ok=True))
+    assert out["_ok"] is True and out["blockers"] == []  # 빈 blocker 슬롯 무시
+
+
 def test_coerce_result_success_whitelist():
     ok = RoleResult(ok=True)
     for bad in ("fail", "failure", "error", "incomplete", "partial", "blocked"):

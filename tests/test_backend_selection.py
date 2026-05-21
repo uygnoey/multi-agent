@@ -93,6 +93,9 @@ class _FakeBackend:
         return (True, "ok")
 
     async def run_role(self, req):
+        if self._ok:  # 계약 준수 백엔드: 결과 JSON 을 남긴다
+            req.result_path.parent.mkdir(parents=True, exist_ok=True)
+            req.result_path.write_text('{"status":"done","artifacts":[]}', encoding="utf-8")
         return RoleResult(
             ok=self._ok,
             final_message=self.name,

@@ -185,7 +185,10 @@ python -m orchestrator --web --port 8765          # 또는: web-team-web --port 
 - **예외 격리**: 한 역할 실패가 다른 동시 역할을 취소시키지 않음 (run_role 비전파)
 - **결과 무결성**: 백엔드 실패 시 남은 결과파일을 성공으로 오탐하지 않음, 보드는 단일 writer
 - **웹 보안**: 경로 traversal 차단(run id 를 base_dir 로 한정·role 검증), 요청 바디 크기 상한
+- **결과 계약**: 감독(PM/PL) 외 역할은 결과 JSON 미작성/깨짐을 실패로 처리(성공 오탐 방지)
 - 세션별 `max_turns`·예산, 전역 동시성 세마포어, `--max-units`, 경로 스코프(타깃 cwd 한정)
+- ⚠️ `openai-agents` 백엔드의 `run_bash`(shell)는 cwd 만 타깃일 뿐 FS 경계를 강제하지 않는다
+  (allowed_tools 로 Bash 권한 역할만 노출). 강한 격리가 필요하면 **Docker 컨테이너**로 실행할 것
 
 ## 배포 (Docker)
 
