@@ -8,22 +8,48 @@ codex exec ... --cd <타깃> --sandbox workspace-write --json -o <out> --skip-gi
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import uuid
 from pathlib import Path
 
 from .base import Backend, RoleRequest, RoleResult, run_subprocess
 
-# OpenAI 공식 표준(short context) 가격, 1M 토큰당 USD: (input, cached_input, output).
-# codex 는 USD 를 안 주므로 토큰 usage × 단가로 추정 계산한다 (가격은 변동 가능 — 2026-05 기준).
-CODEX_PRICING = {
+# 가격은 코드에 하드코딩하지 않고 설정 파일에서 로드한다(변동 대응). 파일이 없으면 아래 fallback.
+_PRICING_FILE = Path(__file__).resolve().parent.parent / "codex_pricing.json"
+_FALLBACK_PRICING = {
     "gpt-5.5-pro": (30.0, 30.0, 180.0),
     "gpt-5.5": (5.0, 0.5, 30.0),
+    "gpt-5.4": (2.5, 0.25, 15.0),
     "gpt-5.4-mini": (0.75, 0.075, 4.5),
     "gpt-5.4-nano": (0.20, 0.02, 1.25),
-    "gpt-5.4": (2.5, 0.25, 15.0),
     "gpt-5.3-codex": (1.75, 0.175, 14.0),
 }
+
+
+def load_pricing() -> dict:
+    """모델별 단가 로드: ① $CODEX_PRICING_FILE ② orchestrator/codex_pricing.json ③ 코드 fallback.
+
+    값은 [input, cached_input, output] (1M 토큰당 USD). '_' 로 시작하는 키는 주석으로 무시.
+    """
+    for path in (os.environ.get("CODEX_PRICING_FILE"), _PRICING_FILE):
+        if not path:
+            continue
+        p = Path(path)
+        if not p.exists():
+            continue
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            out = {}
+            for k, v in data.items():
+                if k.startswith("_") or not isinstance(v, (list, tuple)) or len(v) < 3:
+                    continue
+                out[k] = (float(v[0]), float(v[1]), float(v[2]))
+            if out:
+                return out
+        except Exception:
+            pass
+    return dict(_FALLBACK_PRICING)
 
 
 def _codex_default_model() -> str:
@@ -41,10 +67,11 @@ def _codex_default_model() -> str:
 
 
 def _price_for(model: str):
+    pricing = load_pricing()
     m = (model or "").lower()
-    for key in sorted(CODEX_PRICING, key=len, reverse=True):  # 긴 키 우선 매칭
+    for key in sorted(pricing, key=len, reverse=True):  # 긴 키 우선 매칭
         if m.startswith(key):
-            return CODEX_PRICING[key]
+            return pricing[key]
     return None
 
 

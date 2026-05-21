@@ -107,6 +107,16 @@ def test_codex_cost_from_token_pricing():
     assert codex_cost("unknown-model", 1, 1, 1) is None  # 단가표에 없으면 None
 
 
+def test_codex_pricing_from_config_file_and_env(tmp_path, monkeypatch):
+    from orchestrator.backends.codex_cli import codex_cost, load_pricing
+
+    assert "gpt-5.5" in load_pricing()  # 동봉 JSON 에서 로드
+    f = tmp_path / "px.json"
+    f.write_text('{"gpt-5.5":[1.0,0.1,2.0]}', encoding="utf-8")
+    monkeypatch.setenv("CODEX_PRICING_FILE", str(f))  # 환경변수로 단가표 교체
+    assert codex_cost("gpt-5.5", 100_000, 0, 10_000) == 0.12
+
+
 def test_board_cost_estimated_flag(tmp_path):
     board = Board(tmp_path / "p")
     asyncio.run(board.init("s", {}))
