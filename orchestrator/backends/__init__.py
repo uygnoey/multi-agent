@@ -23,13 +23,20 @@ _REGISTRY: dict[str, Backend] = {
 }
 
 
-# 직관적 별칭 → 정식 이름 (둘 다 허용)
+# 공식 명칭 별칭 → 정식 이름 (둘 다 허용)
 ALIASES = {
+    # Claude Code (Anthropic 공식 CLI)
     "claude-code": "claude-cli",
     "claude-code-cli": "claude-cli",
+    # Claude Agent SDK (Anthropic 공식 Python SDK)
+    "claude-agent-sdk": "claude-sdk",
+    # OpenAI Agents SDK (OpenAI 공식 Python SDK)
     "openai-sdk": "openai-agents",
+    "openai-agents-sdk": "openai-agents",
     "openai": "openai-agents",
+    # OpenAI Codex CLI (OpenAI 공식 CLI)
     "codex-cli": "codex",
+    "openai-codex": "codex",
 }
 
 
