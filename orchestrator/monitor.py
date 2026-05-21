@@ -70,21 +70,25 @@ def render_snapshot(board: dict, roles: list[str], alive: bool | None = None) ->
         return "stopped" if (alive is False and st == "running") else st
 
     run_n = sum(1 for r in roles if status_of(agents.get(r, {})) == "running")
+    toks = board.get("total_tokens", 0)
     lines = [
-        f"phase={phase}   cost=${cost:.4f}   units={done}/{len(units)}   running_agents={run_n}",
+        f"phase={phase}   cost=${cost:.4f}   tokens={toks:,}   "
+        f"units={done}/{len(units)}   running_agents={run_n}",
         "",
-        f"   {'agent':<22}{'state':<9}{'model/backend':<22}{'$cost':>9}{'calls':>6}  unit",
-        "   " + "-" * 74,
+        f"   {'agent':<22}{'state':<9}{'model/backend':<20}"
+        f"{'$cost':>9}  {'tokens':>9}  {'calls':>5}  unit",
+        "   " + "-" * 84,
     ]
     for r in roles:
         a = agents.get(r, {})
         st = status_of(a)
         icon = "●" if st == "running" else "○"
-        model = (a.get("model") or a.get("backend") or "")[:20]
+        model = (a.get("model") or a.get("backend") or "")[:18]
         unit = a.get("current_unit") or ""
+        tok = f"{a.get('tokens', 0):,}" if a.get("tokens") else "-"
         lines.append(
-            f" {icon} {r:<22}{st:<9}{model:<22}{a.get('cost_usd', 0.0):>9.4f}"
-            f"{a.get('calls', 0):>6}  {unit}"
+            f" {icon} {r:<22}{st:<9}{model:<20}{a.get('cost_usd', 0.0):>9.4f}  "
+            f"{tok:>9}  {a.get('calls', 0):>5}  {unit}"
         )
     return "\n".join(lines)
 
@@ -122,8 +126,8 @@ def _draw_list(stdscr, board, roles, sel, orch_dir, alive) -> None:
         stdscr,
         1,
         0,
-        f" phase:{phase}  cost:${cost:.4f}  units:{done}/{len(units)}  "
-        f"동시실행:{run_n}  [{'running' if alive else 'stopped'}]",
+        f" phase:{phase}  cost:${cost:.4f}  tokens:{board.get('total_tokens', 0):,}  "
+        f"units:{done}/{len(units)}  동시실행:{run_n}  [{'running' if alive else 'stopped'}]",
         curses.A_BOLD,
     )
     _safe_add(stdscr, 2, 1, f"📁 {orch_dir.parent}", curses.A_DIM)
@@ -131,7 +135,8 @@ def _draw_list(stdscr, board, roles, sel, orch_dir, alive) -> None:
         stdscr,
         4,
         1,
-        f"{'AGENT':<22}{'STATE':<9}{'MODEL/BACKEND':<20}{'$COST':>9}{'CALLS':>5}  UNIT",
+        f"{'AGENT':<22}{'STATE':<9}{'MODEL/BACKEND':<18}{'$COST':>9}  {'TOKENS':>9}  "
+        f"{'CALLS':>5}  UNIT",
         curses.A_DIM,
     )
 
@@ -141,11 +146,12 @@ def _draw_list(stdscr, board, roles, sel, orch_dir, alive) -> None:
         st = status_of(a)
         running = st == "running"
         icon = "●" if running else "○"
-        model = (a.get("model") or a.get("backend") or "-")[:18]
+        model = (a.get("model") or a.get("backend") or "-")[:16]
         unit = a.get("current_unit") or "-"
+        tok = f"{a.get('tokens', 0):,}" if a.get("tokens") else "-"
         line = (
-            f"{icon} {r:<22}{st:<9}{model:<20}{a.get('cost_usd', 0.0):>9.4f}"
-            f"{a.get('calls', 0):>5}  {unit}"
+            f"{icon} {r:<22}{st:<9}{model:<18}{a.get('cost_usd', 0.0):>9.4f}  "
+            f"{tok:>9}  {a.get('calls', 0):>5}  {unit}"
         )
         attr = curses.A_REVERSE if i == sel else (curses.A_BOLD if running else 0)
         _safe_add(stdscr, row + i, 1, line, attr)
@@ -219,8 +225,8 @@ def _draw_detail(stdscr, board: dict, orch_dir: Path, role: str, scroll: int) ->
         1,
         0,
         f" state: {st}    model: {a.get('model') or '-'}    $cost: {a.get('cost_usd', 0.0):.4f}"
-        f"    calls: {a.get('calls', 0)}    unit: {a.get('current_unit') or '-'}"
-        f"    backend: {a.get('backend') or '-'}",
+        f"    tokens: {a.get('tokens', 0):,}    calls: {a.get('calls', 0)}"
+        f"    unit: {a.get('current_unit') or '-'}    backend: {a.get('backend') or '-'}",
         curses.A_BOLD if running else 0,
     )
     _safe_add(stdscr, 2, 1, "activity (live):", curses.A_DIM)

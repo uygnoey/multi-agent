@@ -87,6 +87,30 @@ def test_global_artifacts_tracked(tmp_path):
     ]
 
 
+def test_board_tracks_tokens(tmp_path):
+    board = Board(tmp_path / "p")
+    asyncio.run(board.init("s", {}))
+    asyncio.run(board.agent_update("backend-developer", tokens_add=1000))
+    asyncio.run(board.agent_update("backend-developer", tokens_add=500))
+    snap = board.snapshot()
+    assert snap["total_tokens"] == 1500
+    assert snap["agents"]["backend-developer"]["tokens"] == 1500
+
+
+def test_parse_stream_result_extracts_tokens_cost_model():
+    from orchestrator.backends.claude_cli import parse_stream_result
+
+    out = b"\n".join(
+        [
+            b'{"type":"system","subtype":"init","model":"claude-x"}',
+            b'{"type":"result","result":"done","total_cost_usd":0.5,'
+            b'"usage":{"input_tokens":100,"output_tokens":20}}',
+        ]
+    )
+    final, cost, model, tokens = parse_stream_result(out)
+    assert final == "done" and cost == 0.5 and model == "claude-x" and tokens == 120
+
+
 def test_run_role_never_raises_on_backend_exception(tmp_path, sample_spec_path, monkeypatch):
     class Boom:
         def available(self):

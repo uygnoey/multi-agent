@@ -59,6 +59,7 @@ class Board:
                 "stack": stack,
                 "phase": "init",
                 "total_cost_usd": 0.0,
+                "total_tokens": 0,
                 "agents": {},
                 "artifacts": [],  # 설계/공통 산출물 (특정 unit 에 속하지 않는)
                 "units": [],
@@ -156,6 +157,7 @@ class Board:
         call: bool = False,
         activity: str | None = None,
         model: str | None = None,
+        tokens_add: int | None = None,
     ) -> None:
         async with self._lock:
             agents = self._data.setdefault("agents", {})
@@ -165,6 +167,7 @@ class Board:
                     "status": "idle",
                     "calls": 0,
                     "cost_usd": 0.0,
+                    "tokens": 0,
                     "current_unit": None,
                     "backend": None,
                     "model": None,
@@ -182,6 +185,9 @@ class Board:
                 a["model"] = model
             if cost_add:
                 a["cost_usd"] = round(a["cost_usd"] + float(cost_add), 6)
+            if tokens_add:
+                a["tokens"] = a.get("tokens", 0) + int(tokens_add)
+                self._data["total_tokens"] = self._data.get("total_tokens", 0) + int(tokens_add)
             if message is not None:
                 a["last_message"] = message[:500]
             if call:

@@ -7,6 +7,7 @@ codex exec ... --cd <타깃> --sandbox workspace-write --json -o <out> --skip-gi
 
 from __future__ import annotations
 
+import json
 import shutil
 import uuid
 
@@ -48,7 +49,7 @@ class CodexCLIBackend(Backend):
         if req.model:
             cmd += ["--model", req.model]
         try:
-            rc, _out, err, timed_out = await run_subprocess(
+            rc, out, err, timed_out = await run_subprocess(
                 cmd, str(req.cwd), req.timeout, req.live_log_path
             )
         except Exception as e:
@@ -65,4 +66,16 @@ class CodexCLIBackend(Backend):
                 final = out_path.read_text(encoding="utf-8")[:2000]
             except Exception:
                 pass
-        return RoleResult(ok=True, final_message=final or "codex exec ok")
+        # codex 는 USD 미보고(구독) → turn.completed 의 토큰 사용량을 캡처
+        tokens = None
+        for line in out.splitlines():
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if o.get("type") == "turn.completed":
+                u = o.get("usage") or {}
+                tokens = (u.get("input_tokens") or 0) + (u.get("output_tokens") or 0)
+        return RoleResult(
+            ok=True, final_message=final or "codex exec ok", model=req.model, tokens=tokens
+        )
