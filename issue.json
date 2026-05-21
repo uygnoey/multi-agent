@@ -1,0 +1,1345 @@
+{
+  "audit": {
+    "repository": "/Users/yeongyu/multi-agent",
+    "scope": "full-code review findings gathered from repeated audit passes",
+    "verification": {
+      "python3 -m pytest -q": "114 passed",
+      "ruff check .": "passed",
+      "ruff format --check .": "failed: tests/test_hardening.py would be reformatted",
+      "pytest -q": "failed locally with ModuleNotFoundError: No module named 'orchestrator'"
+    },
+    "note": "Issues include confirmed bugs, edge-case bugs, design risks, packaging/deployment mismatches, and tests that currently encode risky behavior."
+  },
+  "issues": [
+    {
+      "id": 1,
+      "severity": "critical",
+      "category": "docker-cli",
+      "title": "Docker CMD passes --base-dir to orchestrator CLI, but the CLI does not define that option",
+      "file": "Dockerfile",
+      "line": 24,
+      "evidence": "CMD uses python -m orchestrator --web --host 0.0.0.0 --port 8765 --base-dir /data/runs, but orchestrator.__main__.parse_args has no --base-dir.",
+      "impact": "The documented Docker container exits with argparse error instead of starting the web UI."
+    },
+    {
+      "id": 2,
+      "severity": "high",
+      "category": "documentation",
+      "title": "README documents --base-dir for python -m orchestrator --web, but that entrypoint does not support it",
+      "file": "README.md",
+      "line": 160,
+      "evidence": "README says outputs are created under --base-dir, while --base-dir only exists in orchestrator.webui main, not the top-level --web path.",
+      "impact": "Users following the README hit CLI errors or cannot configure the web run directory through the documented command."
+    },
+    {
+      "id": 3,
+      "severity": "critical",
+      "category": "scheduler",
+      "title": "--max-units can leave unprocessed units in designed state while the run exits successfully",
+      "file": "orchestrator/scheduler.py",
+      "line": 97,
+      "evidence": "The scheduler adds all architect units to the board, then slices unit_list with max_units. Reproduction showed rc=0 with U1 done and U2/U3 still designed.",
+      "impact": "Partial runs can be reported as successful even though known work units were never built or tested."
+    },
+    {
+      "id": 4,
+      "severity": "high",
+      "category": "cli",
+      "title": "CLI success/failure summary ignores incomplete non-terminal unit states",
+      "file": "orchestrator/__main__.py",
+      "line": 194,
+      "evidence": "Exit code checks only failed/blocked units and warnings. It does not fail on designed, in_progress, testing, or dev_done units.",
+      "impact": "Automation can treat incomplete runs as successful."
+    },
+    {
+      "id": 5,
+      "severity": "high",
+      "category": "scheduler",
+      "title": "Final cleanup does not mark designed units as failed or skipped",
+      "file": "orchestrator/scheduler.py",
+      "line": 122,
+      "evidence": "Cleanup only handles IN_PROGRESS, DEV_DONE, and TESTING, explicitly leaving DESIGNED alone.",
+      "impact": "Units that were never started remain in a non-terminal state without making the run fail."
+    },
+    {
+      "id": 6,
+      "severity": "high",
+      "category": "dependency",
+      "title": "Unknown dependencies are warned and ignored instead of blocking the dependent unit",
+      "file": "orchestrator/scheduler.py",
+      "line": 243,
+      "evidence": "_wait_for_deps filters unknown deps out and returns true if no known deps remain.",
+      "impact": "Architect dependency typos can cause units to run before required work exists."
+    },
+    {
+      "id": 7,
+      "severity": "medium",
+      "category": "dependency",
+      "title": "Dependency stall detection uses all agent activity, not activity related to the dependency",
+      "file": "orchestrator/scheduler.py",
+      "line": 265,
+      "evidence": "The progress signature uses max(updated_at) across all agents.",
+      "impact": "Unrelated PM/PL or other agent activity can reset dependency idle time and delay or prevent stall failure."
+    },
+    {
+      "id": 8,
+      "severity": "critical",
+      "category": "path-safety",
+      "title": "Unit IDs are embedded directly into result paths without slug or path validation",
+      "file": "orchestrator/runner.py",
+      "line": 91,
+      "evidence": "result_rel = f\".orchestrator/results/{role}__{key}.json\" where key is unit['id']. Values containing ../ can resolve outside results.",
+      "impact": "Malformed or adversarial architect output can write or delete result files outside the intended result directory."
+    },
+    {
+      "id": 9,
+      "severity": "high",
+      "category": "input-validation",
+      "title": "Board normalizes unit IDs to strings but does not restrict separators or path traversal tokens",
+      "file": "orchestrator/board.py",
+      "line": 92,
+      "evidence": "uid is str(raw_id).strip(); no validation against '/', '..', whitespace, or invalid identifier characters.",
+      "impact": "The same unsafe unit ID flows into filenames, generated code, migrations, reports, and artifact paths."
+    },
+    {
+      "id": 10,
+      "severity": "medium",
+      "category": "mock-backend",
+      "title": "Mock backend uses unit IDs directly in file paths and code identifiers",
+      "file": "orchestrator/backends/mock.py",
+      "line": 55,
+      "evidence": "Mock writes frontend/src/{unit['id']}.jsx and generates function names from unit IDs.",
+      "impact": "Unexpected unit IDs can create nested paths or invalid generated code even in mock validation runs."
+    },
+    {
+      "id": 11,
+      "severity": "high",
+      "category": "artifact-validation",
+      "title": "Runner accepts agent artifact paths without existence or project-boundary validation",
+      "file": "orchestrator/runner.py",
+      "line": 287,
+      "evidence": "_coerce_result converts artifacts to strings only.",
+      "impact": "Reports and UI can list absolute paths, ../ paths, or files that were never created."
+    },
+    {
+      "id": 12,
+      "severity": "high",
+      "category": "workspace",
+      "title": "expose_team_agents overwrites target .claude/agents files despite scaffold being described as non-destructive",
+      "file": "orchestrator/workspace.py",
+      "line": 21,
+      "evidence": "Each bundled agent file is written to dest_dir unconditionally.",
+      "impact": "Existing custom target subagents can be overwritten."
+    },
+    {
+      "id": 13,
+      "severity": "medium",
+      "category": "process-management",
+      "title": "Web stop deletes run.pid immediately before the process is actually dead",
+      "file": "orchestrator/webui.py",
+      "line": 216,
+      "evidence": "stop sends SIGTERM, schedules SIGKILL later, then unlinks pidfile immediately.",
+      "impact": "UI and monitor can show stopped while the process continues writing run state."
+    },
+    {
+      "id": 14,
+      "severity": "medium",
+      "category": "process-management",
+      "title": "TUI rerun can launch a new process for the same project directory when pidfile state is stale or prematurely removed",
+      "file": "orchestrator/monitor.py",
+      "line": 71,
+      "evidence": "_rerun only checks _run_alive via run.pid, then starts the saved argv in the same project-dir.",
+      "impact": "Two orchestrator processes can write the same .orchestrator files concurrently."
+    },
+    {
+      "id": 15,
+      "severity": "low",
+      "category": "webui",
+      "title": "RunManager keeps completed processes in _procs",
+      "file": "orchestrator/webui.py",
+      "line": 240,
+      "evidence": "is_running reaps and closes logfile but never removes the run_id from self._procs.",
+      "impact": "Long-lived web servers accumulate stale process objects."
+    },
+    {
+      "id": 16,
+      "severity": "critical",
+      "category": "sandbox",
+      "title": "OpenAI Agents run_bash uses shell=True and only sets cwd, without enforcing a filesystem boundary",
+      "file": "orchestrator/backends/openai_agents.py",
+      "line": 68,
+      "evidence": "The function tool executes arbitrary shell commands with cwd=root. The comment acknowledges shell does not enforce the FS boundary.",
+      "impact": "Bash-capable roles can read or affect files outside the target project."
+    },
+    {
+      "id": 17,
+      "severity": "medium",
+      "category": "process-management",
+      "title": "Subprocess timeout kills immediately with SIGKILL and offers no SIGTERM grace period",
+      "file": "orchestrator/backends/base.py",
+      "line": 73,
+      "evidence": "Timeout handler calls os.killpg(..., SIGKILL) directly.",
+      "impact": "Backends cannot clean up locks, temp files, or partial state gracefully."
+    },
+    {
+      "id": 18,
+      "severity": "high",
+      "category": "packaging",
+      "title": "Package data excludes bundled agents, templates, examples, and docs required by runtime behavior",
+      "file": "pyproject.toml",
+      "line": 25,
+      "evidence": "Only orchestrator/codex_pricing.json is configured as package data; FRAMEWORK_ROOT expects .claude/agents and templates at repository root.",
+      "impact": "A normal wheel install can miss files needed for scaffolding and role loading."
+    },
+    {
+      "id": 19,
+      "severity": "medium",
+      "category": "test-runner",
+      "title": "Plain pytest -q fails locally unless the project is installed or invoked as python -m pytest",
+      "file": "tests/conftest.py",
+      "line": 14,
+      "evidence": "Observed pytest -q failure: ModuleNotFoundError: No module named 'orchestrator'.",
+      "impact": "Local contributor workflow differs from CI and from python3 -m pytest behavior."
+    },
+    {
+      "id": 20,
+      "severity": "high",
+      "category": "ci",
+      "title": "ruff format --check fails on tests/test_hardening.py",
+      "file": "tests/test_hardening.py",
+      "line": 1,
+      "evidence": "ruff format --check . reports: Would reformat: tests/test_hardening.py.",
+      "impact": "The current CI workflow will fail at the formatting step."
+    },
+    {
+      "id": 21,
+      "severity": "high",
+      "category": "timeout",
+      "title": "run_subprocess timeout only wraps stream pumping, not the final proc.wait",
+      "file": "orchestrator/backends/base.py",
+      "line": 64,
+      "evidence": "asyncio.wait_for wraps gather(_pump stdout, _pump stderr), then await proc.wait() is outside the timeout.",
+      "impact": "A process that closes stdout/stderr but keeps running can bypass the timeout."
+    },
+    {
+      "id": 22,
+      "severity": "medium",
+      "category": "shutdown",
+      "title": "SIGTERM/SIGINT handler only sets the supervisor stop event and does not cancel active build tasks",
+      "file": "orchestrator/scheduler.py",
+      "line": 60,
+      "evidence": "Signal handler calls self._stop.set; build/test/cicd paths do not consult it before continuing.",
+      "impact": "Graceful shutdown is incomplete; long role calls can continue until externally killed."
+    },
+    {
+      "id": 23,
+      "severity": "medium",
+      "category": "shutdown",
+      "title": "Web stop relies on forced SIGKILL because the scheduler does not fully honor graceful stop",
+      "file": "orchestrator/webui.py",
+      "line": 216,
+      "evidence": "stop sends SIGTERM and schedules SIGKILL after 4 seconds.",
+      "impact": "Stopping from the web UI can interrupt writes and leave partial artifacts."
+    },
+    {
+      "id": 24,
+      "severity": "medium",
+      "category": "shutdown",
+      "title": "TUI stop has the same SIGTERM then SIGKILL behavior as web stop",
+      "file": "orchestrator/monitor.py",
+      "line": 62,
+      "evidence": "_stop_run sends SIGTERM and schedules SIGKILL after 4 seconds.",
+      "impact": "Stopping from the monitor can interrupt writes and leave partial artifacts."
+    },
+    {
+      "id": 25,
+      "severity": "high",
+      "category": "path-safety",
+      "title": "Runner deletes result_path before each backend attempt without first proving it is under the results directory",
+      "file": "orchestrator/runner.py",
+      "line": 130,
+      "evidence": "if result_path.exists(): result_path.unlink(). result_path includes unvalidated unit IDs.",
+      "impact": "Unsafe unit IDs can cause deletion of files outside the intended result namespace."
+    },
+    {
+      "id": 26,
+      "severity": "high",
+      "category": "artifact-validation",
+      "title": "Per-unit artifacts are stored without path validation",
+      "file": "orchestrator/board.py",
+      "line": 137,
+      "evidence": "add_artifacts appends artifact strings directly to unit state.",
+      "impact": "Reports and UI can display misleading or unsafe artifact paths."
+    },
+    {
+      "id": 27,
+      "severity": "high",
+      "category": "artifact-validation",
+      "title": "Global artifacts are stored without path validation",
+      "file": "orchestrator/board.py",
+      "line": 160,
+      "evidence": "add_global_artifacts appends artifact strings directly to board state.",
+      "impact": "Design/docs/cicd artifact lists can include paths outside the target project or paths that do not exist."
+    },
+    {
+      "id": 28,
+      "severity": "low",
+      "category": "markdown",
+      "title": "Deliverables unit headings do not escape unit IDs or titles",
+      "file": "orchestrator/board.py",
+      "line": 321,
+      "evidence": "unit_files emits f\"### {u['id']} — {u.get('title', '')}\" directly.",
+      "impact": "LLM-provided titles can break Markdown structure."
+    },
+    {
+      "id": 29,
+      "severity": "low",
+      "category": "markdown",
+      "title": "Artifact entries in deliverables are not escaped",
+      "file": "orchestrator/board.py",
+      "line": 322,
+      "evidence": "unit_files emits f\"- {a}\" directly.",
+      "impact": "Artifact names containing newlines or Markdown syntax can inject unintended document content."
+    },
+    {
+      "id": 30,
+      "severity": "low",
+      "category": "markdown",
+      "title": "Supervisor directives are appended to Markdown without size or content controls",
+      "file": "orchestrator/board.py",
+      "line": 387,
+      "evidence": "append_directive writes raw text to directives.md.",
+      "impact": "Large or malformed LLM output can bloat or distort directives.md."
+    },
+    {
+      "id": 31,
+      "severity": "medium",
+      "category": "logging",
+      "title": "Runner logs full prompts, including spec and directives, to per-agent logs",
+      "file": "orchestrator/runner.py",
+      "line": 133,
+      "evidence": "write_agent_block logs [SYSTEM] and [TASK] prompt bodies.",
+      "impact": "Sensitive information in specs or directives is persisted in .orchestrator/agents logs."
+    },
+    {
+      "id": 32,
+      "severity": "medium",
+      "category": "logging",
+      "title": "Runner logs full backend result messages without truncation",
+      "file": "orchestrator/runner.py",
+      "line": 145,
+      "evidence": "write_agent_block writes res.final_message or res.error with no size cap.",
+      "impact": "Large backend outputs can produce very large log files and expose sensitive data."
+    },
+    {
+      "id": 33,
+      "severity": "medium",
+      "category": "logging",
+      "title": "write_agent_block has no maximum body size",
+      "file": "orchestrator/board.py",
+      "line": 245,
+      "evidence": "The method writes the full body string directly to the agent log.",
+      "impact": "A single prompt or result can grow logs significantly."
+    },
+    {
+      "id": 34,
+      "severity": "low",
+      "category": "webui-performance",
+      "title": "Web UI reads up to 600 log lines per role on every state request",
+      "file": "orchestrator/webui.py",
+      "line": 56,
+      "evidence": "_read_agent_logs reads tail lines for every role.",
+      "impact": "Large logs can make /api/state slow and heavy."
+    },
+    {
+      "id": 35,
+      "severity": "low",
+      "category": "webui-performance",
+      "title": "/api/state returns all role logs even though an agent-specific endpoint exists",
+      "file": "orchestrator/webui.py",
+      "line": 316,
+      "evidence": "agent_logs = _read_agent_logs(orch, list(ROLES)) is included in every /api/state response.",
+      "impact": "Dashboard polling transfers unnecessary data every second."
+    },
+    {
+      "id": 36,
+      "severity": "low",
+      "category": "tui-performance",
+      "title": "TUI detail view reads up to 2000 log lines every refresh",
+      "file": "orchestrator/monitor.py",
+      "line": 335,
+      "evidence": "_draw_detail calls _read_agent_log(orch_dir, role, n=2000) on each redraw.",
+      "impact": "Large logs can make the terminal UI sluggish."
+    },
+    {
+      "id": 37,
+      "severity": "low",
+      "category": "config",
+      "title": "RunConfig integer normalization raises raw ValueError for invalid programmatic input",
+      "file": "orchestrator/config.py",
+      "line": 168,
+      "evidence": "__post_init__ calls int(...) directly.",
+      "impact": "Library callers get unstructured exceptions instead of validation errors."
+    },
+    {
+      "id": 38,
+      "severity": "low",
+      "category": "webui",
+      "title": "build_command can raise from corrupted saved options and expose raw exception text through rerun",
+      "file": "orchestrator/webui.py",
+      "line": 90,
+      "evidence": "build_command int() conversions can fail; /api/rerun returns str(e).",
+      "impact": "Malformed _run_opts.json creates user-facing internal error strings."
+    },
+    {
+      "id": 39,
+      "severity": "low",
+      "category": "privacy",
+      "title": "rerun.json stores raw command arguments",
+      "file": "orchestrator/scheduler.py",
+      "line": 53,
+      "evidence": "rerun.json writes sys.argv[1:].",
+      "impact": "Local paths or sensitive argument values persist in run artifacts."
+    },
+    {
+      "id": 40,
+      "severity": "medium",
+      "category": "rerun",
+      "title": "Saved rerun argv may contain relative paths that break when rerun from a different cwd",
+      "file": "orchestrator/scheduler.py",
+      "line": 54,
+      "evidence": "The scheduler stores raw argv instead of normalized absolute spec/project paths.",
+      "impact": "TUI rerun can fail or target the wrong path depending on the current working directory."
+    },
+    {
+      "id": 41,
+      "severity": "medium",
+      "category": "backend-status",
+      "title": "backend_status does not isolate exceptions from backend availability checks",
+      "file": "orchestrator/backends/__init__.py",
+      "line": 58,
+      "evidence": "The loop calls b.available() without try/except.",
+      "impact": "One broken backend check can break --check, /api/check, and TUI backend display."
+    },
+    {
+      "id": 42,
+      "severity": "low",
+      "category": "diagnostics",
+      "title": "Claude CLI backend truncates stderr to 500 characters",
+      "file": "orchestrator/backends/claude_cli.py",
+      "line": 96,
+      "evidence": "Error result uses err.decode(... )[:500].",
+      "impact": "Important authentication or permission details can be omitted."
+    },
+    {
+      "id": 43,
+      "severity": "low",
+      "category": "diagnostics",
+      "title": "Codex CLI backend truncates stderr to 500 characters",
+      "file": "orchestrator/backends/codex_cli.py",
+      "line": 139,
+      "evidence": "Error result uses err.decode(... )[:500].",
+      "impact": "Important sandbox, login, or runtime diagnostics can be omitted."
+    },
+    {
+      "id": 44,
+      "severity": "low",
+      "category": "diagnostics",
+      "title": "Claude team backend truncates stderr to 500 characters",
+      "file": "orchestrator/backends/claude_team.py",
+      "line": 56,
+      "evidence": "Error result uses err.decode(... )[:500].",
+      "impact": "Important subagent dispatch or CLI diagnostics can be omitted."
+    },
+    {
+      "id": 45,
+      "severity": "low",
+      "category": "observability",
+      "title": "Claude SDK backend does not populate model or token usage",
+      "file": "orchestrator/backends/claude_sdk.py",
+      "line": 122,
+      "evidence": "State captures final and cost only.",
+      "impact": "UI cost/token/model display is less complete for SDK runs."
+    },
+    {
+      "id": 46,
+      "severity": "low",
+      "category": "observability",
+      "title": "OpenAI Agents backend does not populate cost, model, or token usage",
+      "file": "orchestrator/backends/openai_agents.py",
+      "line": 110,
+      "evidence": "Returns RoleResult(ok=True, final_message=...) only.",
+      "impact": "Backend comparisons and budget visibility are inconsistent."
+    },
+    {
+      "id": 47,
+      "severity": "medium",
+      "category": "contract",
+      "title": "Completion report prompt does not define strict status enum or path/id restrictions",
+      "file": "orchestrator/prompts.py",
+      "line": 95,
+      "evidence": "Schema shows generic status/artifacts/units fields without allowed values or safe naming rules.",
+      "impact": "Agents can produce values that later require defensive handling but are currently undervalidated."
+    },
+    {
+      "id": 48,
+      "severity": "medium",
+      "category": "policy-enforcement",
+      "title": "Prompt says most roles must not install dependencies, but runtime tool permissions do not enforce that",
+      "file": "orchestrator/prompts.py",
+      "line": 80,
+      "evidence": "Roles with Bash can still run install commands; this is policy-by-prompt only.",
+      "impact": "Real backends can mutate environments despite prompt guidance."
+    },
+    {
+      "id": 49,
+      "severity": "medium",
+      "category": "permissions",
+      "title": "Project manager supervisor has Bash access",
+      "file": ".claude/agents/project-manager.md",
+      "line": 4,
+      "evidence": "tools: Read, Bash while the role states it does not write code.",
+      "impact": "A supervisor role can execute shell commands despite being conceptually read-only."
+    },
+    {
+      "id": 50,
+      "severity": "medium",
+      "category": "permissions",
+      "title": "Project leader supervisor has Bash access",
+      "file": ".claude/agents/project-leader.md",
+      "line": 4,
+      "evidence": "tools: Read, Bash.",
+      "impact": "A supervisor role can execute shell commands despite being conceptually review-only."
+    },
+    {
+      "id": 51,
+      "severity": "low",
+      "category": "dependencies",
+      "title": "OpenAI Agents optional dependency may be brittle across environments",
+      "file": "pyproject.toml",
+      "line": 17,
+      "evidence": "openai optional dependency is openai-agents>=0.0.1; Docker later masks optional install failures.",
+      "impact": "Users may believe OpenAI backend is installed when fallback installation dropped the extra."
+    },
+    {
+      "id": 52,
+      "severity": "high",
+      "category": "docker",
+      "title": "Docker build masks optional backend dependency installation failures",
+      "file": "Dockerfile",
+      "line": 18,
+      "evidence": "RUN pip install -e \".[all]\" || pip install -e .",
+      "impact": "Images can build successfully without requested real backend dependencies."
+    },
+    {
+      "id": 53,
+      "severity": "low",
+      "category": "docker",
+      "title": "Docker image does not copy README.en.md, docs, or tests",
+      "file": "Dockerfile",
+      "line": 12,
+      "evidence": "Dockerfile copies pyproject.toml, README.md, orchestrator, .claude, templates, and examples only.",
+      "impact": "Container runtime lacks some project documentation and local verification assets."
+    },
+    {
+      "id": 54,
+      "severity": "medium",
+      "category": "documentation",
+      "title": "README says CI runs lint and tests, but current formatting check fails",
+      "file": "README.md",
+      "line": 208,
+      "evidence": "README points to CI workflow; local ruff format --check fails.",
+      "impact": "Documentation overstates current CI readiness."
+    },
+    {
+      "id": 55,
+      "severity": "high",
+      "category": "ci",
+      "title": "CI workflow will fail because formatting is not currently clean",
+      "file": ".github/workflows/ci.yml",
+      "line": 28,
+      "evidence": "CI runs ruff format --check ., and local check reports tests/test_hardening.py would be reformatted.",
+      "impact": "Pull requests or pushes fail CI until formatting is fixed."
+    },
+    {
+      "id": 56,
+      "severity": "medium",
+      "category": "test-gap",
+      "title": "CLI tests do not assert nonzero exit code for failed, blocked, or incomplete runs",
+      "file": "tests/test_cli.py",
+      "line": 19,
+      "evidence": "test_mock_run_returns_zero covers only a successful mock run.",
+      "impact": "Exit-code regressions and incomplete-run success bugs can escape tests."
+    },
+    {
+      "id": 57,
+      "severity": "medium",
+      "category": "test-lock-in",
+      "title": "Web stop test encodes immediate pidfile deletion behavior",
+      "file": "tests/test_webui.py",
+      "line": 82,
+      "evidence": "The test asserts run.pid does not exist immediately after stop.",
+      "impact": "A safer stop implementation would require changing this test."
+    },
+    {
+      "id": 58,
+      "severity": "medium",
+      "category": "test-lock-in",
+      "title": "Unknown dependency test encodes the current warn-and-ignore behavior",
+      "file": "tests/test_hardening.py",
+      "line": 229,
+      "evidence": "The test asserts _wait_for_deps returns True when the only dependency is unknown.",
+      "impact": "Changing unknown dependencies to hard failures requires updating this test."
+    },
+    {
+      "id": 59,
+      "severity": "low",
+      "category": "validation-consistency",
+      "title": "Numeric option policy differs between web validation and RunConfig normalization",
+      "file": "tests/test_hardening.py",
+      "line": 318,
+      "evidence": "Web rejects 0/negative values with 400, while RunConfig clamps them.",
+      "impact": "Different entrypoints behave differently for the same invalid settings."
+    },
+    {
+      "id": 60,
+      "severity": "low",
+      "category": "webui-validation",
+      "title": "MAX_SPEC_BYTES name does not match implementation because spec size is checked by character count after JSON parsing",
+      "file": "orchestrator/webui.py",
+      "line": 407,
+      "evidence": "The code checks len(data.get('spec_text', '')), not encoded byte length.",
+      "impact": "Multibyte specs can exceed the intended byte limit while passing the character-count check."
+    },
+    {
+      "id": 61,
+      "severity": "medium",
+      "category": "webui-config",
+      "title": "Web-launched runs hardcode poll interval to 600 seconds",
+      "file": "orchestrator/webui.py",
+      "line": 103,
+      "evidence": "build_command always appends --poll-interval 600, while the CLI default is 20 seconds and the web UI exposes no control.",
+      "impact": "PM/PL supervision cadence differs silently between CLI and web runs."
+    },
+    {
+      "id": 62,
+      "severity": "medium",
+      "category": "webui-config",
+      "title": "Web UI cannot pass timeout, retries, budget, or model options to orchestrator runs",
+      "file": "orchestrator/webui.py",
+      "line": 90,
+      "evidence": "build_command forwards backend, backends, role_backends, distribute, cross_check, mock, delegate, max_units, and max_attempts only.",
+      "impact": "Real backend runs started from the browser cannot use important CLI controls documented for production runs."
+    },
+    {
+      "id": 63,
+      "severity": "medium",
+      "category": "webui-ux",
+      "title": "Run button can remain disabled if startRun fetch or JSON parsing throws",
+      "file": "orchestrator/webui.py",
+      "line": 626,
+      "evidence": "startRun disables runBtn, awaits fetch and r.json, then re-enables it without try/finally.",
+      "impact": "A network error or non-JSON response can leave the launch UI stuck until refresh."
+    },
+    {
+      "id": 64,
+      "severity": "low",
+      "category": "webui-performance",
+      "title": "Dashboard polling can overlap because loop does not await tick",
+      "file": "orchestrator/webui.py",
+      "line": 711,
+      "evidence": "loop awaits refreshRuns but calls tick() without await every second.",
+      "impact": "Slow /api/state responses can race each other and render stale state after newer state."
+    },
+    {
+      "id": 65,
+      "severity": "medium",
+      "category": "webui-security",
+      "title": "Backend status panel renders backend names and reasons via innerHTML without escaping",
+      "file": "orchestrator/webui.py",
+      "line": 594,
+      "evidence": "loadChecks concatenates r.name and r.reason directly into innerHTML.",
+      "impact": "If an availability reason ever contains HTML, the browser can render unintended markup or script."
+    },
+    {
+      "id": 66,
+      "severity": "medium",
+      "category": "webui-security",
+      "title": "Run picker builds inline onclick handlers from run IDs",
+      "file": "orchestrator/webui.py",
+      "line": 646,
+      "evidence": "renderPicker injects onclick=\"selectRun('\" + r.id + \"')\" into innerHTML. list_runs uses directory names under base_dir, not only new_run_id outputs.",
+      "impact": "A manually created run directory with quotes or script-like content can break markup or inject JavaScript."
+    },
+    {
+      "id": 67,
+      "severity": "low",
+      "category": "webui-validation",
+      "title": "RunManager.project_dir accepts empty run IDs as the base directory itself",
+      "file": "orchestrator/webui.py",
+      "line": 156,
+      "evidence": "project_dir allows p == base. An empty run_id resolves to base rather than being rejected.",
+      "impact": "APIs can operate against base_dir/.orchestrator for invalid or missing run IDs."
+    },
+    {
+      "id": 68,
+      "severity": "low",
+      "category": "webui-api",
+      "title": "/api/agent does not require a non-empty run or role",
+      "file": "orchestrator/webui.py",
+      "line": 334,
+      "evidence": "do_GET for /api/agent reads run and role defaults as empty strings and still calls manager.project_dir(run).",
+      "impact": "Invalid agent requests return empty successful responses instead of clear 400 or 404 errors."
+    },
+    {
+      "id": 69,
+      "severity": "low",
+      "category": "webui-api",
+      "title": "/api/state returns an empty successful state for nonexistent runs",
+      "file": "orchestrator/webui.py",
+      "line": 301,
+      "evidence": "If the requested run directory has no board.json, _read_board returns {}, and the API still returns 200.",
+      "impact": "The UI and callers cannot distinguish a run that has not initialized yet from a nonexistent or broken run."
+    },
+    {
+      "id": 70,
+      "severity": "medium",
+      "category": "state-corruption",
+      "title": "Corrupt board.json is silently treated as an empty board",
+      "file": "orchestrator/monitor.py",
+      "line": 96,
+      "evidence": "_read_board catches all exceptions from json.loads and returns {}.",
+      "impact": "State corruption is hidden from the web UI and TUI instead of being surfaced as a run error."
+    },
+    {
+      "id": 71,
+      "severity": "medium",
+      "category": "cross-check",
+      "title": "Cross-check warning ignores role-pinned backends that can make a two-backend pool",
+      "file": "orchestrator/__main__.py",
+      "line": 123,
+      "evidence": "build_config warns whenever --cross-check has fewer than two --backends, but RunConfig._cross_pool can add role_priority values to the pool.",
+      "impact": "Users can receive a warning that cross-check will not apply even when role pins make it apply."
+    },
+    {
+      "id": 72,
+      "severity": "medium",
+      "category": "webui-ux",
+      "title": "Mock checkbox is checked by default and silently overrides selected real backends",
+      "file": "orchestrator/webui.py",
+      "line": 546,
+      "evidence": "The browser sends mock:true by default. RunConfig.backends_for returns mock before considering backend selections.",
+      "impact": "A user can select a real backend in the web UI but still get a mock run unless they notice and uncheck mock."
+    },
+    {
+      "id": 73,
+      "severity": "low",
+      "category": "documentation",
+      "title": "docs/PLAN.md contains stale implementation claims",
+      "file": "docs/PLAN.md",
+      "line": 124,
+      "evidence": "The plan mentions board MCP tools and command-injection prevention for OpenAI bash, while the current implementation uses result files and documents that run_bash only sets cwd.",
+      "impact": "Maintainers can be misled about actual security and architecture behavior."
+    },
+    {
+      "id": 74,
+      "severity": "low",
+      "category": "documentation",
+      "title": "docs/architecture.html depends on a remote CDN to render Mermaid",
+      "file": "docs/architecture.html",
+      "line": 76,
+      "evidence": "The page imports mermaid from https://cdn.jsdelivr.net/...",
+      "impact": "The architecture diagram does not render offline or in restricted network environments."
+    },
+    {
+      "id": 75,
+      "severity": "low",
+      "category": "documentation",
+      "title": "docs/architecture.html describes stale runtime details",
+      "file": "docs/architecture.html",
+      "line": 40,
+      "evidence": "The diagram mentions board MCP tools and ClaudeSDKClient supervisor loops, which do not match the current baseline implementation.",
+      "impact": "Architecture documentation can lead readers to believe unsupported runtime mechanisms exist."
+    },
+    {
+      "id": 76,
+      "severity": "low",
+      "category": "template-contract",
+      "title": "Target templates document result file naming without spelling out global vs unit keys",
+      "file": "templates/CLAUDE.md",
+      "line": 22,
+      "evidence": "The template says .orchestrator/results/<role>__<unit>.json, while non-unit roles use global and supervisors do not require result files.",
+      "impact": "Agents or humans reading target instructions can misunderstand which result file to write."
+    },
+    {
+      "id": 77,
+      "severity": "low",
+      "category": "template-contract",
+      "title": "AGENTS.md template uses a malformed JSON schema example",
+      "file": "templates/AGENTS.md",
+      "line": 16,
+      "evidence": "The inline example is {\"status\",\"artifacts\":[],\"notes\":[],\"blockers\":[],\"units\":[]}, which is not valid JSON.",
+      "impact": "Codex-style agents that rely on AGENTS.md may copy an invalid result schema."
+    },
+    {
+      "id": 78,
+      "severity": "medium",
+      "category": "webui-api",
+      "title": "POST handlers assume parsed JSON is an object",
+      "file": "orchestrator/webui.py",
+      "line": 372,
+      "evidence": "json.loads can return a list, string, number, or null. Later code calls data.get(...) unconditionally.",
+      "impact": "Malformed but valid JSON bodies can raise AttributeError and drop the HTTP connection instead of returning 400."
+    },
+    {
+      "id": 79,
+      "severity": "low",
+      "category": "webui-api",
+      "title": "backends option type is not validated",
+      "file": "orchestrator/webui.py",
+      "line": 415,
+      "evidence": "The code iterates data.get('backends') directly. If a client sends a string, it iterates characters rather than backend names.",
+      "impact": "API behavior for malformed clients is confusing and can produce misleading validation errors."
+    },
+    {
+      "id": 80,
+      "severity": "medium",
+      "category": "webui-api",
+      "title": "role_backends option type is not validated before .items()",
+      "file": "orchestrator/webui.py",
+      "line": 419,
+      "evidence": "The code calls (data.get('role_backends') or {}).items() without checking that role_backends is a dict.",
+      "impact": "Malformed clients can crash the request handler instead of receiving a structured 400 response."
+    },
+    {
+      "id": 81,
+      "severity": "low",
+      "category": "webui",
+      "title": "list_runs can surface symlinked or externally moved run directories inconsistently",
+      "file": "orchestrator/webui.py",
+      "line": 127,
+      "evidence": "list_runs enumerates base_dir entries by path name, while RunManager.project_dir later resolves and rejects paths outside base_dir.",
+      "impact": "A symlinked run can appear in /api/runs but later fail state/stop/rerun operations."
+    },
+    {
+      "id": 82,
+      "severity": "medium",
+      "category": "board",
+      "title": "set_status logs success even when the target unit ID does not exist",
+      "file": "orchestrator/board.py",
+      "line": 127,
+      "evidence": "set_status loops through units and flushes, but does not track whether a unit was actually updated before logging status=...",
+      "impact": "Events can claim a status transition happened when board state did not change."
+    },
+    {
+      "id": 83,
+      "severity": "medium",
+      "category": "board",
+      "title": "set_test_status silently no-ops for unknown unit IDs",
+      "file": "orchestrator/board.py",
+      "line": 148,
+      "evidence": "set_test_status does not report or warn when no matching unit is found.",
+      "impact": "Test result updates can be lost without any warning."
+    },
+    {
+      "id": 84,
+      "severity": "medium",
+      "category": "board",
+      "title": "add_artifacts silently drops artifacts for unknown unit IDs",
+      "file": "orchestrator/board.py",
+      "line": 137,
+      "evidence": "add_artifacts loops through units and appends only on match, with no warning if no unit matches.",
+      "impact": "Artifacts from a role run can disappear from reports if the unit ID mismatches."
+    },
+    {
+      "id": 85,
+      "severity": "medium",
+      "category": "board",
+      "title": "add_cost accepts non-finite float values",
+      "file": "orchestrator/board.py",
+      "line": 171,
+      "evidence": "add_cost converts amount with float(amount) and json.dumps later writes NaN or Infinity by default if present.",
+      "impact": "A malformed backend cost can produce non-standard JSON in board.json."
+    },
+    {
+      "id": 86,
+      "severity": "low",
+      "category": "board",
+      "title": "agent_update can raise on invalid token or cost inputs",
+      "file": "orchestrator/board.py",
+      "line": 219,
+      "evidence": "cost_add and tokens_add are converted with float() and int() without local error handling.",
+      "impact": "Unexpected backend metadata can break a board update path."
+    },
+    {
+      "id": 87,
+      "severity": "low",
+      "category": "logging",
+      "title": "Board log paths are not sanitized when role is passed programmatically",
+      "file": "orchestrator/board.py",
+      "line": 236,
+      "evidence": "_append_agent_log and write_agent_block use f'{role}.log' directly.",
+      "impact": "Internal callers using untrusted role names could write logs outside the agents directory."
+    },
+    {
+      "id": 88,
+      "severity": "low",
+      "category": "webui",
+      "title": "_send does not handle BrokenPipeError or client disconnects",
+      "file": "orchestrator/webui.py",
+      "line": 273,
+      "evidence": "_send writes body directly to self.wfile without catching socket write errors.",
+      "impact": "Client disconnects can produce noisy handler tracebacks."
+    },
+    {
+      "id": 89,
+      "severity": "medium",
+      "category": "webui-api",
+      "title": "spec_text type is not validated before writing to disk",
+      "file": "orchestrator/webui.py",
+      "line": 439,
+      "evidence": "The handler uses len(data.get('spec_text', '') or '') and passes the value to RunManager.start, which calls Path.write_text and expects a string.",
+      "impact": "A valid JSON body with spec_text as a list/object can crash the request handler."
+    },
+    {
+      "id": 90,
+      "severity": "medium",
+      "category": "rerun",
+      "title": "TUI rerun trusts mutable rerun.json arguments",
+      "file": "orchestrator/monitor.py",
+      "line": 79,
+      "evidence": "_rerun reads argv from .orchestrator/rerun.json and launches python -m orchestrator with those arguments.",
+      "impact": "If rerun.json is edited or corrupted, the monitor can launch an unexpected orchestrator command."
+    },
+    {
+      "id": 91,
+      "severity": "low",
+      "category": "workspace",
+      "title": "scaffold overwrites .orchestrator/spec.md on existing target projects",
+      "file": "orchestrator/workspace.py",
+      "line": 46,
+      "evidence": "scaffold always writes spec_text to .orchestrator/spec.md.",
+      "impact": "Existing run metadata in a reused project directory can be overwritten."
+    },
+    {
+      "id": 92,
+      "severity": "low",
+      "category": "workspace",
+      "title": "gitignore seeding treats any .orchestrator/ substring as already configured",
+      "file": "orchestrator/workspace.py",
+      "line": 65,
+      "evidence": "The check is if '.orchestrator/' not in cur, which also matches comments or unrelated patterns.",
+      "impact": "A target .gitignore with a commented mention can fail to ignore actual orchestrator state."
+    },
+    {
+      "id": 93,
+      "severity": "medium",
+      "category": "agent-metadata",
+      "title": "Main role frontmatter model is parsed but ignored",
+      "file": "orchestrator/runner.py",
+      "line": 62,
+      "evidence": "load_agent returns agent.model, but _build_req sets model from cfg.model_for(backend_name) only. agent.model is used only for delegated teammates.",
+      "impact": "Per-agent model choices in .claude/agents/*.md do not affect normal role execution."
+    },
+    {
+      "id": 94,
+      "severity": "low",
+      "category": "agent-metadata",
+      "title": "model: inherit can be passed as a literal delegated teammate model",
+      "file": "orchestrator/runner.py",
+      "line": 47,
+      "evidence": "_build_teammates includes td.model directly. The bundled agent files set model: inherit.",
+      "impact": "Delegation backends may receive 'inherit' as an actual model name instead of treating it as unspecified."
+    },
+    {
+      "id": 95,
+      "severity": "low",
+      "category": "tool-semantics",
+      "title": "OpenAI Agents Edit tool is implemented as full-file overwrite",
+      "file": "orchestrator/backends/openai_agents.py",
+      "line": 84,
+      "evidence": "tool_map maps both Write and Edit to write_file.",
+      "impact": "Agents expecting an edit operation may overwrite whole files instead of applying targeted changes."
+    },
+    {
+      "id": 96,
+      "severity": "medium",
+      "category": "board",
+      "title": "Board.units returns shallow copies with mutable nested lists still shared",
+      "file": "orchestrator/board.py",
+      "line": 369,
+      "evidence": "units() returns [dict(u)] but nested lists like artifacts, deps, roles, and notes are the same list objects.",
+      "impact": "Internal callers can mutate board state outside the board lock and without flushing to disk."
+    },
+    {
+      "id": 97,
+      "severity": "medium",
+      "category": "contract",
+      "title": "Result status validation is not role or phase specific",
+      "file": "orchestrator/runner.py",
+      "line": 249,
+      "evidence": "_SUCCESS_STATUSES accepts generic values such as done, passed, success, and completed for every role.",
+      "impact": "A dev role can report passed or an architect can report done and still be treated as _ok even if the phase-specific contract was not satisfied."
+    },
+    {
+      "id": 98,
+      "severity": "medium",
+      "category": "contract",
+      "title": "Architect success does not require a non-empty units array",
+      "file": "orchestrator/scheduler.py",
+      "line": 86,
+      "evidence": "The scheduler only reads arch_outcome.get('units') or [] and falls back to a core unit when none exist.",
+      "impact": "An architect result can be considered successful while failing its most important contract: decomposing the spec into units."
+    },
+    {
+      "id": 99,
+      "severity": "medium",
+      "category": "webui-validation",
+      "title": "Web form masks invalid numeric values before server validation",
+      "file": "orchestrator/webui.py",
+      "line": 623,
+      "evidence": "startRun sends +concurrency || 3 and +maxAttempts || 2. Values such as 0, NaN, or non-numeric strings become defaults.",
+      "impact": "The server-side validation for invalid numeric inputs is bypassed for normal browser use."
+    },
+    {
+      "id": 100,
+      "severity": "medium",
+      "category": "webui-config",
+      "title": "Web role backend controls cannot express per-role priority lists",
+      "file": "orchestrator/webui.py",
+      "line": 618,
+      "evidence": "The UI builds role_backends as role -> single select value, while CLI supports ROLE=B1[,B2,...].",
+      "impact": "Browser-launched runs cannot configure per-role failover priority even though the CLI and config model support it."
+    },
+    {
+      "id": 101,
+      "severity": "medium",
+      "category": "webui-api",
+      "title": "Web API accepts only scalar role_backends values but build_command does not handle list priorities",
+      "file": "orchestrator/webui.py",
+      "line": 109,
+      "evidence": "build_command emits f'{role}={prov}'. If API clients send a list to represent priority, the list repr is passed to the CLI as one malformed backend string.",
+      "impact": "The API shape cannot faithfully represent the CLI's role-backend priority feature."
+    },
+    {
+      "id": 102,
+      "severity": "medium",
+      "category": "cli",
+      "title": "Top-level --web repurposes --project-dir as the web run base directory",
+      "file": "orchestrator/__main__.py",
+      "line": 173,
+      "evidence": "main calls serve(a.port, a.project_dir, a.host) when --web is set, although --project-dir is documented as the target output directory for a single run.",
+      "impact": "The same option has different meanings between CLI run mode and web server mode, which can confuse users and scripts."
+    },
+    {
+      "id": 103,
+      "severity": "low",
+      "category": "reporting",
+      "title": "write_report reports ok for an empty board with no units and no warnings",
+      "file": "orchestrator/board.py",
+      "line": 257,
+      "evidence": "If units is empty and warnings is empty, result is set to ok.",
+      "impact": "A report generated before unit creation or after state loss can look successful despite containing no work."
+    },
+    {
+      "id": 104,
+      "severity": "low",
+      "category": "documentation",
+      "title": "README examples use --max-units in real mode even though current max-units behavior can produce partial-success reports",
+      "file": "README.md",
+      "line": 87,
+      "evidence": "The real-mode demo uses --max-units 2, while the scheduler currently leaves unprocessed units in designed state and can still exit 0.",
+      "impact": "The documented demo path exercises a known partial-run success bug."
+    },
+    {
+      "id": 105,
+      "severity": "low",
+      "category": "repo-hygiene",
+      "title": "Ignored cache and OS files are present in the working tree",
+      "file": ".gitignore",
+      "line": 1,
+      "evidence": "find shows .DS_Store, .pytest_cache, .ruff_cache, and __pycache__ files in the repository directory.",
+      "impact": "They are ignored, but they add local noise and can confuse file audits or packaging checks."
+    },
+    {
+      "id": 106,
+      "severity": "medium",
+      "category": "web-security",
+      "title": "Docker deployment binds the unauthenticated web UI to 0.0.0.0 by default",
+      "file": "Dockerfile",
+      "line": 24,
+      "evidence": "The Docker CMD starts --web --host 0.0.0.0. README notes the web UI has no auth.",
+      "impact": "Running the documented container command can expose run controls on any reachable network interface unless the operator adds external protection."
+    },
+    {
+      "id": 107,
+      "severity": "critical",
+      "category": "result-contract",
+      "title": "Valid JSON result files that are not objects can be accepted as successful",
+      "file": "orchestrator/runner.py",
+      "line": 280,
+      "evidence": "_coerce_result replaces non-dict JSON values with {}, then defaults status to done when the backend returned ok=True.",
+      "impact": "A role can write [] or \"done\" instead of the required object schema and still be treated as _ok."
+    },
+    {
+      "id": 108,
+      "severity": "high",
+      "category": "path-safety",
+      "title": "Codex backend output path embeds unit IDs without path validation",
+      "file": "orchestrator/backends/codex_cli.py",
+      "line": 106,
+      "evidence": "out_path is built from f'{req.role}__{key}__{uuid}.codex.txt' where key is req.unit['id'].",
+      "impact": "Unsafe unit IDs can move Codex transcript output outside the intended .orchestrator/results directory."
+    },
+    {
+      "id": 109,
+      "severity": "medium",
+      "category": "backend-status",
+      "title": "Claude CLI backend reports ready when the binary exists, without verifying login or API credentials",
+      "file": "orchestrator/backends/claude_cli.py",
+      "line": 65,
+      "evidence": "available() only checks shutil.which('claude') and returns ready (login subscription or ANTHROPIC_API_KEY).",
+      "impact": "--check and the web backend panel can show Claude CLI as ready even though the first real role call will fail for auth."
+    },
+    {
+      "id": 110,
+      "severity": "medium",
+      "category": "backend-status",
+      "title": "Claude team backend reports ready when the binary exists, without verifying login or API credentials",
+      "file": "orchestrator/backends/claude_team.py",
+      "line": 20,
+      "evidence": "available() only checks shutil.which('claude').",
+      "impact": "The native subagent backend can appear available while actual dispatch fails for authentication."
+    },
+    {
+      "id": 111,
+      "severity": "medium",
+      "category": "backend-status",
+      "title": "Codex backend reports ready when the binary exists, without verifying login or API credentials",
+      "file": "orchestrator/backends/codex_cli.py",
+      "line": 99,
+      "evidence": "available() only checks shutil.which('codex') and returns ready (codex login or CODEX_API_KEY).",
+      "impact": "--check and the web backend panel can show Codex as ready even though real execution fails for auth."
+    },
+    {
+      "id": 112,
+      "severity": "medium",
+      "category": "budget",
+      "title": "Budget option is only enforced by Claude SDK but is accepted globally",
+      "file": "orchestrator/runner.py",
+      "line": 78,
+      "evidence": "RoleRequest carries budget for all backends, but Claude CLI, Claude team, Codex, OpenAI Agents, and mock do not enforce it.",
+      "impact": "Users can pass --budget and assume cost protection while most backend paths ignore it."
+    },
+    {
+      "id": 113,
+      "severity": "medium",
+      "category": "budget",
+      "title": "Claude SDK option compatibility fallback can silently drop the budget cap",
+      "file": "orchestrator/backends/claude_sdk.py",
+      "line": 31,
+      "evidence": "_make_options catches TypeError and removes max_budget_usd among other options before retrying.",
+      "impact": "If the installed SDK does not accept the budget option, the run proceeds without the requested budget limit and without surfacing that fact."
+    },
+    {
+      "id": 114,
+      "severity": "medium",
+      "category": "budget",
+      "title": "OpenAI Agents backend ignores RoleRequest.budget",
+      "file": "orchestrator/backends/openai_agents.py",
+      "line": 98,
+      "evidence": "Agent kwargs include name, instructions, tools, and optional model only; req.budget is never used.",
+      "impact": "OpenAI Agents runs have no budget cap despite the global CLI accepting --budget."
+    },
+    {
+      "id": 115,
+      "severity": "medium",
+      "category": "budget",
+      "title": "Codex backend ignores RoleRequest.budget",
+      "file": "orchestrator/backends/codex_cli.py",
+      "line": 115,
+      "evidence": "The codex command includes sandbox/json/output/model flags but no budget-related behavior.",
+      "impact": "Codex runs can exceed the user's intended budget."
+    },
+    {
+      "id": 116,
+      "severity": "medium",
+      "category": "budget",
+      "title": "Claude CLI and Claude team backends ignore RoleRequest.budget",
+      "file": "orchestrator/backends/claude_cli.py",
+      "line": 70,
+      "evidence": "The Claude CLI command does not include or enforce any budget cap; claude_team uses the same CLI pattern.",
+      "impact": "Subscription/API CLI runs can proceed without budget enforcement even when --budget was provided."
+    },
+    {
+      "id": 117,
+      "severity": "medium",
+      "category": "turn-limit",
+      "title": "Claude CLI backend ignores RoleRequest.max_turns",
+      "file": "orchestrator/backends/claude_cli.py",
+      "line": 70,
+      "evidence": "RoleRequest carries max_turns, but the claude command is built without any turn-limit option.",
+      "impact": "The documented per-session max_turns safety rail is not enforced for Claude CLI runs."
+    },
+    {
+      "id": 118,
+      "severity": "medium",
+      "category": "turn-limit",
+      "title": "Claude team backend ignores RoleRequest.max_turns",
+      "file": "orchestrator/backends/claude_team.py",
+      "line": 32,
+      "evidence": "The claude-team command is built without a max-turns equivalent even though RoleRequest includes max_turns.",
+      "impact": "Native subagent dispatch runs do not enforce the same turn cap as SDK-backed runs."
+    },
+    {
+      "id": 119,
+      "severity": "medium",
+      "category": "turn-limit",
+      "title": "Codex backend ignores RoleRequest.max_turns",
+      "file": "orchestrator/backends/codex_cli.py",
+      "line": 115,
+      "evidence": "The codex exec command does not use req.max_turns.",
+      "impact": "Codex runs are not bounded by the role phase max_turns configured in the orchestrator."
+    },
+    {
+      "id": 120,
+      "severity": "medium",
+      "category": "scheduler",
+      "title": "Build pipeline gather does not use return_exceptions and can skip final unit cleanup on internal exceptions",
+      "file": "orchestrator/scheduler.py",
+      "line": 118,
+      "evidence": "asyncio.gather(*[pipeline(u) for u in unit_list]) uses the default exception behavior. If a pipeline raises, the cleanup block that marks non-terminal units failed is skipped.",
+      "impact": "An unexpected internal exception can leave units in in_progress/designed states and produce incomplete reports."
+    },
+    {
+      "id": 121,
+      "severity": "medium",
+      "category": "scheduler",
+      "title": "Development role gather assumes runner.run_role never raises",
+      "file": "orchestrator/scheduler.py",
+      "line": 183,
+      "evidence": "_develop_unit awaits asyncio.gather over dev role calls without return_exceptions or a local wrapper.",
+      "impact": "A regression in Runner or a programmatic monkeypatch can abort the unit pipeline instead of marking the unit failed."
+    },
+    {
+      "id": 122,
+      "severity": "low",
+      "category": "openai-agents",
+      "title": "OpenAI Agents read_file has no size limit",
+      "file": "orchestrator/backends/openai_agents.py",
+      "line": 43,
+      "evidence": "read_file returns the entire file contents.",
+      "impact": "Agents can accidentally load very large files into tool output and context."
+    },
+    {
+      "id": 123,
+      "severity": "low",
+      "category": "openai-agents",
+      "title": "OpenAI Agents write_file has no content size limit",
+      "file": "orchestrator/backends/openai_agents.py",
+      "line": 49,
+      "evidence": "write_file writes the full provided content string without a maximum size.",
+      "impact": "A malformed tool call can create very large files under the target project."
+    },
+    {
+      "id": 124,
+      "severity": "low",
+      "category": "openai-agents",
+      "title": "OpenAI Agents run_bash output omits the command exit code",
+      "file": "orchestrator/backends/openai_agents.py",
+      "line": 67,
+      "evidence": "run_bash returns stdout+stderr truncated to 4000 characters but does not include r.returncode.",
+      "impact": "The agent may misinterpret a failed command as successful if the textual output is ambiguous."
+    },
+    {
+      "id": 125,
+      "severity": "medium",
+      "category": "mock-backend",
+      "title": "Mock CI workflow YAML is malformed",
+      "file": "orchestrator/backends/mock.py",
+      "line": 84,
+      "evidence": "The generated ci.yml string concatenates runs-on and steps without a newline between ubuntu-latest and steps.",
+      "impact": "A mock run can produce an invalid .github/workflows/ci.yml while tests only assert the file exists."
+    },
+    {
+      "id": 126,
+      "severity": "medium",
+      "category": "mock-backend",
+      "title": "Mock frontend component name is derived directly from unit ID and can be invalid JavaScript",
+      "file": "orchestrator/backends/mock.py",
+      "line": 55,
+      "evidence": "The generated JSX uses export default function {unit['id']}(), but IDs such as U-1, 1, or A/B are not valid function identifiers.",
+      "impact": "Mock validation can generate syntactically invalid frontend files."
+    },
+    {
+      "id": 127,
+      "severity": "medium",
+      "category": "mock-backend",
+      "title": "Mock test function name is derived directly from unit ID and can be invalid Python",
+      "file": "orchestrator/backends/mock.py",
+      "line": 75,
+      "evidence": "The generated test uses def test_{unit['id'].lower()}(): without sanitizing the ID.",
+      "impact": "Mock validation can generate syntactically invalid pytest files."
+    },
+    {
+      "id": 128,
+      "severity": "medium",
+      "category": "mock-backend",
+      "title": "Mock database table name is derived directly from unit ID and can be invalid SQL",
+      "file": "orchestrator/backends/mock.py",
+      "line": 68,
+      "evidence": "The generated migration uses CREATE TABLE IF NOT EXISTS t_{unit['id'].lower()} without identifier quoting or sanitization.",
+      "impact": "Mock validation can generate invalid SQL for non-simple unit IDs."
+    },
+    {
+      "id": 129,
+      "severity": "low",
+      "category": "mock-backend",
+      "title": "Mock E2E sheet ignores the provided spec text",
+      "file": "orchestrator/backends/mock.py",
+      "line": 200,
+      "evidence": "_mock_e2e accepts spec_text but returns a fixed smoke scenario.",
+      "impact": "Mock testsheet output can look successful while not reflecting the actual uploaded spec."
+    },
+    {
+      "id": 130,
+      "severity": "medium",
+      "category": "scheduler",
+      "title": "CI/CD and docs phases still run after failed or blocked units",
+      "file": "orchestrator/scheduler.py",
+      "line": 129,
+      "evidence": "After build/test cleanup, the scheduler always enters cicd and docs phases regardless of failed or blocked units.",
+      "impact": "Later phases can produce deliverables for an incomplete or failed build, making artifacts look more complete than they are."
+    },
+    {
+      "id": 131,
+      "severity": "medium",
+      "category": "scheduler",
+      "title": "Final phase is set to done even when units or post-build phases failed",
+      "file": "orchestrator/scheduler.py",
+      "line": 153,
+      "evidence": "The scheduler sets phase to done after finishing supervisors regardless of warnings or failed units.",
+      "impact": "Consumers that look only at phase can interpret a failed run as completed successfully."
+    },
+    {
+      "id": 132,
+      "severity": "medium",
+      "category": "monitor",
+      "title": "Monitor state label does not include failed or blocked unit status",
+      "file": "orchestrator/monitor.py",
+      "line": 169,
+      "evidence": "_state_label only considers alive, phase, and warnings. It does not inspect failed or blocked units.",
+      "impact": "The TUI and one-shot snapshot can show done or stopped without making failed units obvious in the run state label."
+    },
+    {
+      "id": 133,
+      "severity": "low",
+      "category": "monitor",
+      "title": "Backend availability view can overflow vertically without scrolling",
+      "file": "orchestrator/monitor.py",
+      "line": 295,
+      "evidence": "_draw_backends writes one row per backend and does not guard against terminal height except through _safe_add silently dropping rows.",
+      "impact": "On small terminals some backend status rows can disappear with no scroll path."
+    }
+  ]
+}

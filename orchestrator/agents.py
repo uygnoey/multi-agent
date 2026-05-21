@@ -65,11 +65,24 @@ def load_agent(role: str) -> AgentDef:
     fm, body = _split_frontmatter(path.read_text(encoding="utf-8"))
     meta = _parse_meta(fm)
     tools = _as_tools(meta.get("tools"))
-    model = meta.get("model") or None
     return AgentDef(
         name=str(meta.get("name", role)),
         description=str(meta.get("description", "")),
         tools=tools,
-        model=str(model) if model else None,
+        model=_norm_model(meta.get("model")),
         system_prompt=body.strip(),
     )
+
+
+def _norm_model(value) -> str | None:
+    """frontmatter 의 model 값 정규화. 'inherit'(대소문자 무관)/빈값은 미지정(None) 처리 (#94).
+
+    번들 에이전트가 model: inherit 를 쓰면 실제 모델명이 아니라 '미지정' 의미이므로
+    백엔드/teammate 에 'inherit' 가 모델명으로 새어 들어가지 않게 한다.
+    """
+    if not value:
+        return None
+    s = str(value).strip()
+    if not s or s.lower() == "inherit":
+        return None
+    return s

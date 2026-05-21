@@ -170,7 +170,10 @@ def test_runconfig_clamps_numeric_options(tmp_path, sample_spec_path):
     )
     assert cfg.concurrency == 1 and cfg.max_attempts == 1 and cfg.retries == 0
     assert cfg.max_units is None  # 0/음수 → 제한 없음
-    assert RunConfig(spec_path=sample_spec_path, project_dir=tmp_path / "q", max_units=-1).max_units is None
+    assert (
+        RunConfig(spec_path=sample_spec_path, project_dir=tmp_path / "q", max_units=-1).max_units
+        is None
+    )
 
 
 def test_add_units_ignores_dict_and_none_deps_roles(tmp_path):
@@ -226,13 +229,15 @@ def test_add_units_handles_numeric_scalar_deps_roles(tmp_path):
     assert isinstance(u["roles"], list)
 
 
-def test_wait_for_deps_warns_on_unknown_dep(tmp_path, sample_spec_path):
+def test_wait_for_deps_blocks_on_unknown_dep(tmp_path, sample_spec_path):
+    # 감사 #6/#58: 존재하지 않는 dep(architect 오타 등)은 무시(=실행)하지 않고
+    # 의존 unit 을 BLOCKED 처리(False) + 경고로 표면화한다.
     cfg = RunConfig(spec_path=sample_spec_path, project_dir=tmp_path / "p", mock=True)
     sched = Scheduler(cfg)
     asyncio.run(sched.board.init("s", {}))
     asyncio.run(sched.board.add_units([{"id": "U2", "title": "b"}]))  # U1 은 board 에 없음
     ok = asyncio.run(sched._wait_for_deps({"id": "U2", "deps": ["U1"]}))
-    assert ok is True  # 알 수 없는 dep 은 무한 대기 X
+    assert ok is False  # 미지 dep → 의존자 차단
     assert any("U1" in w for w in sched.board.snapshot()["warnings"])  # 경고로 표면화
 
 
@@ -250,8 +255,10 @@ def test_add_units_normalizes_scalar_deps_and_roles(tmp_path):
 
 def test_warnings_recorded_and_reported(tmp_path):
     # 설계/CI/docs 실패는 경고로 기록되고 리포트에 'done with warnings' 로 표시돼야 함.
+    # (unit 이 있어야 함 — 빈 보드는 감사 #103 으로 'no units' 가 되므로 unit 하나 추가.)
     board = Board(tmp_path / "p")
     asyncio.run(board.init("s", {}))
+    asyncio.run(board.add_units([{"id": "U1", "title": "a"}]))
     asyncio.run(board.add_warning("cicd failed"))
     assert board.snapshot()["warnings"] == ["cicd failed"]
     text = board.write_report().read_text(encoding="utf-8")
@@ -276,7 +283,9 @@ def test_test_engineer_failure_fails_unit(tmp_path, sample_spec_path):
     # test-engineer 가 실패하면 QA 가 통과해도 unit 은 done/pass 가 되면 안 됨.
     from orchestrator.board import FAILED
 
-    cfg = RunConfig(spec_path=sample_spec_path, project_dir=tmp_path / "p", mock=True, max_attempts=1)
+    cfg = RunConfig(
+        spec_path=sample_spec_path, project_dir=tmp_path / "p", mock=True, max_attempts=1
+    )
     sched = Scheduler(cfg)
     asyncio.run(sched.board.init("spec", {}))
     asyncio.run(sched.board.add_units([{"id": "U1", "title": "a"}]))
@@ -302,7 +311,9 @@ def test_run_role_failover_on_backend_exception(tmp_path, sample_spec_path, monk
         async def run_role(self, req):
             raise RuntimeError("boom")
 
-    monkeypatch.setattr(runner_mod, "get_backend", lambda n: Boom() if n == "boom" else MockBackend())
+    monkeypatch.setattr(
+        runner_mod, "get_backend", lambda n: Boom() if n == "boom" else MockBackend()
+    )
     cfg = RunConfig(
         spec_path=sample_spec_path,
         project_dir=tmp_path / "p",

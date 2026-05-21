@@ -96,12 +96,18 @@ def compose_prompt(
         "## Completion report (required)\n"
         f"When done, write your result as JSON to `{result_rel}`. Schema:\n"
         "```json\n"
-        '{"status": "...", "artifacts": ["relative/path", ...], "notes": ["..."], '
+        '{"status": "done", "artifacts": ["relative/path", ...], "notes": ["..."], '
         '"blockers": [], "units": []}\n'
         "```\n"
-        "- Most roles: set status to done/dev_done/tested as appropriate; "
-        "artifacts = files created/edited.\n"
+        "- `status` MUST be one of: `done`, `failed`, `blocked` "
+        "(use `failed`/`blocked` when the work could not be completed, and list reasons "
+        "in `blockers`).\n"
+        "- `artifacts` MUST be project-relative paths (e.g. `backend/app/api.py`). "
+        "Do NOT use absolute paths (no leading `/`, no `C:\\`) or `..` parent-traversal; "
+        "list only files you actually created or edited.\n"
         "- Architect only: include a `units` array of "
-        '[{"id","title","description","deps":[],"roles":[]}].'
+        '[{"id","title","description","deps":[],"roles":[]}]. '
+        "Each `id` MUST be a simple slug (letters, digits, `-`/`_`; no spaces, slashes, "
+        "or `..`), and `deps` MUST reference such ids."
     )
     return "\n\n".join(parts)

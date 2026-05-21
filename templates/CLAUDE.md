@@ -19,9 +19,17 @@ Every role agent follows the conventions here. (Auto-loaded by Claude-family bac
 
 ## Result-file coordination protocol (important)
 - Edit only files inside this directory (cwd). Never access paths outside it.
-- When done, write your result to the assigned `.orchestrator/results/<role>__<unit>.json`:
+- When done, write your result to the assigned `.orchestrator/results/<role>__<key>.json`:
+  - **Unit-scoped roles** (frontend/backend/dba/test-engineer/qa) use the unit id as the key,
+    e.g. `.orchestrator/results/backend-developer__U1.json`.
+  - **Non-unit roles** (architecture-engineer, testsheet-creator, cicd, docs-writer) use the
+    literal key `global`, e.g. `.orchestrator/results/cicd__global.json`.
+  - **Supervisors (project-manager / project-leader) do NOT write a result file** — their output
+    is captured as board directives; only edit/read, never produce a `results/*.json`.
+  - Valid status values: `done`, `passed`, `success`, `completed` (success); `failed`/`blocked`
+    (failure). Use a JSON object exactly like:
   ```json
-  {"status": "...", "artifacts": ["relative/path"], "notes": ["..."], "blockers": [], "units": []}
+  {"status": "done", "artifacts": ["relative/path"], "notes": ["..."], "blockers": [], "units": []}
   ```
 - The board (`.orchestrator/board.json`) is written only by the orchestrator. You read it; you never write it.
 - Do not touch other work units' files. If a shared change is needed, report it via `blockers`.

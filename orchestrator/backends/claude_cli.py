@@ -65,7 +65,9 @@ class ClaudeCLIBackend(Backend):
     def available(self) -> tuple[bool, str]:
         if not shutil.which("claude"):
             return False, "claude CLI 미설치 (npm i -g @anthropic-ai/claude-code)"
-        return True, "ready (로그인 구독 또는 ANTHROPIC_API_KEY)"
+        # #109: '바이너리 존재'만 확인 — 로그인/인증은 검증하지 않는다(네트워크 probe 회피).
+        # --check 가 정직하도록 인증 미검증임을 reason 에 명시한다.
+        return True, "binary present (auth NOT verified: 로그인 구독 또는 ANTHROPIC_API_KEY 필요)"
 
     async def run_role(self, req: RoleRequest) -> RoleResult:
         cmd = [
@@ -84,6 +86,8 @@ class ClaudeCLIBackend(Backend):
         ]
         if req.model:
             cmd += ["--model", req.model]
+        # #116/#117: claude CLI 에는 per-call budget/turn-limit 플래그가 없다.
+        # req.budget / req.max_turns 강제는 이 백엔드에서 불가 — 누적 예산은 상위에서 처리한다.
         try:
             rc, out, err, timed_out = await run_subprocess(
                 cmd, str(req.cwd), req.timeout, req.live_log_path, line_render=claude_stream_line
@@ -94,7 +98,8 @@ class ClaudeCLIBackend(Backend):
         if timed_out:
             return RoleResult(ok=False, error=f"claude-cli timed out after {req.timeout}s")
         if rc != 0:
-            return RoleResult(ok=False, error=err.decode(errors="replace")[:500] or f"exit {rc}")
+            # #42: auth/permission 진단이 잘리지 않도록 stderr cap 을 크게(4000) 잡는다.
+            return RoleResult(ok=False, error=err.decode(errors="replace")[:4000] or f"exit {rc}")
 
         final, cost, model, tokens = parse_stream_result(out)
         return RoleResult(

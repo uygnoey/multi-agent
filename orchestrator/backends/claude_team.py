@@ -20,7 +20,8 @@ class ClaudeTeamBackend(Backend):
     def available(self) -> tuple[bool, str]:
         if not shutil.which("claude"):
             return False, "claude CLI 미설치 (npm i -g @anthropic-ai/claude-code)"
-        return True, "ready (native subagent dispatch)"
+        # #110: 바이너리 존재만 확인 — 로그인/인증은 검증하지 않는다(probe 회피).
+        return True, "binary present (auth NOT verified: native subagent dispatch)"
 
     async def run_role(self, req: RoleRequest) -> RoleResult:
         lead_prompt = (
@@ -44,6 +45,8 @@ class ClaudeTeamBackend(Backend):
         ]
         if req.model:
             cmd += ["--model", req.model]
+        # #116/#118: claude CLI 에는 per-call budget/turn-limit 플래그가 없다.
+        # req.budget / req.max_turns 강제는 이 백엔드에서 불가 — 누적 예산은 상위에서 처리한다.
         try:
             rc, out, err, timed_out = await run_subprocess(
                 cmd, str(req.cwd), req.timeout, req.live_log_path, line_render=claude_stream_line
@@ -54,7 +57,8 @@ class ClaudeTeamBackend(Backend):
         if timed_out:
             return RoleResult(ok=False, error=f"claude-team timed out after {req.timeout}s")
         if rc != 0:
-            return RoleResult(ok=False, error=err.decode(errors="replace")[:500] or f"exit {rc}")
+            # #44: subagent dispatch/CLI 진단이 잘리지 않도록 stderr cap 을 크게(4000) 잡는다.
+            return RoleResult(ok=False, error=err.decode(errors="replace")[:4000] or f"exit {rc}")
 
         final, cost, model, tokens = parse_stream_result(out)
         return RoleResult(

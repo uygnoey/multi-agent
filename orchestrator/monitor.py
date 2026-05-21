@@ -81,6 +81,9 @@ def _rerun(orch_dir: Path) -> tuple[bool, str]:
         return False, "rerun.json 파싱 실패"
     if not argv:
         return False, "재실행 인자 없음"
+    ok, why = _validate_rerun_argv(argv)
+    if not ok:  # rerun.json 이 손상/조작되면 임의 프로그램 실행 금지 (#90)
+        return False, why
     try:
         subprocess.Popen(
             [sys.executable, "-m", "orchestrator", *argv],
@@ -93,14 +96,39 @@ def _rerun(orch_dir: Path) -> tuple[bool, str]:
         return False, f"재실행 실패: {e}"
 
 
+def _validate_rerun_argv(argv) -> tuple[bool, str]:
+    """rerun.json 의 argv 경량 검증 (#90).
+
+    rerun.json 은 로컬 신뢰 데이터지만 손상/조작될 수 있으므로 임의 프로그램 실행을 막는다.
+    - argv 는 list[str] 여야 함
+    - 첫 토큰은 '--' 로 시작하는 오케스트레이터 플래그여야 함 (절대경로/다른 프로그램명 거부)
+    """
+    if not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
+        return False, "재실행 인자 형식 오류 (list[str] 아님)"
+    first = argv[0]
+    # `python -m orchestrator <argv>` 로 실행되므로 첫 토큰은 플래그여야 정상.
+    # 절대경로/상대경로 형태(=다른 프로그램 지정 시도)나 비플래그 토큰은 거부.
+    if first.startswith("/") or first.startswith("\\") or os.path.isabs(first):
+        return False, "재실행 인자 거부 (첫 토큰이 절대경로)"
+    if not first.startswith("-"):
+        return False, "재실행 인자 거부 (첫 토큰이 오케스트레이터 플래그가 아님)"
+    return True, ""
+
+
 def _read_board(orch_dir: Path) -> dict:
+    """board.json 을 읽는다. 파일 없음과 손상을 구분한다 (#70).
+
+    - 파일 없음(아직 run 시작 전): {}  → 대기 화면
+    - 파일은 있으나 파싱 불가(상태 손상): {"_corrupt": True}  → 명확한 손상 표시
+    """
     p = orch_dir / "board.json"
     if not p.exists():
         return {}
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {"_corrupt": True}
     except Exception:
-        return {}
+        return {"_corrupt": True}
 
 
 def _read_agent_log(orch_dir: Path, role: str, n: int = 400) -> str:
@@ -131,7 +159,7 @@ def render_snapshot(board: dict, roles: list[str], alive: bool | None = None) ->
     run_n = sum(1 for r in roles if status_of(agents.get(r, {})) == "running")
     toks = board.get("total_tokens", 0)
     est = " est." if board.get("cost_estimated") else ""
-    state = _state_label(bool(alive), phase, board.get("warnings") or [])
+    state = _state_label(bool(alive), phase, board.get("warnings") or [], units)
     lines = [
         f"phase={phase}   cost=${cost:.4f}{est}   tokens={toks:,}   "
         f"units={done}/{len(units)}   running_agents={run_n}   state={state}",
@@ -166,13 +194,26 @@ def _safe_add(win, y: int, x: int, text: str, attr: int = 0) -> None:
             pass
 
 
-def _state_label(alive: bool, phase: str, warnings: list) -> str:
-    """run 상태 라벨: 실행중 / 완료(경고 있으면 ⚠N) / 중단."""
+def _state_label(alive: bool, phase: str, warnings: list, units: list | None = None) -> str:
+    """run 상태 라벨: 실행중 / 완료 / 중단. 실패·블록 unit 을 라벨에 노출한다 (#132).
+
+    예: 'done(2 failed)', 'done⚠1(1 blocked)', 'stopped(1 failed)' 처럼 실패가 한눈에 보이게.
+    """
+    units = units or []
+    failed = sum(1 for u in units if u.get("status") == "failed")
+    blocked = sum(1 for u in units if u.get("status") == "blocked")
+    bad = []
+    if failed:
+        bad.append(f"{failed} failed")
+    if blocked:
+        bad.append(f"{blocked} blocked")
+    suffix = f"({', '.join(bad)})" if bad else ""
     if alive:
-        return "running"
+        return "running" + suffix
     if phase == "done":
-        return f"done⚠{len(warnings)}" if warnings else "done"
-    return "stopped"
+        base = f"done⚠{len(warnings)}" if warnings else "done"
+        return base + suffix
+    return "stopped" + suffix
 
 
 def _disp_width(ch: str) -> int:
@@ -221,7 +262,7 @@ def _draw_list(stdscr, board, roles, sel, orch_dir, alive) -> None:
         0,
         f" phase:{phase}  cost:${cost:.4f}{' est.' if board.get('cost_estimated') else ''}  "
         f"tokens:{board.get('total_tokens', 0):,}  units:{done}/{len(units)}  "
-        f"동시실행:{run_n}  [{_state_label(alive, phase, board.get('warnings') or [])}]",
+        f"동시실행:{run_n}  [{_state_label(alive, phase, board.get('warnings') or [], units)}]",
         curses.A_BOLD,
     )
     _safe_add(stdscr, 2, 1, f"📁 {orch_dir.parent}", curses.A_DIM)
@@ -298,13 +339,21 @@ def _draw_backends(stdscr) -> None:
     h, _w = stdscr.getmaxyx()
     _safe_add(stdscr, 0, 0, " BACKEND AVAILABILITY ", curses.A_REVERSE | curses.A_BOLD)
     row = 2
-    for s in backend_status():
+    statuses = backend_status()
+    last_row = h - 2  # 마지막 줄(h-1)은 footer 용으로 예약
+    overflow = False
+    for s in statuses:
+        if row >= last_row:  # 화면 높이를 넘기면 조용히 사라지지 않게 힌트 표시 (#133)
+            overflow = True
+            break
         ok = s["ok"]
         icon = "✅" if ok else "❌"
         info = BACKEND_INFO.get(s["name"], "")
         attr = 0 if ok else curses.A_DIM
         _safe_add(stdscr, row, 1, f"{icon} {s['name']:<14}{info:<40}{s['reason']}", attr)
         row += 1
+    if overflow:
+        _safe_add(stdscr, last_row, 1, "… (터미널을 키우세요 / resize terminal)", curses.A_DIM)
     _safe_add(stdscr, h - 1, 0, " b/Esc: back   q: quit ", curses.A_REVERSE)
 
 
@@ -377,6 +426,18 @@ def run_tui(project_dir: Path, interval: float = 1.0) -> None:
                 _draw_backends(stdscr)
             elif mode == "artifacts":
                 scroll = _draw_artifacts(stdscr, board, orch, scroll)
+            elif board.get("_corrupt"):  # 손상 board.json 을 빈 보드로 숨기지 않고 표시 (#70)
+                _safe_add(stdscr, 0, 0, " MULTI-AGENT MONITOR ", curses.A_REVERSE | curses.A_BOLD)
+                _safe_add(
+                    stdscr,
+                    2,
+                    1,
+                    f"⚠ board.json 손상 — 읽을 수 없습니다: {orch / 'board.json'}",
+                    curses.A_BOLD,
+                )
+                _safe_add(
+                    stdscr, 3, 1, "run 상태가 깨졌습니다. 파일 확인.  c: 백엔드 체크   q: 종료"
+                )
             elif not board:
                 _safe_add(stdscr, 0, 0, " MULTI-AGENT MONITOR ", curses.A_REVERSE)
                 _safe_add(stdscr, 2, 1, f"run 대기 중… {orch / 'board.json'} 가 아직 없습니다.")
@@ -462,6 +523,9 @@ def main(argv=None) -> int:
     orch = a.project_dir.resolve() / ".orchestrator"
     if a.once:
         board = _read_board(orch)
+        if board.get("_corrupt"):  # 손상을 빈 보드로 숨기지 않고 명확히 보고 (#70)
+            print(f"(board.json corrupt at {orch / 'board.json'})")
+            return 1
         if not board:
             print(f"(no run state at {orch / 'board.json'})")
             return 1

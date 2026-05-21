@@ -87,6 +87,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument("--port", type=int, default=8765, help="--web 포트 (기본 8765)")
     p.add_argument("--host", default="127.0.0.1", help="--web 바인드 호스트")
+    p.add_argument(
+        "--base-dir", type=Path, help="--web 실행 결과 베이스 디렉터리 (기본 ~/agent-runs)"
+    )
     return p.parse_args(argv)
 
 
@@ -120,12 +123,22 @@ def build_config(a: argparse.Namespace) -> RunConfig:
         if role not in ROLES:
             raise SystemExit(f"알 수 없는 역할: {role} (가능: {', '.join(ROLES)})")
         role_priority[role] = _parse_backend_list(backends)
-    if a.cross_check and not a.mock and len(backend_priority) < 2:
-        print(
-            "⚠️  --cross-check 는 백엔드가 2개 이상이어야 동작합니다 "
-            "(--backends 로 2종 이상 지정). 지금은 교차 배치가 적용되지 않습니다.",
-            file=sys.stderr,
-        )
+    if a.cross_check and not a.mock:
+        # 교차검증 풀 = --backends + 역할핀(role_priority) 값 (RunConfig._cross_pool 동일 규칙).
+        # 풀의 distinct 백엔드가 2종 미만일 때만 경고한다(역할핀으로 2종이 되면 교차가 성립).
+        base_pool = backend_priority if backend_priority else [resolve(a.backend)]
+        pool = list(base_pool)
+        for picks in role_priority.values():
+            for p in picks:
+                if p not in pool:
+                    pool.append(p)
+        if len(set(pool)) < 2:
+            print(
+                "⚠️  --cross-check 는 백엔드가 2개 이상이어야 동작합니다 "
+                "(--backends 또는 --role-backend 로 2종 이상 지정). "
+                "지금은 교차 배치가 적용되지 않습니다.",
+                file=sys.stderr,
+            )
     return RunConfig(
         spec_path=a.spec.resolve(),
         project_dir=a.project_dir.resolve(),
@@ -173,7 +186,8 @@ def main(argv=None) -> int:
     if a.web:
         from .webui import serve
 
-        serve(a.port, a.project_dir, a.host)
+        # --web 은 --base-dir(우선) 또는 --project-dir 를 결과 베이스로 사용
+        serve(a.port, a.base_dir or a.project_dir, a.host)
         return 0
     if a.watch:
         if not a.project_dir:
@@ -190,7 +204,11 @@ def main(argv=None) -> int:
     cfg = build_config(a)
     snap = asyncio.run(Scheduler(cfg).run())
     _print_summary(snap, cfg)
-    # 실패/blocked unit 또는 경고가 있으면 비정상 종료 코드 → CI/자동화가 실패를 인지
+    # 비정상 종료 코드(1) 조건 = report.md 의 result != ok 와 일치:
+    #   - failed/blocked unit 이 하나라도 있거나
+    #   - 경고가 하나라도 있으면 (설계 실패·max-units 미처리·CI/docs 실패·비종료 정리 등)
+    # → 비종료(in_progress/testing/dev_done) 와 max-units 로 designed 로 남은 미처리 unit 도
+    #   스케줄러가 각각 failed 전이 또는 경고로 표면화하므로 자동화가 '미완 성공'을 못 만든다.
     units = snap.get("units", [])
     failed = [u for u in units if u.get("status") in ("failed", "blocked")]
     if failed or snap.get("warnings"):

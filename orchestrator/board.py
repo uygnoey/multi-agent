@@ -7,12 +7,80 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+import math
+import re
 import time
 from pathlib import Path
 from typing import Any
 
 from .config import normalize_role
+
+_UNSAFE_ID = re.compile(r"[^A-Za-z0-9_-]+")
+
+# 로그/디렉티브 본문 최대 길이: LLM 폭주 출력이 파일을 무한히 키우는 것을 방지.
+_MAX_BODY_CHARS = 20000
+
+
+def _truncate_body(text: str) -> str:
+    """본문을 _MAX_BODY_CHARS 로 잘라 '…(truncated)' 마커를 붙임 (runaway 파일 증가 방지)."""
+    s = str(text)
+    if len(s) <= _MAX_BODY_CHARS:
+        return s
+    return s[:_MAX_BODY_CHARS] + "\n…(truncated)"
+
+
+def _coerce_finite_float(raw) -> float:
+    """비-숫자/NaN/Inf 는 0.0 으로 변환 (잘못된 비용 메타데이터 방어)."""
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return val if math.isfinite(val) else 0.0
+
+
+def _coerce_int(raw) -> int:
+    """비-정수 입력은 0 으로 변환 (잘못된 토큰 메타데이터 방어)."""
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _safe_artifact(raw) -> str | None:
+    """아티팩트 경로 경량 검증: str 만 허용, strip 후 절대경로/'..' 포함 시 drop.
+
+    이 경로들은 타깃 프로젝트 기준 상대경로다. 비-str/빈값/안전하지 않은 값은 None.
+    """
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    # 절대경로(POSIX '/' 또는 Windows 드라이브/역슬래시) 차단
+    if s.startswith("/") or s.startswith("\\"):
+        return None
+    if len(s) >= 2 and s[1] == ":":  # 예: C:\... 형태의 드라이브 절대경로
+        return None
+    # 경로 traversal('..') 토큰 차단
+    parts = re.split(r"[\\/]+", s)
+    if ".." in parts:
+        return None
+    return s
+
+
+def _safe_unit_id(raw) -> str:
+    """unit id 를 경로/파일명/식별자에 안전한 문자만 남겨 정규화.
+
+    '/', '..', 공백, 특수문자를 '-' 로 치환 → result 파일/마이그레이션/생성코드에서 traversal 차단.
+    안전화 후 빈 문자열이면 "" (호출부에서 skip).
+    """
+    if raw in (None, ""):
+        return ""
+    s = _UNSAFE_ID.sub("-", str(raw).strip()).strip("-")
+    return s
+
 
 # unit 상태 머신
 TODO = "todo"
@@ -89,8 +157,8 @@ class Board:
         async with self._lock:
             existing = {u["id"] for u in self._data["units"]}
             for u in units:
-                raw_id = u.get("id")  # 숫자 ID 도 문자열로 통일
-                uid = str(raw_id).strip() if raw_id not in (None, "") else ""
+                # 숫자 ID 문자열화 + 경로/식별자 안전 문자만 (traversal·특수문자 차단)
+                uid = _safe_unit_id(u.get("id"))
                 if not uid or uid in existing:
                     continue
                 existing.add(uid)
@@ -125,32 +193,57 @@ class Board:
         await self.log_event("scheduler", f"WARNING: {msg}")
 
     async def set_status(self, unit_id: str, status: str, note: str | None = None) -> None:
+        matched = False
         async with self._lock:
             for u in self._data["units"]:
                 if u["id"] == unit_id:
                     u["status"] = status
                     if note:
                         u["notes"].append(note)
+                    matched = True
             self._flush()
-        await self.log_event(unit_id, f"status={status}" + (f" :: {note}" if note else ""))
+        if matched:
+            # 실제로 unit 이 갱신된 경우에만 상태 전이를 기록 (거짓 성공 방지)
+            await self.log_event(unit_id, f"status={status}" + (f" :: {note}" if note else ""))
+        else:
+            # 매칭되는 unit 이 없으면 거짓 성공 대신 명확한 'unknown unit' 기록 (raise 하지 않음)
+            await self.log_event(unit_id, f"WARNING: unknown unit, status={status} not applied")
 
     async def add_artifacts(self, unit_id: str, artifacts: list[str]) -> None:
         if not artifacts:
             return
+        # 아티팩트 경량 검증: str 만, strip, 절대경로/'..' 등 안전하지 않은 값 drop
+        clean = [s for s in (_safe_artifact(a) for a in artifacts) if s]
+        if not clean:
+            return
+        matched = False
         async with self._lock:
             for u in self._data["units"]:
                 if u["id"] == unit_id:
-                    for a in artifacts:
+                    matched = True
+                    for a in clean:
                         if a not in u["artifacts"]:
                             u["artifacts"].append(a)
             self._flush()
+        if not matched:
+            # 알 수 없는 unit id → 아티팩트가 조용히 사라지지 않도록 경고 기록
+            await self.log_event(
+                unit_id, f"WARNING: unknown unit, {len(clean)} artifact(s) dropped"
+            )
 
     async def set_test_status(self, unit_id: str, test_status: str) -> None:
+        matched = False
         async with self._lock:
             for u in self._data["units"]:
                 if u["id"] == unit_id:
                     u["test_status"] = test_status
+                    matched = True
             self._flush()
+        if not matched:
+            # 알 수 없는 unit id → 테스트 결과가 조용히 유실되지 않도록 경고 기록
+            await self.log_event(
+                unit_id, f"WARNING: unknown unit, test_status={test_status} dropped"
+            )
 
     async def set_phase(self, phase: str) -> None:
         async with self._lock:
@@ -161,18 +254,27 @@ class Board:
         """특정 unit 에 속하지 않는 설계/공통 산출물 (architect docs, cicd 등)."""
         if not artifacts:
             return
+        # 아티팩트 경량 검증: str 만, strip, 절대경로/'..' 등 안전하지 않은 값 drop
+        clean = [s for s in (_safe_artifact(a) for a in artifacts) if s]
+        if not clean:
+            return
         async with self._lock:
             g = self._data.setdefault("artifacts", [])
-            for a in artifacts:
+            for a in clean:
                 if a not in g:
                     g.append(a)
             self._flush()
 
     async def add_cost(self, amount: float) -> None:
+        # NaN/Inf 같은 비정상 float 는 JSON 에 NaN/Infinity 로 새지 않도록 무시 (0 처리)
+        try:
+            val = float(amount)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(val):
+            return
         async with self._lock:
-            self._data["total_cost_usd"] = round(
-                self._data.get("total_cost_usd", 0.0) + float(amount), 6
-            )
+            self._data["total_cost_usd"] = round(self._data.get("total_cost_usd", 0.0) + val, 6)
             self._flush()
 
     # ---- per-agent live state (for the monitor TUI) ----
@@ -217,13 +319,19 @@ class Board:
             if model is not None:
                 a["model"] = model
             if cost_add:
-                a["cost_usd"] = round(a["cost_usd"] + float(cost_add), 6)
+                # 잘못된 비용 메타데이터(비-숫자/NaN/Inf)가 업데이트를 깨지 않도록 방어
+                add = _coerce_finite_float(cost_add)
+                if add:
+                    a["cost_usd"] = round(a["cost_usd"] + add, 6)
             if cost_est:
                 a["cost_est"] = True
                 self._data["cost_estimated"] = True
             if tokens_add:
-                a["tokens"] = a.get("tokens", 0) + int(tokens_add)
-                self._data["total_tokens"] = self._data.get("total_tokens", 0) + int(tokens_add)
+                # 잘못된 토큰 메타데이터(비-정수 등)는 무시하고 업데이트 진행
+                add_t = _coerce_int(tokens_add)
+                if add_t:
+                    a["tokens"] = a.get("tokens", 0) + add_t
+                    self._data["total_tokens"] = self._data.get("total_tokens", 0) + add_t
             if message is not None:
                 a["last_message"] = message[:500]
             if call:
@@ -233,23 +341,31 @@ class Board:
         if activity:
             self._append_agent_log(role, activity)
 
+    def _log_path(self, role: str) -> Path:
+        """role 을 안전한 파일명으로 정규화해 agents_dir 밖으로 쓰지 못하게 차단(traversal 방지)."""
+        safe = _safe_unit_id(role) or "_unknown"
+        return self.agents_dir / f"{safe}.log"
+
     def _append_agent_log(self, role: str, text: str) -> None:
         self.agents_dir.mkdir(parents=True, exist_ok=True)
-        with (self.agents_dir / f"{role}.log").open("a", encoding="utf-8") as f:
+        with self._log_path(role).open("a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%H:%M:%S')} {text}\n")
 
     def write_agent_block(self, role: str, title: str, body: str) -> None:
         """프롬프트/결과 같은 상세 블록을 per-agent 로그에 기록 (실시간 상세 로그용)."""
         self.agents_dir.mkdir(parents=True, exist_ok=True)
         bar = "─" * 56
-        with (self.agents_dir / f"{role}.log").open("a", encoding="utf-8") as f:
+        # 단일 프롬프트/결과가 로그를 폭증시키지 않도록 본문 크기 제한
+        body = _truncate_body(body)
+        with self._log_path(role).open("a", encoding="utf-8") as f:
             f.write(f"\n{bar}\n{time.strftime('%H:%M:%S')} {title}\n{bar}\n{body}\n")
 
     def agents(self) -> dict:
         return json.loads(json.dumps(self._data.get("agents", {})))
 
     def agent_log_tail(self, role: str, n: int = 200) -> str:
-        p = self.agents_dir / f"{role}.log"
+        # 쓰기 경로와 동일하게 안전화된 파일명을 사용해 일관되게 읽기
+        p = self._log_path(role)
         if not p.exists():
             return ""
         return "\n".join(p.read_text(encoding="utf-8").splitlines()[-n:])
@@ -263,6 +379,9 @@ class Board:
         warnings = d.get("warnings") or []
         if failed:
             result = f"❌ failed ({len(failed)} unit)"
+        elif not units:
+            # unit 이 하나도 없는 보드는 'ok' 로 보이면 안 됨 (작업 없음/상태 유실 가능)
+            result = "⚠ no units"
         elif warnings:
             result = "⚠ done with warnings"
         else:
@@ -318,8 +437,10 @@ class Board:
             out = []
             for u in units:
                 if u.get("artifacts"):
-                    out.append(f"### {u['id']} — {u.get('title', '')}")
-                    out += [f"- {a}" for a in u["artifacts"]]
+                    # id/title 이스케이프: LLM 제공 값이 마크다운 구조를 깨지 못하게
+                    out.append(f"### {_md_cell(u['id'])} — {_md_cell(u.get('title', ''))}")
+                    # 아티팩트도 최소한 개행을 중화해 문서 주입 방지
+                    out += [f"- {_md_cell(a)}" for a in u["artifacts"]]
                     out.append("")
             return out
 
@@ -367,7 +488,9 @@ class Board:
 
     # ---- reads (best-effort snapshots) ----
     def units(self) -> list[dict]:
-        return [dict(u) for u in self._data.get("units", [])]
+        # 중첩 리스트(artifacts/deps/roles/notes)까지 깊은 복사해 호출부가 보드 상태를
+        # lock 밖에서 변형하지 못하게 함 (얕은 dict 복사는 내부 list 를 공유했었음)
+        return [copy.deepcopy(u) for u in self._data.get("units", [])]
 
     def snapshot(self) -> dict:
         return json.loads(json.dumps(self._data, ensure_ascii=False))
@@ -385,7 +508,8 @@ class Board:
         return "\n".join(self.events_path.read_text(encoding="utf-8").splitlines()[-n:])
 
     async def append_directive(self, who: str, text: str) -> None:
-        block = f"\n### {time.strftime('%H:%M:%S')} — {who}\n{text}\n"
+        # 대량/이상 LLM 출력이 directives.md 를 무한히 키우지 않도록 본문 크기 제한
+        block = f"\n### {time.strftime('%H:%M:%S')} — {who}\n{_truncate_body(text)}\n"
         async with self._lock:
             with self.directives_path.open("a", encoding="utf-8") as f:
                 f.write(block)

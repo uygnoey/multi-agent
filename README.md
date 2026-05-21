@@ -69,6 +69,13 @@ pip install -e ".[openai]"       # + OpenAI Agents SDK 백엔드
 pip install -e ".[all]"          # 둘 다
 ```
 
+> **소스 설치(`pip install -e .`) 권장.** 런타임은 저장소 루트의 `.claude/agents/*.md` 와
+> `templates/*` 를 그대로 읽으므로, 일반 wheel 설치로는 이 파일들이 누락될 수 있다(#18). 소스 체크아웃에서
+> editable 설치하거나 Docker 이미지(두 디렉터리를 COPY)를 사용한다.
+> **OpenAI 백엔드 주의(#51):** `openai-agents` extra(`[openai]`/`[all]`)가 설치되어야 OpenAI Agents
+> 백엔드가 동작한다. 이 패키지는 환경에 따라 설치가 실패할 수 있으니, `--check` 로 실제 가용성을 확인할 것.
+> mock 및 CLI 백엔드(claude-cli/codex)는 이 extra 없이도 동작한다.
+
 CLI 백엔드는 별도 설치/로그인 필요:
 - `claude-cli`: `npm i -g @anthropic-ai/claude-code` 후 로그인(구독) 또는 `ANTHROPIC_API_KEY`
 - `codex`:      `npm i -g @openai/codex` 후 `codex login`(ChatGPT 구독) 또는 `CODEX_API_KEY`
@@ -93,6 +100,10 @@ python -m orchestrator --spec examples/specs/sample-spec.md --project-dir /tmp/d
     --role-backend backend-developer=openai-agents
 ```
 
+> ⚠️ 위 데모의 `--max-units 2` 는 아키텍트가 만든 unit 중 앞 2개만 빌드한다. 상한을 넘은 나머지
+> unit 은 `designed` 상태로 **빌드되지 않은 채 남으며**, 이는 보드 `warnings`/`events.log` 에 경고로
+> 기록된다(조용한 부분 성공 아님). 전체를 빌드하려면 `--max-units` 를 빼거나 unit 수 이상으로 키운다.
+
 ## 주요 옵션
 
 | 옵션 | 설명 |
@@ -115,7 +126,8 @@ python -m orchestrator --spec examples/specs/sample-spec.md --project-dir /tmp/d
 | `--poll-interval SEC` | PM/PL 감독 주기 (기본 20초) |
 | `--check` | 백엔드 가용성만 진단 후 종료 |
 | `--watch` | 실행 대신 `--project-dir` 진행을 실시간 모니터 TUI 로 본다 |
-| `--web [--port N]` | 웹 UI 서버 실행 (브라우저에서 기획서 업로드·실행·모니터링) |
+| `--web [--port N] [--host H]` | 웹 UI 서버 실행 (브라우저에서 기획서 업로드·실행·모니터링) |
+| `--base-dir PATH` | `--web` 실행 결과 베이스 디렉터리 (기본 `~/agent-runs`). run 들은 `<base-dir>/<run-id>/` 에 생성 |
 
 ## 실시간 모니터 (TUI)
 
@@ -146,6 +158,8 @@ python -m orchestrator --watch --project-dir /tmp/demo-web
 
 ```bash
 python -m orchestrator --web --port 8765          # 또는: web-team-web --port 8765
+# 결과 베이스 디렉터리 지정도 가능 (기본 ~/agent-runs)
+python -m orchestrator --web --port 8765 --base-dir ~/agent-runs
 # 브라우저에서 http://localhost:8765 접속
 ```
 
@@ -203,6 +217,10 @@ docker run --rm -p 8765:8765 -v "$PWD/runs:/data/runs" web-team
 프로덕션 주의:
 - **실 백엔드**(claude-cli/codex/openai-agents/claude-sdk)는 각 CLI 설치·로그인 또는 API 키가 필요하다.
   컨테이너에 키를 `-e OPENAI_API_KEY=… -e ANTHROPIC_API_KEY=…` 로 주입하거나, CLI 인증 디렉터리를 마운트한다.
-- 웹 UI는 인증이 없다 — 신뢰된 네트워크에서만 노출하거나 리버스 프록시 뒤에 인증을 두고, `--host` 바인딩을 제한한다.
+- ⚠️ **인증 없음 / 0.0.0.0 노출 주의(#106):** 위 문서화된 컨테이너 실행(`--host 0.0.0.0`)은 **인증 없는**
+  웹 UI(= run 제어/모니터링)를 게시된 포트로 접근 가능한 **모든 네트워크 인터페이스**에 노출한다. 컨테이너 특성상
+  0.0.0.0 바인딩 자체는 필요하지만, 운영자는 반드시 외부 보호를 추가해야 한다 — 인증을 둔 리버스 프록시,
+  방화벽, 또는 루프백 한정 publish(`-p 127.0.0.1:8765:8765`). 신뢰되지 않은 네트워크에 그대로 노출하지 말 것.
 - 산출물·런 상태는 `/data/runs`(볼륨)에 생성된다.
-- CI: `.github/workflows/ci.yml` 가 lint(ruff)+test(pytest, 3.10–3.12)를 실행한다.
+- CI: `.github/workflows/ci.yml` 가 lint(`ruff check`)+포맷 검사(`ruff format --check`)+test(`pytest`,
+  Python 3.10–3.12 매트릭스)를 실행한다. (포맷 검사 포함 — 현재 트리는 통과 상태.)

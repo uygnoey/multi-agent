@@ -50,9 +50,11 @@ class Scheduler:
         except Exception:
             pass
         # 재실행(rerun)용 커맨드 저장 (웹/CLI/TUI 어디서 띄웠든 동일하게 재실행 가능)
+        # --spec/--project-dir 의 상대경로 인자는 cfg 의 절대경로로 치환한다. 그래야 다른 cwd 에서
+        # rerun 해도 같은 spec/타깃을 가리키며(#40), 상대경로가 raw 로 새지 않는다(#39).
         try:
             (self.board.orch_dir / "rerun.json").write_text(
-                json.dumps({"argv": sys.argv[1:]}), encoding="utf-8"
+                json.dumps({"argv": self._rerun_argv()}), encoding="utf-8"
             )
         except Exception:
             pass
@@ -86,6 +88,13 @@ class Scheduler:
             units = arch_outcome.get("units") or []
             if units:
                 await self.board.add_units(units)
+            if not units and arch_outcome.get("_ok", True):
+                # 설계 계약 위반: architect 가 '성공'했는데 units 가 비었음 → 경고로 표면화.
+                # (성공으로 오해되면 안 됨. 폴백은 유지하되 result != ok 가 되도록 기록.)
+                await self.board.add_warning(
+                    "architecture-engineer succeeded but produced no units (design contract: "
+                    "must decompose spec into units)"
+                )
             if not self.board.units():
                 # 아키텍트가 units 를 못 만든 경우 — 명시적으로 기록 후 폴백
                 await self.board.log_event(
@@ -96,7 +105,16 @@ class Scheduler:
             # Phase B/C — unit별 동시 개발 + 완료 시 테스트 트리거
             unit_list = self.board.units()
             if self.cfg.max_units and self.cfg.max_units > 0:  # 음수면 슬라이싱 오작동 → 무시
+                skipped_units = unit_list[self.cfg.max_units :]
                 unit_list = unit_list[: self.cfg.max_units]
+                if skipped_units:
+                    # --max-units 로 잘린 unit 들은 designed 로 남는다. 조용히 'ok' 로 끝나지
+                    # 않도록 경고로 표면화 (의도적 스킵이므로 failed 로 만들지는 않는다).
+                    skipped_ids = [u["id"] for u in skipped_units]
+                    await self.board.add_warning(
+                        f"--max-units={self.cfg.max_units} 로 {len(skipped_ids)}개 unit 미처리"
+                        f"(designed 유지): {skipped_ids}"
+                    )
             await self.board.set_phase("build")
             await self.board.log_event(
                 "scheduler",
@@ -107,6 +125,9 @@ class Scheduler:
 
             async def pipeline(unit: dict) -> None:
                 uid = unit["id"]
+                if self._stop.is_set():  # graceful shutdown: 새 unit 작업을 시작하지 않음
+                    await self.board.log_event(uid, "stop requested → skip (designed 유지)")
+                    return
                 if not await self._wait_for_deps(unit):
                     await self.board.set_status(uid, BLOCKED, "deps unmet or failed")
                     return
@@ -115,7 +136,15 @@ class Scheduler:
                 if await self._develop_unit(unit, sem, 1):
                     test_tasks.append(asyncio.create_task(self._test_unit_safe(unit, sem)))
 
-            await asyncio.gather(*[pipeline(u) for u in unit_list])
+            # pipeline 이 예기치 못한 예외를 던져도 아래 정리/리포트 블록이 항상 돌도록
+            # return_exceptions=True (한 unit 의 내부 오류가 전체 cleanup 을 스킵시키지 않게).
+            pipe_results = await asyncio.gather(
+                *[pipeline(u) for u in unit_list], return_exceptions=True
+            )
+            for u, r in zip(unit_list, pipe_results, strict=False):
+                if isinstance(r, Exception):
+                    await self.board.set_status(u["id"], FAILED, f"pipeline error: {r}")
+                    await self.board.add_warning(f"{u['id']}: 파이프라인 예외: {r}")
             if test_tasks:  # 마지막 unit 들의 test/qa 완료 대기
                 await asyncio.gather(*test_tasks, return_exceptions=True)
 
@@ -125,6 +154,15 @@ class Scheduler:
                 if u["status"] in (IN_PROGRESS, DEV_DONE, TESTING):
                     await self.board.set_status(u["id"], FAILED, "left non-terminal")
                     await self.board.add_warning(f"{u['id']}: '{u['status']}' 상태로 비정상 종료")
+
+            # CI/CD·docs 는 이후에도 돌지만(부분 산출물 생성 허용) 최종 result/phase 가 실패를
+            # 반영하도록, failed/blocked unit 을 경고로 표면화한다. (QA 재시도 실패·deps blocked
+            # 등 개별 경고가 없던 경로도 result != ok 가 되도록 요약 경고 기록.)
+            broken = [u["id"] for u in self.board.units() if u["status"] in (FAILED, BLOCKED)]
+            if broken:
+                await self.board.add_warning(
+                    f"빌드 미완료: {len(broken)}개 unit failed/blocked: {broken}"
+                )
 
             # Phase D — CI/CD
             await self.board.set_phase("cicd")
@@ -150,7 +188,10 @@ class Scheduler:
             self._stop.set()
             await asyncio.gather(*sup_tasks, return_exceptions=True)
             sup_tasks = []
-            await self.board.set_phase("done")
+            # phase 만 보는 소비자가 실패 런을 'done' 으로 오해하지 않도록, failed/blocked unit 이
+            # 하나라도 있으면 최종 phase 를 'failed' 로 둔다. (성공 런은 그대로 'done')
+            still_broken = any(u["status"] in (FAILED, BLOCKED) for u in self.board.units())
+            await self.board.set_phase("failed" if still_broken else "done")
         finally:
             self._stop.set()
             for t in sup_tasks:
@@ -169,6 +210,37 @@ class Scheduler:
 
         return self.board.snapshot()
 
+    def _rerun_argv(self) -> list[str]:
+        """rerun.json 에 저장할 argv 를 만든다 (--spec/--project-dir 는 절대경로로 정규화).
+
+        다른 cwd 에서 rerun 해도 동일 spec/타깃을 가리키도록(#40), 상대경로 인자를
+        cfg 의 resolve 된 절대경로로 치환한다.
+        """
+        argv = list(sys.argv[1:])
+        replace = {
+            "--spec": str(self.cfg.spec_path),
+            "--project-dir": str(self.cfg.project_dir),
+        }
+        out: list[str] = []
+        i = 0
+        while i < len(argv):
+            tok = argv[i]
+            # "--spec=PATH" 형태
+            if "=" in tok and tok.split("=", 1)[0] in replace:
+                key = tok.split("=", 1)[0]
+                out.append(f"{key}={replace[key]}")
+                i += 1
+                continue
+            # "--spec PATH" 형태
+            if tok in replace and i + 1 < len(argv):
+                out.append(tok)
+                out.append(replace[tok])
+                i += 2
+                continue
+            out.append(tok)
+            i += 1
+        return out
+
     async def _develop_unit(self, unit: dict, sem: asyncio.Semaphore, attempt: int) -> bool:
         """개발 3인(FE/BE/DBA) 동시 실행. 개발 동시성 슬롯(sem)은 이 동안만 점유.
 
@@ -177,13 +249,22 @@ class Scheduler:
         uid = unit["id"]
         dev_roles = [r for r in unit.get("roles", DEV_ROLES) if r in DEV_ROLES] or DEV_ROLES
         async with sem:
+            if self._stop.is_set():  # graceful shutdown: 새 개발 시도를 시작하지 않음
+                await self.board.log_event(uid, "stop requested → skip dev attempt")
+                return False
             await self.board.set_status(
                 uid, IN_PROGRESS, f"dev attempt {attempt}/{self.cfg.max_attempts}"
             )
-            dev_outcomes = await asyncio.gather(*[self.runner.run_role(r, unit) for r in dev_roles])
+            # dev role 호출이 예외를 던져도 unit 을 blocked 로 내리고 파이프라인을 죽이지 않는다.
+            dev_outcomes = await asyncio.gather(
+                *[self.runner.run_role(r, unit) for r in dev_roles], return_exceptions=True
+            )
             for o in dev_outcomes:
+                if isinstance(o, Exception):
+                    continue
                 await self.board.add_artifacts(uid, o.get("artifacts", []))
-            if any(not o.get("_ok", True) for o in dev_outcomes):
+            failed = any(isinstance(o, Exception) or not o.get("_ok", True) for o in dev_outcomes)
+            if failed:
                 await self.board.set_status(uid, BLOCKED, "dev failed")
                 await self.board.add_warning(f"{uid}: 개발(dev) 실패 → blocked")
                 return False
@@ -231,21 +312,22 @@ class Scheduler:
     async def _wait_for_deps(self, unit: dict, timeout: float | None = None) -> bool:
         """deps 가 모두 완료되면 True. 실패/blocked dep 이 있으면 즉시 False(패스트페일).
 
-        존재하지 않는 dep id 는 무시한다. 타임아웃은 의존 unit 의 재작업(max_attempts)까지
-        고려해 넉넉히 잡는다(빠른 실패는 FAILED/BLOCKED 로만, 오래 걸린다고 막지 않음).
+        존재하지 않는 dep id 는 BLOCKED 로 처리한다(False). 타임아웃은 의존 unit 의
+        재작업(max_attempts)까지 고려해 넉넉히 잡는다(빠른 실패는 FAILED/BLOCKED 로만,
+        오래 걸린다고 막지 않음).
         """
         deps = unit.get("deps", [])
         if not deps:
             return True
         uid = unit["id"]
-        # 보드에 없는 dep 은 조용히 넘기지 않고 경고로 표면화 (architect 누락/오타 대비)
+        # 보드에 없는 dep id 는 무시하지 않고 BLOCKED 로 처리한다(architect 누락/오타 안전장치).
+        # 존재하지 않는 의존성을 만족했다고 보고 먼저 실행하면 필요한 선행 작업 없이 진행될 위험.
         known_ids = {u["id"] for u in self.board.units()}
         unknown = [d for d in deps if d not in known_ids]
         if unknown:
-            await self.board.add_warning(f"{uid}: 존재하지 않는 의존성 무시됨: {unknown}")
-            deps = [d for d in deps if d in known_ids]
-            if not deps:
-                return True
+            await self.board.add_warning(f"{uid}: 존재하지 않는 의존성 → blocked: {unknown}")
+            await self.board.log_event(uid, f"unknown deps → blocked: {unknown}")
+            return False
         # 단순 시간초과가 아니라 '진행이 멈췄을 때'만 포기한다(stall). dep 가 아직 작업 중이면
         # (상태가 바뀌거나 에이전트가 활동 중이면) 계속 기다린다 — 한 role 호출이 상태를 붙잡는
         # 최대 시간(session_timeout)보다 넉넉한 윈도. timeout 인자를 주면 그 값을 stall 로 쓴다.
@@ -262,10 +344,16 @@ class Scheduler:
             if all(units.get(d, {}).get("status") in TERMINAL_OK for d in pending):
                 return True
             # 진행 신호: dep 상태 + 에이전트 활동(updated_at). 변하면 작업이 살아있다는 뜻.
+            # updated_at 은 '의존 unit 을 작업 중인' 에이전트로 한정한다(관련 없는 PM/PL·다른
+            # unit 활동이 idle 타이머를 리셋해 stall 실패를 지연/방해하지 않도록). 관련 에이전트가
+            # 없으면(아직 시작 전 등) 전체로 폴백해 견고성을 유지한다.
             agents = self.board.agents()
+            pending_set = set(pending)
+            scoped = [a for a in agents.values() if a.get("current_unit") in pending_set]
+            relevant = scoped if scoped else list(agents.values())
             sig = (
                 tuple(units.get(d, {}).get("status") for d in pending),
-                round(max((a.get("updated_at", 0.0) for a in agents.values()), default=0.0), 1),
+                round(max((a.get("updated_at", 0.0) for a in relevant), default=0.0), 1),
             )
             if sig != prev_sig:
                 prev_sig, idle = sig, 0.0  # 진행 있음 → 리셋 (살아있으면 막지 않음)

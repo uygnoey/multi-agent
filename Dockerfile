@@ -9,17 +9,27 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # 프레임워크 구성요소 (config.FRAMEWORK_ROOT = /app)
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md README.en.md ./
 COPY orchestrator ./orchestrator
 COPY .claude ./.claude
 COPY templates ./templates
 COPY examples ./examples
+# docs/ is intentionally not copied (excluded by .dockerignore); the runtime does not need it.
 
-RUN pip install -e ".[all]" || pip install -e .
+# 코어를 먼저 설치(반드시 성공) → 선택 백엔드 SDK([all])는 비치명적으로 시도한다.
+# [all] 설치가 실패해도 빌드는 계속되지만(이미지에 mock/CLI 백엔드는 항상 동작),
+# 빌드 로그에 명확한 경고를 남겨 "실 SDK 백엔드 누락"을 가린 채 성공하지 않게 한다(#52).
+RUN pip install -e . \
+    && (pip install -e ".[all]" \
+        || echo "WARNING: optional backend SDKs ([all]: claude-agent-sdk/openai-agents) failed to install. Image has mock + CLI backends only; claude-sdk/openai-agents backends will be unavailable.")
 
 EXPOSE 8765
 VOLUME ["/data"]
 
-# 산출물은 /data/runs 에 생성. 컨테이너 안이라 0.0.0.0 바인딩.
+# 산출물은 /data/runs 에 생성. 컨테이너 안이라 0.0.0.0 바인딩(컨테이너는 외부에서 접근하려면 필요).
+# ⚠️ 보안 경고(#106): 이 웹 UI 에는 인증이 없다. 0.0.0.0 바인딩은 published port 로 노출되면
+#   접근 가능한 모든 네트워크 인터페이스에서 run 제어/모니터링이 가능해진다. 운영 시에는
+#   반드시 외부 보호(리버스 프록시 인증 / 방화벽 / -p 127.0.0.1:8765:8765 처럼 루프백 한정 publish)를
+#   추가하라. 신뢰되지 않은 네트워크에 그대로 노출하지 말 것. (README 배포 섹션 참고)
 CMD ["python", "-m", "orchestrator", "--web", "--host", "0.0.0.0", "--port", "8765", \
      "--base-dir", "/data/runs"]
