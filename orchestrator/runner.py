@@ -143,6 +143,8 @@ class Runner:
                     role_cost += res.cost_usd
                     await self.board.add_cost(res.cost_usd)
                     await self.board.agent_update(role, cost_add=res.cost_usd)
+                if res.tokens:
+                    await self.board.agent_update(role, tokens_add=res.tokens)
                 if res.ok:
                     break
                 if i < len(candidates) - 1:

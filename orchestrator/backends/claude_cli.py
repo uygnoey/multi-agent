@@ -40,8 +40,8 @@ def claude_stream_line(line_bytes: bytes) -> str | None:
 
 
 def parse_stream_result(out_bytes: bytes):
-    """stream-json 전체에서 (final_text, cost, model) 추출."""
-    final, cost, model = "", None, None
+    """stream-json 전체에서 (final_text, cost, model, tokens) 추출."""
+    final, cost, model, tokens = "", None, None, None
     for line in out_bytes.splitlines():
         try:
             o = json.loads(line)
@@ -52,7 +52,10 @@ def parse_stream_result(out_bytes: bytes):
         if o.get("type") == "result":
             final = o.get("result", final)
             cost = o.get("total_cost_usd", cost)
-    return final, cost, model
+            u = o.get("usage") or {}
+            if u:
+                tokens = (u.get("input_tokens") or 0) + (u.get("output_tokens") or 0)
+    return final, cost, model, tokens
 
 
 class ClaudeCLIBackend(Backend):
@@ -92,7 +95,11 @@ class ClaudeCLIBackend(Backend):
         if rc != 0:
             return RoleResult(ok=False, error=err.decode(errors="replace")[:500] or f"exit {rc}")
 
-        final, cost, model = parse_stream_result(out)
+        final, cost, model, tokens = parse_stream_result(out)
         return RoleResult(
-            ok=True, final_message=final or "(done)", cost_usd=cost, model=model or req.model
+            ok=True,
+            final_message=final or "(done)",
+            cost_usd=cost,
+            model=model or req.model,
+            tokens=tokens,
         )

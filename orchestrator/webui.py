@@ -539,6 +539,7 @@ INDEX_HTML = r"""<!doctype html>
     <div class="row" style="align-items:center;margin-bottom:8px">
       <div class="muted">phase <b id="phase">—</b></div>
       <div class="muted">cost <b class="cost" id="cost">$0</b></div>
+      <div class="muted">tokens <b id="tok">0</b></div>
       <div class="muted">units <b id="units">0/0</b></div>
       <div class="muted">동시 실행 <b id="runCount">0</b></div>
       <div class="muted">상태 <span class="pill" id="running">—</span></div>
@@ -641,6 +642,7 @@ async function tick(){
     $("projDir").textContent=proj||"—";
     $("phase").textContent=b.phase||"—";
     $("cost").textContent="$"+(b.total_cost_usd||0).toFixed(4);
+    $("tok").textContent=(b.total_tokens||0).toLocaleString();
     $("units").textContent=done+"/"+((b.units||[]).length);
     const runN=(s.roles||[]).filter(r=>(ag[r]||{}).status==="running").length;
     $("runCount").textContent=runN+"개";
@@ -650,7 +652,8 @@ async function tick(){
     const logs=s.agent_logs||{};
     $("agentCards").innerHTML=(s.roles||[]).map(r=>{const a=ag[r]||{};
       const run=a.status==="running";
-      const meta=[(a.model||a.backend||"—"),"$"+(+(a.cost_usd||0)).toFixed(4),"calls "+(a.calls||0),
+      const meta=[(a.model||a.backend||"—"),"$"+(+(a.cost_usd||0)).toFixed(4),
+        (a.tokens?(+a.tokens).toLocaleString()+" tok":null),"calls "+(a.calls||0),
         (a.current_unit&&a.current_unit!=="global")?("unit "+a.current_unit):null].filter(Boolean).join(" · ");
       return '<div class="agent-card'+(run?" run":"")+'"><h5>'+statusDot(a.status)+esc(r)+
         '<span class="badge">'+(a.status||"idle")+'</span></h5><div class="meta">'+esc(meta)+

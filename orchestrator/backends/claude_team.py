@@ -54,7 +54,11 @@ class ClaudeTeamBackend(Backend):
         if rc != 0:
             return RoleResult(ok=False, error=err.decode(errors="replace")[:500] or f"exit {rc}")
 
-        final, cost, model = parse_stream_result(out)
+        final, cost, model, tokens = parse_stream_result(out)
         return RoleResult(
-            ok=True, final_message=final or "(done)", cost_usd=cost, model=model or req.model
+            ok=True,
+            final_message=final or "(done)",
+            cost_usd=cost,
+            model=model or req.model,
+            tokens=tokens,
         )

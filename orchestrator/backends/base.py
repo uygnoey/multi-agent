@@ -112,6 +112,7 @@ class RoleResult:
     raw: Any = None
     error: str | None = None
     model: str | None = None  # 실제 사용된 모델 (캡처 가능 시)
+    tokens: int | None = None  # 토큰 사용량 (codex 등 USD 미보고 백엔드용)
 
 
 class Backend:
