@@ -8,6 +8,7 @@ CI/CD → graceful shutdown.
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 
 from . import workspace
@@ -40,6 +41,13 @@ class Scheduler:
         self.board.spec_text = spec_text
         await self.board.init(spec_text, DEFAULT_STACK)
 
+        # 생존 확인용 PID 파일 (웹 서버 재시작에도 running 상태를 정확히 판단)
+        pid_file = self.board.orch_dir / "run.pid"
+        try:
+            pid_file.write_text(str(os.getpid()), encoding="utf-8")
+        except Exception:
+            pass
+
         # graceful shutdown on SIGINT/SIGTERM (stops supervisors; phases unwind via finally)
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -59,6 +67,8 @@ class Scheduler:
             # 아키텍트 결과를 역할명으로 선택 (DESIGN_ROLES 순서가 바뀌어도 안전)
             by_role = dict(zip(DESIGN_ROLES, design_outcomes, strict=False))
             arch_outcome = by_role.get("architecture-engineer", design_outcomes[0])
+            for o in design_outcomes:  # 설계/테스트시트 산출물 → 전역 노출
+                await self.board.add_global_artifacts(o.get("artifacts", []))
             units = arch_outcome.get("units") or []
             if units:
                 await self.board.add_units(units)
@@ -79,12 +89,27 @@ class Scheduler:
                 f"Phase B/C: {len(unit_list)} unit(s), concurrency={self.cfg.concurrency}",
             )
             sem = asyncio.Semaphore(self.cfg.concurrency)
-            await asyncio.gather(*[self._process_unit(u, sem) for u in unit_list])
+            test_tasks: list[asyncio.Task] = []
+
+            async def pipeline(unit: dict) -> None:
+                uid = unit["id"]
+                if not await self._wait_for_deps(unit):
+                    await self.board.set_status(uid, BLOCKED, "deps unmet or failed")
+                    return
+                # dev 가 끝나면(dev_done) test/qa 는 별도 태스크로 즉시 실행하고,
+                # 개발 슬롯은 반납 → 개발은 곧바로 다음 unit 으로 진행한다.
+                if await self._develop_unit(unit, sem, 1):
+                    test_tasks.append(asyncio.create_task(self._test_unit(unit, sem, 1)))
+
+            await asyncio.gather(*[pipeline(u) for u in unit_list])
+            if test_tasks:  # 마지막 unit 들의 test/qa 완료 대기
+                await asyncio.gather(*test_tasks, return_exceptions=True)
 
             # Phase D — CI/CD
             await self.board.set_phase("cicd")
             await self.board.log_event("scheduler", "Phase D: CI/CD")
-            await self.runner.run_role("cicd")
+            cicd_out = await self.runner.run_role("cicd")
+            await self.board.add_global_artifacts(cicd_out.get("artifacts", []))
             await self.board.set_phase("done")
         finally:
             self._stop.set()
@@ -92,53 +117,56 @@ class Scheduler:
                 t.cancel()
             await asyncio.gather(*sup_tasks, return_exceptions=True)
             self.board.write_report()
+            try:
+                (self.board.orch_dir / "run.pid").unlink()  # 종료 표시
+            except Exception:
+                pass
 
         return self.board.snapshot()
 
-    async def _process_unit(self, unit: dict, sem: asyncio.Semaphore) -> None:
+    async def _develop_unit(self, unit: dict, sem: asyncio.Semaphore, attempt: int) -> bool:
+        """개발 3인(FE/BE/DBA) 동시 실행. 개발 동시성 슬롯(sem)은 이 동안만 점유.
+
+        성공 시 dev_done 으로 두고 True. (test/qa 는 호출자가 별도 태스크로 돌린다.)
+        """
         uid = unit["id"]
-        if not await self._wait_for_deps(unit):
-            await self.board.set_status(uid, BLOCKED, "deps unmet or failed")
-            return
+        dev_roles = [r for r in unit.get("roles", DEV_ROLES) if r in DEV_ROLES] or DEV_ROLES
         async with sem:
-            dev_roles = [r for r in unit.get("roles", DEV_ROLES) if r in DEV_ROLES] or DEV_ROLES
-            passed = False
-            for attempt in range(1, self.cfg.max_attempts + 1):
-                await self.board.set_status(
-                    uid, IN_PROGRESS, f"attempt {attempt}/{self.cfg.max_attempts}"
-                )
+            await self.board.set_status(
+                uid, IN_PROGRESS, f"dev attempt {attempt}/{self.cfg.max_attempts}"
+            )
+            dev_outcomes = await asyncio.gather(*[self.runner.run_role(r, unit) for r in dev_roles])
+            for o in dev_outcomes:
+                await self.board.add_artifacts(uid, o.get("artifacts", []))
+            if any(not o.get("_ok", True) for o in dev_outcomes):
+                await self.board.set_status(uid, BLOCKED, "dev failed")
+                return False
+            await self.board.set_status(uid, DEV_DONE)
+            return True
 
-                # 개발 3인 동시 실행
-                dev_outcomes = await asyncio.gather(
-                    *[self.runner.run_role(r, unit) for r in dev_roles]
-                )
-                for o in dev_outcomes:
-                    await self.board.add_artifacts(uid, o.get("artifacts", []))
-                if any(not o.get("_ok", True) for o in dev_outcomes):
-                    if attempt < self.cfg.max_attempts:
-                        await self.board.log_event(uid, "dev failed; reworking")
-                        continue
-                    await self.board.set_status(uid, BLOCKED, "dev failed after retries")
-                    return
-                await self.board.set_status(uid, DEV_DONE)
+    async def _test_unit(self, unit: dict, sem: asyncio.Semaphore, attempt: int) -> None:
+        """unit 개발 완료 직후 test-engineer → qa 를 실행 (개발 슬롯 비점유).
 
-                # Phase C — 테스트 코드 → QA 검증
-                await self.board.set_status(uid, TESTING)
-                te = await self.runner.run_role("test-engineer", unit)
-                await self.board.add_artifacts(uid, te.get("artifacts", []))
-                qa = await self.runner.run_role("qa", unit)
-                await self.board.add_artifacts(uid, qa.get("artifacts", []))
+        QA 실패 시 max_attempts 내에서 개발 슬롯을 다시 잡아 재작업 후 재검증.
+        """
+        uid = unit["id"]
+        await self.board.set_status(uid, TESTING)
+        te = await self.runner.run_role("test-engineer", unit)
+        await self.board.add_artifacts(uid, te.get("artifacts", []))
+        qa = await self.runner.run_role("qa", unit)
+        await self.board.add_artifacts(uid, qa.get("artifacts", []))
 
-                passed = qa.get("_ok", True) and qa.get("status") != "failed"
-                await self.board.set_test_status(uid, "pass" if passed else "fail")
-                if passed:
-                    await self.board.set_status(uid, DONE)
-                    break
-                if attempt < self.cfg.max_attempts:
-                    await self.board.log_event(uid, f"QA failed; rework attempt {attempt + 1}")
-
-            if not passed:
-                await self.board.set_status(uid, FAILED, "QA failed after retries")
+        passed = qa.get("_ok", True) and qa.get("status") != "failed"
+        await self.board.set_test_status(uid, "pass" if passed else "fail")
+        if passed:
+            await self.board.set_status(uid, DONE)
+            return
+        if attempt < self.cfg.max_attempts:
+            await self.board.log_event(uid, f"QA failed → 재작업 (attempt {attempt + 1})")
+            if await self._develop_unit(unit, sem, attempt + 1):
+                await self._test_unit(unit, sem, attempt + 1)
+                return
+        await self.board.set_status(uid, FAILED, "QA failed after retries")
 
     async def _wait_for_deps(self, unit: dict, timeout: float = 1800.0) -> bool:
         """deps 가 모두 완료되면 True. 실패/blocked dep 이 있으면 즉시 False(패스트페일).

@@ -42,7 +42,9 @@ class ClaudeTeamBackend(Backend):
         if req.model:
             cmd += ["--model", req.model]
         try:
-            rc, out, err, timed_out = await run_subprocess(cmd, str(req.cwd), req.timeout)
+            rc, out, err, timed_out = await run_subprocess(
+                cmd, str(req.cwd), req.timeout, req.live_log_path
+            )
         except Exception as e:
             return RoleResult(ok=False, error=str(e))
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 
 import pytest
@@ -53,6 +54,37 @@ def test_wait_for_deps_fast_fails_on_failed_dep(tmp_path, sample_spec_path):
     # U2 가 실패한 U1 에 의존 → 1800s 대기 없이 즉시 False
     ok = asyncio.run(sched._wait_for_deps({"id": "U2", "deps": ["U1"]}, timeout=5.0))
     assert ok is False
+
+
+def test_run_subprocess_streams_to_log(tmp_path):
+    # 긴 호출 중에도 출력이 실시간으로 로그파일에 쌓이도록 tee 한다.
+    lp = tmp_path / "live.log"
+    rc, out, err, timed_out = asyncio.run(
+        run_subprocess([sys.executable, "-c", "print('L1');print('L2')"], ".", 10, lp)
+    )
+    assert rc == 0 and not timed_out
+    assert lp.exists() and "L1" in lp.read_text() and "L2" in lp.read_text()
+
+
+def test_run_alive_detects_pidfile(tmp_path):
+    orch = tmp_path / ".orchestrator"
+    orch.mkdir()
+    assert webui._run_alive(orch) is False  # pidfile 없음
+    (orch / "run.pid").write_text(str(os.getpid()), encoding="utf-8")
+    assert webui._run_alive(orch) is True  # 살아있는 PID
+    (orch / "run.pid").write_text("999999999", encoding="utf-8")
+    assert webui._run_alive(orch) is False  # 죽은 PID
+
+
+def test_global_artifacts_tracked(tmp_path):
+    board = Board(tmp_path / "p")
+    asyncio.run(board.init("spec", {}))
+    asyncio.run(board.add_global_artifacts(["docs/design/architecture.md", "docs/design/api.md"]))
+    asyncio.run(board.add_global_artifacts(["docs/design/architecture.md"]))  # 중복 무시
+    assert board.snapshot()["artifacts"] == [
+        "docs/design/architecture.md",
+        "docs/design/api.md",
+    ]
 
 
 def test_run_role_never_raises_on_backend_exception(tmp_path, sample_spec_path, monkeypatch):
