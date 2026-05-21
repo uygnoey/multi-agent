@@ -1,4 +1,4 @@
-# Multi-Agent Web-Team Orchestrator
+# Multi-Agent Dev-Team Orchestrator
 
 [한국어](README.md) · **English**
 
