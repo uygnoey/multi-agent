@@ -44,8 +44,8 @@ def _read_events(orch_dir, n: int = 300) -> str:
         return ""
 
 
-def _read_agent_logs(orch_dir, roles, n: int = 40) -> dict:
-    """역할별 실시간 로그 tail {role: text} (활동 있는 역할만)."""
+def _read_agent_logs(orch_dir, roles, n: int = 600) -> dict:
+    """역할별 실시간 로그 tail {role: text} (활동 있는 역할만). 파일엔 전체가 저장됨."""
     out = {}
     ad = orch_dir / "agents"
     for role in roles:

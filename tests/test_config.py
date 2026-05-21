@@ -24,7 +24,7 @@ def _make_cfg(**kw) -> RunConfig:
 
 def test_roles_is_dict_of_rolespecs():
     assert isinstance(ROLES, dict)
-    assert len(ROLES) == 10
+    assert len(ROLES) == 11
     for name, spec in ROLES.items():
         assert isinstance(spec, RoleSpec)
         assert spec.name == name

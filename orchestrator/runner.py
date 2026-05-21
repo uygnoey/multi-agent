@@ -133,11 +133,11 @@ class Runner:
                     "[SYSTEM]\n" + agent.system_prompt + "\n\n[TASK]\n" + prompt,
                 )
                 res = await self._run_with_retries(get_backend(name), req, role, key)
-                # 상세 로그: 받은 결과 (CLI 의 경우 위에 원시 스트리밍 출력도 기록됨)
+                # 상세 로그: 받은 결과 전문 (절단 없음). CLI 는 위에 원시 스트리밍도 기록됨
                 self.board.write_agent_block(
                     role,
                     f"RESULT ← [{name}] ok={res.ok}",
-                    (res.final_message or res.error or "(no output)")[:8000],
+                    res.final_message or res.error or "(no output)",
                 )
                 if res.cost_usd:
                     role_cost += res.cost_usd

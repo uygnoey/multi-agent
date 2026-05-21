@@ -87,6 +87,21 @@ class MockBackend(Backend):
                 "name: ci\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n"
                 "    steps:\n      - run: echo mock-ci\n",
             )
+        elif role == "docs-writer":
+            write(
+                "docs/RUN_GUIDE.md",
+                "# Run Guide (mock)\n\n## Prerequisites\n- Python 3.10+, Node 18+\n\n"
+                "## Install & Run\n```bash\npip install -r backend/requirements.txt\n"
+                "uvicorn app.main:app --app-dir backend --port 8000\n```\n\n"
+                "## Tests\n`pytest tests/`\n",
+            )
+            write(
+                "docs/RUN_GUIDE.ko.md",
+                "# 실행 가이드 (mock)\n\n## 사전 준비\n- Python 3.10+, Node 18+\n\n"
+                "## 설치 및 실행\n```bash\npip install -r backend/requirements.txt\n"
+                "uvicorn app.main:app --app-dir backend --port 8000\n```\n\n"
+                "## 테스트\n`pytest tests/`\n",
+            )
 
         result = {
             "status": status,

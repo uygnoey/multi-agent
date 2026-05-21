@@ -28,11 +28,11 @@ def claude_stream_line(line_bytes: bytes) -> str | None:
             if ct == "text" and c.get("text", "").strip():
                 out.append(c["text"])
             elif ct == "tool_use":
-                out.append(
-                    f"🔧 {c.get('name')} {json.dumps(c.get('input', {}), ensure_ascii=False)[:200]}"
-                )
+                # 전문 저장 (절단 없음)
+                inp = json.dumps(c.get("input", {}), ensure_ascii=False)
+                out.append(f"🔧 {c.get('name')} {inp}")
             elif ct == "thinking" and c.get("thinking"):
-                out.append("💭 " + c["thinking"][:500])
+                out.append("💭 " + c["thinking"])
         return "\n".join(out) or None
     if t == "result":
         return f"✓ result (${o.get('total_cost_usd', 0)})"

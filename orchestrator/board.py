@@ -239,6 +239,75 @@ class Board:
         report.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return report
 
+    def write_deliverables(self) -> list[str]:
+        """보드 상태로 개발 산출물 문서를 EN/KO 양쪽으로 생성 (백엔드 무관 보장)."""
+        d = self._data
+        units = d.get("units", [])
+        done = sum(1 for u in units if u["status"] == "done")
+        artifacts = d.get("artifacts", [])
+        docs_dir = self.project_dir / "docs"
+        docs_dir.mkdir(parents=True, exist_ok=True)
+
+        def table(headers):
+            out = ["| " + " | ".join(headers) + " |", "|" + "|".join(["---"] * len(headers)) + "|"]
+            for u in units:
+                out.append(
+                    f"| {u['id']} | {u['status']} | {u.get('test_status')} | "
+                    f"{len(u.get('artifacts', []))} | {u.get('title', '')} |"
+                )
+            return out
+
+        def unit_files():
+            out = []
+            for u in units:
+                if u.get("artifacts"):
+                    out.append(f"### {u['id']} — {u.get('title', '')}")
+                    out += [f"- {a}" for a in u["artifacts"]]
+                    out.append("")
+            return out
+
+        en = (
+            [
+                "# Development Deliverables",
+                "",
+                f"- phase: **{d.get('phase')}**",
+                f"- units done: **{done}/{len(units)}**",
+                f"- total cost: **${d.get('total_cost_usd', 0.0):.4f}**",
+                f"- stack: {d.get('stack')}",
+                "",
+                "## Work units",
+                "",
+            ]
+            + table(["id", "status", "test", "files", "title"])
+            + ["", "## Design & shared artifacts", ""]
+            + ([f"- {a}" for a in artifacts] or ["- (none)"])
+            + ["", "## Per-unit files", ""]
+            + unit_files()
+            + ["See `docs/RUN_GUIDE.md` for how to run."]
+        )
+        ko = (
+            [
+                "# 개발 산출물",
+                "",
+                f"- 단계: **{d.get('phase')}**",
+                f"- 완료 unit: **{done}/{len(units)}**",
+                f"- 총비용: **${d.get('total_cost_usd', 0.0):.4f}**",
+                f"- 스택: {d.get('stack')}",
+                "",
+                "## 작업 단위",
+                "",
+            ]
+            + table(["id", "상태", "테스트", "파일수", "제목"])
+            + ["", "## 설계·공통 산출물", ""]
+            + ([f"- {a}" for a in artifacts] or ["- (없음)"])
+            + ["", "## 단위별 파일", ""]
+            + unit_files()
+            + ["실행 방법은 `docs/RUN_GUIDE.ko.md` 참고."]
+        )
+        (docs_dir / "DELIVERABLES.md").write_text("\n".join(en) + "\n", encoding="utf-8")
+        (docs_dir / "DELIVERABLES.ko.md").write_text("\n".join(ko) + "\n", encoding="utf-8")
+        return ["docs/DELIVERABLES.md", "docs/DELIVERABLES.ko.md"]
+
     # ---- reads (best-effort snapshots) ----
     def units(self) -> list[dict]:
         return [dict(u) for u in self._data.get("units", [])]
