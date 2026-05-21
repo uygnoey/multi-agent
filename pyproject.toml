@@ -20,6 +20,7 @@ all = ["claude-agent-sdk>=0.1.0", "openai-agents>=0.0.1"]
 [project.scripts]
 web-team = "orchestrator.__main__:main"
 web-team-monitor = "orchestrator.monitor:main"
+web-team-web = "orchestrator.webui:main"
 
 [tool.setuptools]
 packages = ["orchestrator", "orchestrator.backends"]

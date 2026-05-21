@@ -48,6 +48,13 @@ def parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help="실행 대신 --project-dir 의 진행을 실시간 모니터 TUI 로 본다",
     )
+    p.add_argument(
+        "--web",
+        action="store_true",
+        help="웹 UI 서버 실행 (브라우저에서 기획서 업로드·실행·모니터링)",
+    )
+    p.add_argument("--port", type=int, default=8765, help="--web 포트 (기본 8765)")
+    p.add_argument("--host", default="127.0.0.1", help="--web 바인드 호스트")
     return p.parse_args(argv)
 
 
@@ -105,6 +112,11 @@ def main(argv=None) -> int:
     a = parse_args(argv)
     if a.check:
         return cmd_check()
+    if a.web:
+        from .webui import serve
+
+        serve(a.port, a.project_dir, a.host)
+        return 0
     if a.watch:
         if not a.project_dir:
             raise SystemExit("--watch 에는 --project-dir 가 필요합니다.")

@@ -89,6 +89,7 @@ python -m orchestrator --spec examples/specs/sample-spec.md --project-dir /tmp/d
 | `--poll-interval SEC` | PM/PL 감독 주기 (기본 20초) |
 | `--check` | 백엔드 가용성만 진단 후 종료 |
 | `--watch` | 실행 대신 `--project-dir` 진행을 실시간 모니터 TUI 로 본다 |
+| `--web [--port N]` | 웹 UI 서버 실행 (브라우저에서 기획서 업로드·실행·모니터링) |
 
 ## 실시간 모니터 (TUI)
 
@@ -109,6 +110,23 @@ python -m orchestrator --watch --project-dir /tmp/demo-web
 - **↑/↓**(또는 j/k) 이동, **Enter** 로 해당 에이전트 상세 진입
 - **상세 뷰**: 그 에이전트가 실시간으로 무엇을 하는지(활동 로그)·비용·백엔드. **b/Esc** 로 리스트 복귀, **q** 종료
 - 헤드리스/CI: `python -m orchestrator.monitor --project-dir <dir> --once` 로 1회 텍스트 스냅샷
+
+## 웹 UI
+
+브라우저에서 **기획서 파일을 업로드해 실행**하고, TUI와 동일한 기능(에이전트 리스트 →
+클릭 상세(실시간 활동·비용) → 뒤로)을 본다. 의존성 0(stdlib `http.server`), 기본 `127.0.0.1`.
+
+```bash
+python -m orchestrator --web --port 8765          # 또는: web-team-web --port 8765
+# 브라우저에서 http://localhost:8765 접속
+```
+
+- **새 실행** 패널: 기획서(.md/.txt) 업로드 + 백엔드·동시성·mock·delegate·max-units 설정 → ▶ 실행
+- **모니터**: phase·총비용·units, 에이전트 표(● 실행중/○ 대기·$비용·calls·unit) → 행 클릭 시 상세
+- **상세**: 그 에이전트의 실시간 활동 로그·비용·백엔드 → 뒤로 버튼으로 리스트 복귀
+- 실행 결과물은 `--base-dir`(기본 `~/agent-runs`)/`<run-id>/` 에 생성됨
+- 같은 데이터(`board.json` + `agents/<role>.log`)를 읽으므로 TUI와 표시가 일치
+- ⚠️ 실 백엔드 선택 시 LLM 비용 발생 — 기본값은 `mock`. 외부 노출 시 인증/방화벽 직접 구성
 
 ## 산출물 위치 (타깃)
 
