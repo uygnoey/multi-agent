@@ -503,14 +503,11 @@ INDEX_HTML = r"""<!doctype html>
       <div><label>실행 이름</label><input type="text" id="name" placeholder="my-app"/></div>
     </div>
     <div class="row">
-      <div><label>백엔드</label><select id="backend"></select></div>
+      <div style="flex:2"><label>백엔드 (우선순위 순, 콤마 · 1개=단일 / 여러 개=폴오버·분산·교차)</label>
+        <input type="text" id="backends" placeholder="claude-cli   또는   claude-cli,codex"/></div>
       <div><label>동시성</label><input type="text" id="concurrency" value="3"/></div>
       <div><label>max-units (선택)</label><input type="text" id="maxUnits" placeholder="전체"/></div>
       <div><label>max-attempts</label><input type="text" id="maxAttempts" value="2"/></div>
-    </div>
-    <div class="row">
-      <div style="flex:4"><label>백엔드 우선순위 (콤마 · 비우면 위 단일 백엔드)</label>
-        <input type="text" id="backends" placeholder="claude-cli,codex,claude-sdk,openai-agents"/></div>
     </div>
     <div id="backendStatus" class="muted" style="margin-top:8px;font-size:12px">백엔드 상태 확인 중…</div>
     <details style="margin-top:8px">
@@ -563,12 +560,12 @@ async function loadChecks(){
   let data={backends:[],roles:[]};
   try{data=await (await fetch("/api/check")).json()}catch(e){}
   const rows=data.backends||[];
-  const sel=$("backend");sel.innerHTML="";
-  rows.forEach(r=>{const o=document.createElement("option");o.value=r.name;
-    o.text=r.name+" — "+r.info+(r.ok?"  ✅":"  ❌");sel.appendChild(o)});
   const bad=rows.filter(r=>!r.ok);
   $("backendStatus").innerHTML="백엔드: "+rows.map(r=>(r.ok?"✅":"❌")+" "+r.name).join("&nbsp;&nbsp;")+
     (bad.length?"<br>미가용 — "+bad.map(r=>r.name+": "+r.reason).join(" · "):"");
+  // 백엔드 입력칸이 비어있으면 가용한 첫 백엔드를 기본값으로 채움
+  const okOnes=rows.filter(r=>r.ok).map(r=>r.name);
+  if(!$("backends").value && okOnes.length) $("backends").value=okOnes[0];
   // 역할별 프로바이더 그리드 (auto + 백엔드들)
   const names=rows.map(r=>r.name);
   const grid=$("roleGrid");grid.innerHTML="";
@@ -591,7 +588,7 @@ async function startRun(){
   const role_backends={};
   document.querySelectorAll("#roleGrid select").forEach(s=>{if(s.value)role_backends[s.dataset.role]=s.value});
   const body={spec_text,name:$("name").value||f.name.replace(/\.[^.]+$/,""),
-    backend:$("backend").value,backends:blist.length?blist:null,role_backends,
+    backend:blist[0]||"mock",backends:blist.length>1?blist:null,role_backends,
     distribute:$("distribute").checked,cross_check:$("crossCheck").checked,
     concurrency:+$("concurrency").value||3,
     max_units:$("maxUnits").value?+$("maxUnits").value:null,
