@@ -56,6 +56,14 @@ def test_run_manager_start_with_fake_spawn(tmp_path):
     assert "orchestrator" in captured["cmd"]
 
 
+def test_read_events_tail(tmp_path):
+    orch = tmp_path / ".orchestrator"
+    orch.mkdir()
+    (orch / "events.log").write_text("a\nb\nc\nd\n", encoding="utf-8")
+    assert webui._read_events(orch, n=2) == "c\nd"
+    assert webui._read_events(tmp_path / "none") == ""  # 없는 디렉터리 → 빈 문자열
+
+
 def test_list_runs_finds_board(tmp_path):
     base = tmp_path / "runs"
     orch = base / "r1" / ".orchestrator"
