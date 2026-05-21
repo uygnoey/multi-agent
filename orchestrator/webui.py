@@ -402,11 +402,11 @@ def _make_handler(manager: RunManager):
                 self._json({"error": f"spec too large (> {MAX_SPEC_BYTES} chars)"}, 413)
                 return
             backend = data.get("backend", "mock")
-            if backend not in VALID_BACKENDS:
+            if resolve(backend) not in VALID_BACKENDS:  # CLI 와 동일하게 alias 허용
                 self._json({"error": f"invalid backend: {backend}"}, 400)
                 return
             for b in data.get("backends") or []:
-                if b not in VALID_BACKENDS:
+                if resolve(b) not in VALID_BACKENDS:
                     self._json({"error": f"invalid backend in priority list: {b}"}, 400)
                     return
             for role, prov in (data.get("role_backends") or {}).items():
@@ -415,6 +415,16 @@ def _make_handler(manager: RunManager):
                     return
                 if prov and resolve(prov) not in VALID_BACKENDS:
                     self._json({"error": f"invalid backend for {role}: {prov}"}, 400)
+                    return
+            # 숫자 옵션 검증 (잘못된 값이 build_command 의 int() 에서 크래시하지 않도록)
+            for fld in ("concurrency", "max_units", "max_attempts"):
+                v = data.get(fld)
+                if v in (None, ""):
+                    continue
+                try:
+                    int(v)
+                except (TypeError, ValueError):
+                    self._json({"error": f"invalid {fld}: {v!r}"}, 400)
                     return
             run_id = manager.start(data.get("spec_text", ""), data)
             self._json({"run_id": run_id})
