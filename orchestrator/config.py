@@ -88,11 +88,32 @@ class RunConfig:
     max_attempts: int = 2  # dev→test→qa rework attempts per unit
     retries: int = 1  # transient backend-failure retries per role call
     retry_backoff: float = 2.0  # seconds, exponential
+    # 우선순위 풀: 앞에서부터 가용한 백엔드를 쓰고, 실패 시 다음 백엔드로 폴오버.
+    backend_priority: list[str] = field(default_factory=list)
+    # 역할별 우선순위 override (role -> [backend, ...]).
+    role_priority: dict[str, list[str]] = field(default_factory=dict)
+    # True 면 역할들을 우선순위 목록에 라운드로빈으로 분산(모든 백엔드 동시 가동).
+    distribute: bool = False
+
+    def backends_for(self, role: str) -> list[str]:
+        """역할에 대한 백엔드 후보를 우선순위 순서로 반환 (폴오버용)."""
+        if self.mock:
+            return ["mock"]
+        if self.role_priority.get(role):
+            return list(self.role_priority[role])
+        if role in self.role_backend:
+            return [self.role_backend[role]]
+        base = list(self.backend_priority) if self.backend_priority else [self.default_backend]
+        if self.distribute and len(base) > 1:
+            try:
+                idx = list(ROLES).index(role) % len(base)
+            except ValueError:
+                idx = 0
+            base = base[idx:] + base[:idx]
+        return base
 
     def backend_for(self, role: str) -> str:
-        if self.mock:
-            return "mock"
-        return self.role_backend.get(role, self.default_backend)
+        return self.backends_for(role)[0]
 
     def model_for(self, backend: str) -> str | None:
         # 명시 모델만 전달. 미지정 시 각 백엔드 기본값을 쓰도록 None.

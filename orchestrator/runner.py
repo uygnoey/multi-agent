@@ -29,47 +29,34 @@ class Runner:
         self.cfg = cfg
         self.board = board
 
-    async def run_role(self, role: str, unit: dict | None = None) -> dict:
-        spec = ROLES[role]
-        agent = load_agent(role)
-        backend_name = self.cfg.backend_for(role)
-        backend = get_backend(backend_name)
+    def _candidates(self, role: str) -> list[str]:
+        """우선순위 순서의 백엔드 후보. 가용한 것만 남기되, 없으면 첫 후보로 명확히 실패시킨다."""
+        cands = self.cfg.backends_for(role)
+        avail = [c for c in cands if get_backend(c).available()[0]]
+        return avail or cands[:1]
 
-        key = unit["id"] if unit else "global"
-        result_rel = f".orchestrator/results/{role}__{key}.json"
-        result_path = self.board.project_dir / result_rel
-        if result_path.exists():
-            result_path.unlink()  # 직전 결과 제거 → 신선도 보장
+    def _build_teammates(self, role: str) -> list[dict]:
+        out = []
+        for mate in DELEGATES.get(role, ()):
+            td = load_agent(mate)
+            out.append(
+                {
+                    "name": mate,
+                    "description": td.description,
+                    "prompt": td.system_prompt,
+                    "tools": td.tools or list(ROLES[mate].tools),
+                    "model": td.model,
+                }
+            )
+        return out
 
-        prompt = compose_prompt(
-            role=role,
-            phase=spec.phase,
-            unit=unit,
-            directives=self.board.directives(),
-            result_rel=result_rel,
-            spec_excerpt=self.board.snapshot().get("spec_excerpt", ""),
-            recent_events=self.board.recent_events(12) if unit is None else "",
-        )
-
+    def _build_req(self, role, spec, unit, agent, prompt, result_path, result_rel, backend_name):
         allowed_tools = agent.tools or list(spec.tools)
         delegate = self.cfg.delegate and backend_name in DELEGATION_CAPABLE
-        teammates: list[dict] = []
-        if delegate:
-            if DELEGATION_TOOL not in allowed_tools:
-                allowed_tools = [*allowed_tools, DELEGATION_TOOL]
-            for mate in DELEGATES.get(role, ()):
-                td = load_agent(mate)
-                teammates.append(
-                    {
-                        "name": mate,
-                        "description": td.description,
-                        "prompt": td.system_prompt,
-                        "tools": td.tools or list(ROLES[mate].tools),
-                        "model": td.model,
-                    }
-                )
-
-        req = RoleRequest(
+        teammates = self._build_teammates(role) if delegate else []
+        if delegate and DELEGATION_TOOL not in allowed_tools:
+            allowed_tools = [*allowed_tools, DELEGATION_TOOL]
+        return RoleRequest(
             role=role,
             phase=spec.phase,
             unit=unit,
@@ -87,27 +74,61 @@ class Runner:
             teammates=teammates,
         )
 
-        team = f" +team={[m['name'] for m in teammates]}" if teammates else ""
-        start_line = f"start [{backend_name}]" + (f" unit={key}" if unit else "") + team
-        await self.board.log_event(role, start_line)
-        await self.board.agent_update(
-            role,
-            status="running",
-            unit=key,
-            backend=backend_name,
-            call=True,
-            activity=("▶ " + (f"unit={key} " if unit else "") + f"[{backend_name}]{team}"),
+    async def run_role(self, role: str, unit: dict | None = None) -> dict:
+        spec = ROLES[role]
+        agent = load_agent(role)
+        key = unit["id"] if unit else "global"
+        result_rel = f".orchestrator/results/{role}__{key}.json"
+        result_path = self.board.project_dir / result_rel
+
+        prompt = compose_prompt(
+            role=role,
+            phase=spec.phase,
+            unit=unit,
+            directives=self.board.directives(),
+            result_rel=result_rel,
+            spec_excerpt=self.board.snapshot().get("spec_excerpt", ""),
+            recent_events=self.board.recent_events(12) if unit is None else "",
         )
 
-        res = await self._run_with_retries(backend, req, role, key)
+        candidates = self._candidates(role)
+        res = None
+        chosen = candidates[0]
+        for i, name in enumerate(candidates):
+            chosen = name
+            req = self._build_req(role, spec, unit, agent, prompt, result_path, result_rel, name)
+            team = f" +team={[m['name'] for m in req.teammates]}" if req.teammates else ""
+            fo = f" (failover {i + 1}/{len(candidates)})" if i else ""
+            await self.board.log_event(
+                role, f"start [{name}]" + (f" unit={key}" if unit else "") + team + fo
+            )
+            await self.board.agent_update(
+                role,
+                status="running",
+                unit=key,
+                backend=name,
+                call=True,
+                activity="▶ " + (f"unit={key} " if unit else "") + f"[{name}]{team}{fo}",
+            )
+            if result_path.exists():
+                result_path.unlink()  # 후보마다 직전 결과 제거 → 신선도 보장
+
+            res = await self._run_with_retries(get_backend(name), req, role, key)
+            if res.cost_usd:
+                await self.board.add_cost(res.cost_usd)
+                await self.board.agent_update(role, cost_add=res.cost_usd)
+            if res.ok:
+                break
+            if i < len(candidates) - 1:
+                nxt = candidates[i + 1]
+                await self.board.log_event(role, f"failover [{name}]→[{nxt}]: {res.error}")
+                await self.board.agent_update(role, activity=f"↪ failover [{name}]→[{nxt}]")
 
         outcome = self._read_result(result_path, res)
-        if res.cost_usd:
-            await self.board.add_cost(res.cost_usd)
-        cost = f" ${res.cost_usd:.4f}" if res.cost_usd else ""
+        cost = f" ${res.cost_usd:.4f}" if res and res.cost_usd else ""
         await self.board.log_event(
             role,
-            f"done ok={res.ok}{cost}" + ("" if res.ok else f" err={res.error}"),
+            f"done [{chosen}] ok={res.ok}{cost}" + ("" if res.ok else f" err={res.error}"),
         )
         summary = (outcome.get("status") or "?") + (
             f" · {len(outcome.get('artifacts', []))} files" if outcome.get("artifacts") else ""
@@ -115,11 +136,11 @@ class Runner:
         await self.board.agent_update(
             role,
             status="idle",
-            cost_add=res.cost_usd,
+            backend=chosen,
             message=res.final_message or (res.error or ""),
-            activity=f"✓ done ok={res.ok}{cost} → {summary}"
+            activity=f"✓ done [{chosen}]{cost} → {summary}"
             if res.ok
-            else f"✗ failed{cost}: {res.error}",
+            else f"✗ failed [{chosen}]{cost}: {res.error}",
         )
         return outcome
 

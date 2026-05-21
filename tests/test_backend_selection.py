@@ -1,0 +1,90 @@
+"""백엔드 우선순위 풀 · 분산 · 폴오버 선택 로직 테스트."""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+from orchestrator import runner as runner_mod
+from orchestrator.backends.base import RoleResult
+from orchestrator.board import Board
+from orchestrator.config import RunConfig
+
+DUMMY = Path("/x")
+
+
+def _cfg(**kw):
+    return RunConfig(spec_path=DUMMY, project_dir=DUMMY, **kw)
+
+
+def test_priority_pool_order():
+    cfg = _cfg(backend_priority=["claude-cli", "codex", "claude-sdk"])
+    assert cfg.backends_for("backend-developer") == ["claude-cli", "codex", "claude-sdk"]
+    assert cfg.backend_for("backend-developer") == "claude-cli"
+
+
+def test_mock_overrides_everything():
+    cfg = _cfg(mock=True, backend_priority=["claude-cli", "codex"])
+    assert cfg.backends_for("frontend-developer") == ["mock"]
+
+
+def test_role_priority_wins_over_global():
+    cfg = _cfg(backend_priority=["claude-cli"], role_priority={"dba": ["codex", "claude-sdk"]})
+    assert cfg.backends_for("dba") == ["codex", "claude-sdk"]
+    assert cfg.backends_for("backend-developer") == ["claude-cli"]
+
+
+def test_distribute_spreads_roles_across_pool():
+    pool = ["claude-cli", "codex", "claude-sdk", "openai-agents"]
+    cfg = _cfg(backend_priority=pool, distribute=True)
+    # 서로 다른 역할은 서로 다른 1순위를 가져 4종이 동시에 가동된다 (라운드로빈 회전).
+    firsts = {cfg.backends_for(r)[0] for r in ROLES_SAMPLE}
+    assert len(firsts) > 1
+    # 각 역할의 후보는 여전히 전체 풀(폴오버 보장)
+    assert sorted(cfg.backends_for("project-manager")) == sorted(pool)
+
+
+ROLES_SAMPLE = [
+    "project-manager",
+    "project-leader",
+    "architecture-engineer",
+    "frontend-developer",
+]
+
+
+class _FakeBackend:
+    def __init__(self, name, ok):
+        self.name = name
+        self._ok = ok
+
+    def available(self):
+        return (True, "ok")
+
+    async def run_role(self, req):
+        return RoleResult(
+            ok=self._ok,
+            final_message=self.name,
+            cost_usd=0.0,
+            error=None if self._ok else "boom",
+        )
+
+
+def test_runner_fails_over_to_next_backend(tmp_path, monkeypatch, sample_spec_path):
+    cfg = RunConfig(
+        spec_path=sample_spec_path,
+        project_dir=tmp_path / "p",
+        backend_priority=["bad", "good"],
+        retries=0,
+    )
+    board = Board(cfg.project_dir)
+    board.spec_text = "spec"
+    asyncio.run(board.init("spec", {}))
+
+    fakes = {"bad": _FakeBackend("bad", False), "good": _FakeBackend("good", True)}
+    monkeypatch.setattr(runner_mod, "get_backend", lambda n: fakes[n])
+
+    out = asyncio.run(
+        runner_mod.Runner(cfg, board).run_role("backend-developer", {"id": "U1", "title": "t"})
+    )
+    assert out["_ok"] is True
+    assert board.agents()["backend-developer"]["backend"] == "good"

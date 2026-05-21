@@ -23,11 +23,21 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--backend", default=DEFAULT_BACKEND, choices=VALID_BACKENDS, help="전역 기본 백엔드"
     )
     p.add_argument(
+        "--backends",
+        metavar="B1,B2,...",
+        help="우선순위 풀(앞에서부터 가용 사용·실패 시 폴오버). --backend 보다 우선",
+    )
+    p.add_argument(
+        "--distribute",
+        action="store_true",
+        help="역할들을 --backends 풀에 라운드로빈 분산 (4종 동시 가동)",
+    )
+    p.add_argument(
         "--role-backend",
         action="append",
         default=[],
-        metavar="ROLE=BACKEND",
-        help="역할별 백엔드 override (반복 가능)",
+        metavar="ROLE=B1[,B2,...]",
+        help="역할별 백엔드(우선순위 리스트) override. 반복 가능",
     )
     p.add_argument("--max-units", type=int, help="처리할 unit 수 상한")
     p.add_argument("--concurrency", type=int, default=3, help="동시 처리 unit 수")
@@ -66,22 +76,33 @@ def cmd_check() -> int:
     return 0
 
 
+def _parse_backend_list(value: str) -> list[str]:
+    names = [b.strip() for b in value.split(",") if b.strip()]
+    for b in names:
+        if b not in VALID_BACKENDS:
+            raise SystemExit(f"알 수 없는 백엔드: {b} (가능: {', '.join(VALID_BACKENDS)})")
+    if not names:
+        raise SystemExit(f"빈 백엔드 목록: {value!r}")
+    return names
+
+
 def build_config(a: argparse.Namespace) -> RunConfig:
-    role_backend: dict[str, str] = {}
+    backend_priority = _parse_backend_list(a.backends) if a.backends else []
+    role_priority: dict[str, list[str]] = {}
     for item in a.role_backend:
         if "=" not in item:
-            raise SystemExit(f"--role-backend 형식 오류: {item} (ROLE=BACKEND)")
-        role, backend = item.split("=", 1)
+            raise SystemExit(f"--role-backend 형식 오류: {item} (ROLE=B1[,B2,...])")
+        role, backends = item.split("=", 1)
         if role not in ROLES:
             raise SystemExit(f"알 수 없는 역할: {role} (가능: {', '.join(ROLES)})")
-        if backend not in VALID_BACKENDS:
-            raise SystemExit(f"알 수 없는 백엔드: {backend} (가능: {', '.join(VALID_BACKENDS)})")
-        role_backend[role] = backend
+        role_priority[role] = _parse_backend_list(backends)
     return RunConfig(
         spec_path=a.spec.resolve(),
         project_dir=a.project_dir.resolve(),
         default_backend=a.backend,
-        role_backend=role_backend,
+        backend_priority=backend_priority,
+        role_priority=role_priority,
+        distribute=a.distribute,
         max_units=a.max_units,
         concurrency=a.concurrency,
         budget=a.budget,
