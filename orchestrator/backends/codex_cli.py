@@ -8,6 +8,7 @@ codex exec ... --cd <타깃> --sandbox workspace-write --json -o <out> --skip-gi
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import uuid
 
@@ -66,16 +67,27 @@ class CodexCLIBackend(Backend):
                 final = out_path.read_text(encoding="utf-8")[:2000]
             except Exception:
                 pass
-        # codex 는 USD 미보고(구독) → turn.completed 의 토큰 사용량을 캡처
+        # codex usage(토큰) + (제공 시) USD 캡처. 구독이면 cost 는 추정치로 표기.
         tokens = None
+        cost = None
         for line in out.splitlines():
             try:
                 o = json.loads(line)
             except Exception:
                 continue
+            u = o.get("usage") or {}
             if o.get("type") == "turn.completed":
-                u = o.get("usage") or {}
                 tokens = (u.get("input_tokens") or 0) + (u.get("output_tokens") or 0)
+            # 일부/향후 버전이 USD 를 줄 경우 (usage 안이든 이벤트 레벨이든) 캡처
+            for src in (u, o):
+                for k in ("total_cost_usd", "cost_usd", "cost"):
+                    if isinstance(src.get(k), (int, float)):
+                        cost = src[k]
         return RoleResult(
-            ok=True, final_message=final or "codex exec ok", model=req.model, tokens=tokens
+            ok=True,
+            final_message=final or "codex exec ok",
+            model=req.model,
+            tokens=tokens,
+            cost_usd=cost,
+            cost_estimated=cost is not None and not os.environ.get("CODEX_API_KEY"),
         )

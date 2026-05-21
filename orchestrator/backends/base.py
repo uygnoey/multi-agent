@@ -113,6 +113,7 @@ class RoleResult:
     error: str | None = None
     model: str | None = None  # 실제 사용된 모델 (캡처 가능 시)
     tokens: int | None = None  # 토큰 사용량 (codex 등 USD 미보고 백엔드용)
+    cost_estimated: bool = False  # 구독 사용 → cost 는 토큰 환산 추정치(실청구 아님)
 
 
 class Backend:

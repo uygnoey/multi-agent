@@ -97,6 +97,15 @@ def test_board_tracks_tokens(tmp_path):
     assert snap["agents"]["backend-developer"]["tokens"] == 1500
 
 
+def test_board_cost_estimated_flag(tmp_path):
+    board = Board(tmp_path / "p")
+    asyncio.run(board.init("s", {}))
+    asyncio.run(board.agent_update("backend-developer", cost_add=1.0, cost_est=True))
+    snap = board.snapshot()
+    assert snap["cost_estimated"] is True
+    assert snap["agents"]["backend-developer"]["cost_est"] is True
+
+
 def test_parse_stream_result_extracts_tokens_cost_model():
     from orchestrator.backends.claude_cli import parse_stream_result
 

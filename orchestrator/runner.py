@@ -142,7 +142,9 @@ class Runner:
                 if res.cost_usd:
                     role_cost += res.cost_usd
                     await self.board.add_cost(res.cost_usd)
-                    await self.board.agent_update(role, cost_add=res.cost_usd)
+                    await self.board.agent_update(
+                        role, cost_add=res.cost_usd, cost_est=res.cost_estimated
+                    )
                 if res.tokens:
                     await self.board.agent_update(role, tokens_add=res.tokens)
                 if res.ok:
