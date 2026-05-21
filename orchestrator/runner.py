@@ -18,6 +18,7 @@ from .config import (
     DELEGATION_CAPABLE,
     DELEGATION_TOOL,
     MAX_TURNS,
+    PHASE_SUPERVISOR,
     ROLES,
     RunConfig,
 )
@@ -164,7 +165,9 @@ class Runner:
         if res is None:
             res = RoleResult(ok=False, error="no backend candidate")
 
-        outcome = self._read_result(result_path, res)
+        # 감독(PM/PL)은 결과파일을 안 남겨도 자연스럽다. 그 외 역할은 결과 JSON 이 계약.
+        result_required = spec.phase != PHASE_SUPERVISOR
+        outcome = self._read_result(result_path, res, result_required)
         cost = f" ${role_cost:.4f}" if role_cost else ""
         await self.board.log_event(
             role,
@@ -202,7 +205,7 @@ class Runner:
         return last
 
     @staticmethod
-    def _read_result(result_path, res) -> dict:
+    def _read_result(result_path, res, result_required: bool = True) -> dict:
         # 백엔드 호출이 성공한 경우에만 결과파일을 신뢰한다. 실패 시 남아있는
         # 부분/이전 결과파일을 성공으로 오탐하지 않도록 합성 실패 결과를 쓴다.
         if res.ok and result_path.exists():
@@ -219,7 +222,17 @@ class Runner:
                     "units": [],
                     "_ok": False,
                 }
-        # 결과파일을 안 남긴 경우: 백엔드 결과로 합성 (파일을 안 쓰는 역할 등)
+        if res.ok and result_required:
+            # 결과파일이 필수인 역할(dev/test/cicd/docs/architect 등)이 안 썼으면 계약 위반 → 실패
+            return {
+                "status": "failed",
+                "artifacts": [],
+                "notes": [res.final_message[:300]] if res.final_message else [],
+                "blockers": ["no result file written (contract violation)"],
+                "units": [],
+                "_ok": False,
+            }
+        # 결과파일이 불필요한 역할(감독) 또는 백엔드 실패 → 백엔드 결과로 합성
         return {
             "status": "done" if res.ok else "failed",
             "artifacts": [],
@@ -264,7 +277,8 @@ def _coerce_result(data: dict, res) -> dict:
     if not isinstance(data, dict):
         data = {}
     status = str(data.get("status") or ("done" if res.ok else "failed")).strip().lower()
-    blockers = [str(b) for b in _as_list(data.get("blockers"))]
+    # 빈/공백 blocker 슬롯은 무시 (LLM 이 빈 칸을 남겨도 불필요한 실패가 나지 않게)
+    blockers = [s for b in _as_list(data.get("blockers")) if (s := str(b).strip())]
     # 실패 변형(fail/failure/error/...)을 다 나열하기보다 성공 status 만 허용(whitelist)
     ok = res.ok and status in _SUCCESS_STATUSES and not blockers
     return {

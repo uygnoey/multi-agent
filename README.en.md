@@ -200,7 +200,10 @@ python -m orchestrator --web --port 8765          # or: web-team-web --port 8765
 - **Exception isolation**: one role's failure does not cancel other concurrent roles (run_role never propagates)
 - **Result integrity**: a leftover result file is not mistaken for success when the backend failed; the board is single-writer
 - **Web security**: path-traversal blocking (run id confined to base_dir · role validation), request body size cap
+- **Result contract**: non-supervisor roles treat a missing/broken result JSON as failure (avoids false success)
 - Per-session `max_turns`/budget, global concurrency semaphore, `--max-units`, path scoping (confined to target cwd)
+- ⚠️ The `openai-agents` backend's `run_bash` (shell) only sets cwd to the target — it does not enforce an FS
+  boundary (gated by allowed_tools so only Bash-capable roles get it). For strong isolation, run in **Docker**
 
 ## Deploy (Docker)
 
