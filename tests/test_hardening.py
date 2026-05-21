@@ -92,6 +92,28 @@ def test_wait_for_deps_keeps_waiting_while_progressing(tmp_path, sample_spec_pat
     assert asyncio.run(go()) is True
 
 
+def test_add_units_normalizes_scalar_deps_and_roles(tmp_path):
+    # architect 가 "deps":"U0", "roles":"backend-developer" 처럼 스칼라를 줘도 문자 분해되면 안 됨.
+    board = Board(tmp_path / "p")
+    asyncio.run(board.init("s", {}))
+    asyncio.run(
+        board.add_units([{"id": "U1", "title": "a", "deps": "U0", "roles": "backend-developer"}])
+    )
+    u = board.units()[0]
+    assert u["deps"] == ["U0"]  # ["U","0"] 아님
+    assert u["roles"] == ["backend-developer"]  # 문자 단위 분해 아님
+
+
+def test_warnings_recorded_and_reported(tmp_path):
+    # 설계/CI/docs 실패는 경고로 기록되고 리포트에 'done with warnings' 로 표시돼야 함.
+    board = Board(tmp_path / "p")
+    asyncio.run(board.init("s", {}))
+    asyncio.run(board.add_warning("cicd failed"))
+    assert board.snapshot()["warnings"] == ["cicd failed"]
+    text = board.write_report().read_text(encoding="utf-8")
+    assert "cicd failed" in text and "done with warnings" in text
+
+
 def test_wait_for_deps_handles_none_session_timeout(tmp_path, sample_spec_path):
     # --timeout 0 → session_timeout=None. stall 계산에서 None*2 크래시하면 안 됨.
     from orchestrator.board import DONE

@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -25,6 +27,7 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None):
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=2**20,  # 큰 JSON 라인 대응 (기본 64KB 초과 방지)
+        start_new_session=True,  # 새 프로세스 그룹 → 타임아웃 시 자식까지 그룹째 종료
     )
     out_chunks: list[bytes] = []
     err_chunks: list[bytes] = []
@@ -68,8 +71,15 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None):
         await proc.wait()
         return proc.returncode, b"".join(out_chunks), b"".join(err_chunks), False
     except asyncio.TimeoutError:
+        # 프로세스 그룹째 종료 (CLI 가 spawn 한 자식 — node/codex 등 — 이 살아남지 않도록)
         try:
-            proc.kill()
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
             await proc.wait()
         except Exception:
             pass

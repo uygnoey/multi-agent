@@ -129,7 +129,7 @@ def render_snapshot(board: dict, roles: list[str], alive: bool | None = None) ->
     run_n = sum(1 for r in roles if status_of(agents.get(r, {})) == "running")
     toks = board.get("total_tokens", 0)
     est = " est." if board.get("cost_estimated") else ""
-    state = "running" if alive else ("done" if phase == "done" else "stopped")
+    state = _state_label(bool(alive), phase, board.get("warnings") or [])
     lines = [
         f"phase={phase}   cost=${cost:.4f}{est}   tokens={toks:,}   "
         f"units={done}/{len(units)}   running_agents={run_n}   state={state}",
@@ -162,6 +162,15 @@ def _safe_add(win, y: int, x: int, text: str, attr: int = 0) -> None:
             win.addnstr(y, x, text, max(0, w - x - 1), attr)
         except Exception:
             pass
+
+
+def _state_label(alive: bool, phase: str, warnings: list) -> str:
+    """run 상태 라벨: 실행중 / 완료(경고 있으면 ⚠N) / 중단."""
+    if alive:
+        return "running"
+    if phase == "done":
+        return f"done⚠{len(warnings)}" if warnings else "done"
+    return "stopped"
 
 
 def _disp_width(ch: str) -> int:
@@ -210,8 +219,7 @@ def _draw_list(stdscr, board, roles, sel, orch_dir, alive) -> None:
         0,
         f" phase:{phase}  cost:${cost:.4f}{' est.' if board.get('cost_estimated') else ''}  "
         f"tokens:{board.get('total_tokens', 0):,}  units:{done}/{len(units)}  "
-        f"동시실행:{run_n}  "
-        f"[{'running' if alive else ('done' if phase == 'done' else 'stopped')}]",
+        f"동시실행:{run_n}  [{_state_label(alive, phase, board.get('warnings') or [])}]",
         curses.A_BOLD,
     )
     _safe_add(stdscr, 2, 1, f"📁 {orch_dir.parent}", curses.A_DIM)
