@@ -155,6 +155,7 @@ class Board:
         message: str | None = None,
         call: bool = False,
         activity: str | None = None,
+        model: str | None = None,
     ) -> None:
         async with self._lock:
             agents = self._data.setdefault("agents", {})
@@ -166,6 +167,7 @@ class Board:
                     "cost_usd": 0.0,
                     "current_unit": None,
                     "backend": None,
+                    "model": None,
                     "last_message": "",
                     "updated_at": 0.0,
                 },
@@ -176,6 +178,8 @@ class Board:
                 a["current_unit"] = unit
             if backend is not None:
                 a["backend"] = backend
+            if model is not None:
+                a["model"] = model
             if cost_add:
                 a["cost_usd"] = round(a["cost_usd"] + float(cost_add), 6)
             if message is not None:

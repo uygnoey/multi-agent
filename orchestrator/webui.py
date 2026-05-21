@@ -15,10 +15,12 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -81,7 +83,8 @@ def slugify(name: str) -> str:
 
 
 def new_run_id(name: str) -> str:
-    return f"{slugify(name)}-{time.strftime('%Y%m%d-%H%M%S')}"
+    # 같은 초 충돌 방지를 위해 짧은 랜덤 suffix 추가
+    return f"{slugify(name)}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}"
 
 
 def build_command(py: str, spec_path: Path, project_dir: Path, opts: dict) -> list[str]:
@@ -143,7 +146,10 @@ class RunManager:
     @staticmethod
     def _default_spawn(cmd: list[str], log_path: Path):
         f = open(log_path, "w", encoding="utf-8")  # noqa: SIM115 (closed on reap)
-        proc = subprocess.Popen(cmd, cwd=str(FRAMEWORK_ROOT), stdout=f, stderr=subprocess.STDOUT)
+        # start_new_session=True → 새 프로세스 그룹 → stop 시 자식까지 killpg 가능
+        proc = subprocess.Popen(
+            cmd, cwd=str(FRAMEWORK_ROOT), stdout=f, stderr=subprocess.STDOUT, start_new_session=True
+        )
         proc._logfile = f  # is_running 에서 reap 시 close
         return proc
 
@@ -161,11 +167,60 @@ class RunManager:
         project.mkdir(parents=True, exist_ok=True)
         spec_path = project / "_spec.md"
         spec_path.write_text(spec_text or "# (empty spec)\n", encoding="utf-8")
+        # 재실행(rerun)용으로 옵션 저장
+        try:
+            (project / "_run_opts.json").write_text(
+                json.dumps(opts, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception:
+            pass
         cmd = build_command(sys.executable, spec_path, project, opts)
         proc = self._spawn(cmd, self.base_dir / f"{run_id}.log")
         with self._lock:
             self._procs[run_id] = proc
         return run_id
+
+    def stop(self, run_id: str) -> bool:
+        """run 의 프로세스 그룹을 종료 (run.pid 또는 추적 중인 proc 기준)."""
+        pid = None
+        orch = self.project_dir(run_id) / ".orchestrator"
+        pf = orch / "run.pid"
+        if pf.exists():
+            try:
+                pid = int(pf.read_text(encoding="utf-8").strip())
+            except Exception:
+                pid = None
+        with self._lock:
+            proc = self._procs.get(run_id)
+        if pid is None and proc is not None:
+            pid = getattr(proc, "pid", None)
+        if not pid:
+            return False
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+            return True
+        except Exception:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                return True
+            except Exception:
+                return False
+
+    def rerun(self, run_id: str) -> str:
+        """저장된 spec + opts 로 새 run 을 시작."""
+        project = self.project_dir(run_id)
+        spec_text = ""
+        sp = project / "_spec.md"
+        if sp.exists():
+            spec_text = sp.read_text(encoding="utf-8")
+        opts = {"mock": True}
+        op = project / "_run_opts.json"
+        if op.exists():
+            try:
+                opts = json.loads(op.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return self.start(spec_text, opts)
 
     def is_running(self, run_id: str) -> bool:
         with self._lock:
@@ -277,7 +332,7 @@ def _make_handler(manager: RunManager):
 
         def do_POST(self):
             u = urlparse(self.path)
-            if u.path != "/api/run":
+            if u.path not in ("/api/run", "/api/stop", "/api/rerun"):
                 self._json({"error": "not found"}, 404)
                 return
             length = int(self.headers.get("Content-Length", 0) or 0)
@@ -289,6 +344,30 @@ def _make_handler(manager: RunManager):
             except Exception:
                 self._json({"error": "invalid json"}, 400)
                 return
+
+            if u.path == "/api/stop":
+                run = data.get("run", "")
+                try:
+                    ok = manager.stop(run) if run else False
+                except ValueError:
+                    self._json({"error": "invalid run id"}, 400)
+                    return
+                self._json({"stopped": ok})
+                return
+            if u.path == "/api/rerun":
+                run = data.get("run", "")
+                try:
+                    rid = manager.rerun(run)
+                except ValueError:
+                    self._json({"error": "invalid run id"}, 400)
+                    return
+                except Exception as e:
+                    self._json({"error": str(e)}, 400)
+                    return
+                self._json({"run_id": rid})
+                return
+
+            # /api/run
             if len(data.get("spec_text", "") or "") > MAX_SPEC_BYTES:
                 self._json({"error": f"spec too large (> {MAX_SPEC_BYTES} chars)"}, 413)
                 return
@@ -369,6 +448,13 @@ INDEX_HTML = r"""<!doctype html>
   .hide{display:none}
   a{color:#58a6ff}
   .cost{color:#d29922;font-variant-numeric:tabular-nums}
+  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:12px}
+  .agent-card{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:10px}
+  .agent-card.run{border-color:#2ea043}
+  .agent-card h5{margin:0 0 4px;font-size:14px}
+  .agent-card .meta{font-size:11px;color:#8b949e;margin-bottom:6px}
+  .agent-card pre{max-height:30vh;margin:0;font-size:11px}
+  .badge{font-size:10px;padding:1px 6px;border-radius:999px;background:#21262d;border:1px solid #30363d;margin-left:6px}
 </style></head>
 <body>
 <header>
@@ -422,7 +508,12 @@ INDEX_HTML = r"""<!doctype html>
 
   <!-- Monitor: 단일 대시보드 (클릭 불필요, 모두 항상 표시) -->
   <section id="dash" class="card hide">
-    <button class="secondary" onclick="showPicker()" style="margin-bottom:8px">← run 목록</button>
+    <div class="row" style="align-items:center;margin-bottom:8px">
+      <button class="secondary" onclick="showPicker()">← run 목록</button>
+      <span style="flex:1"></span>
+      <button id="stopBtn" class="secondary" onclick="stopRun()">■ 정지</button>
+      <button id="rerunBtn" class="secondary" onclick="rerunRun()">↻ 재실행</button>
+    </div>
     <div class="muted" style="margin-bottom:6px">
       📁 결과물 저장 위치: <b id="projDir" style="user-select:all">—</b>
     </div>
@@ -433,15 +524,11 @@ INDEX_HTML = r"""<!doctype html>
       <div class="muted">상태 <span class="pill" id="running">—</span></div>
     </div>
 
-    <h4 style="margin:6px 0">에이전트 (실시간)</h4>
-    <table><thead><tr><th>agent</th><th>state</th><th>$cost</th><th>calls</th><th>unit</th><th>최근 활동</th></tr></thead>
-      <tbody id="agentRows"></tbody></table>
-
-    <h4 style="margin:14px 0 6px">에이전트별 실시간 로그 (프롬프트·출력·결과)</h4>
-    <div id="agentLogs">(아직 활동 없음)</div>
+    <h4 style="margin:6px 0">에이전트 (카드 · 실시간 로그)</h4>
+    <div id="agentCards" class="cards"></div>
 
     <h4 style="margin:14px 0 6px">통합 로그 (이벤트)</h4>
-    <pre id="liveLog" style="max-height:30vh">(로그 대기 중…)</pre>
+    <pre id="liveLog" style="max-height:26vh">(로그 대기 중…)</pre>
 
     <h4 style="margin:14px 0 6px">산출물 (생성된 파일)</h4>
     <div id="artifacts" class="muted" style="font-size:12px">(아직 없음)</div>
@@ -511,6 +598,17 @@ function renderPicker(runs){
     ? runs.map(r=>'<div style="padding:7px 0;cursor:pointer;border-bottom:1px solid #21262d" onclick="selectRun(\''+r.id+'\')">'+(r.running?"🟢 ":"⚪️ ")+esc(r.id)+'</div>').join("")
     : "(실행 없음 — 새 실행을 시작하세요)";
 }
+async function stopRun(){
+  if(!CUR)return;
+  if(!confirm("이 run 을 정지할까요?"))return;
+  try{await fetch("/api/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({run:CUR})})}catch(e){}
+}
+async function rerunRun(){
+  if(!CUR)return;
+  let j={};
+  try{j=await (await fetch("/api/rerun",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({run:CUR})})).json()}catch(e){}
+  if(j.run_id){await refreshRuns();selectRun(j.run_id)}else if(j.error){alert("재실행 오류: "+j.error)}
+}
 
 function statusDot(s){return '<span class="dot'+(s==="running"?" run":"")+'"></span>'}
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
@@ -525,23 +623,17 @@ async function tick(){
     $("cost").textContent="$"+(b.total_cost_usd||0).toFixed(4);
     $("units").textContent=done+"/"+((b.units||[]).length);
     $("running").textContent=s.running?"running":"stopped";
-    // 에이전트 표 — 최근 활동(last_message)을 인라인으로 (클릭 불필요)
-    $("agentRows").innerHTML=(s.roles||[]).map(r=>{const a=ag[r]||{};
-      const act=(a.last_message||"").replace(/\s+/g," ").slice(0,90);
-      return '<tr><td>'+statusDot(a.status)+r+'</td><td>'+(a.status||"idle")+
-        '</td><td class="cost">$'+(+(a.cost_usd||0)).toFixed(4)+'</td><td>'+(a.calls||0)+
-        '</td><td>'+(a.current_unit||"-")+'</td><td class="muted" title="'+esc(a.last_message||"")+
-        '">'+esc(act)+'</td></tr>'}).join("");
-    // 에이전트별 실시간 로그 패널 (프롬프트·스트리밍 출력·결과, 클릭 불필요)
+    $("stopBtn").style.display=s.running?"":"none";
+    // 에이전트 카드 — 각 카드에 모델·비용·유닛 + 실시간 로그(프롬프트·스트리밍·결과)
     const logs=s.agent_logs||{};
-    const active=(s.roles||[]).filter(r=>logs[r]||((ag[r]||{}).calls));
-    $("agentLogs").innerHTML=active.length?active.map(r=>{const a=ag[r]||{};
-      return '<div style="margin-bottom:8px"><div class="muted" style="margin-bottom:2px">'+statusDot(a.status)+
-        '<b>'+r+'</b> '+(a.status||"idle")+' · $'+(+(a.cost_usd||0)).toFixed(4)+
-        (a.current_unit&&a.current_unit!=="global"?' · '+esc(a.current_unit):"")+
-        '</div><pre style="max-height:24vh">'+esc(logs[r]||"(대기 중)")+'</pre></div>'}).join("")
-      :"(아직 활동 없음)";
-    document.querySelectorAll("#agentLogs pre").forEach(p=>{p.scrollTop=p.scrollHeight});
+    $("agentCards").innerHTML=(s.roles||[]).map(r=>{const a=ag[r]||{};
+      const run=a.status==="running";
+      const meta=[(a.model||a.backend||"—"),"$"+(+(a.cost_usd||0)).toFixed(4),"calls "+(a.calls||0),
+        (a.current_unit&&a.current_unit!=="global")?("unit "+a.current_unit):null].filter(Boolean).join(" · ");
+      return '<div class="agent-card'+(run?" run":"")+'"><h5>'+statusDot(a.status)+esc(r)+
+        '<span class="badge">'+(a.status||"idle")+'</span></h5><div class="meta">'+esc(meta)+
+        '</div><pre>'+esc(logs[r]||"(대기 중)")+'</pre></div>'}).join("");
+    document.querySelectorAll("#agentCards pre").forEach(p=>{p.scrollTop=p.scrollHeight});
     // 통합 로그 — 자동 스크롤
     const log=$("liveLog");const atBottom=log.scrollTop+log.clientHeight>=log.scrollHeight-30;
     log.textContent=s.events||"(로그 대기 중…)";
