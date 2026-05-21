@@ -654,9 +654,10 @@ async function tick(){
     $("units").textContent=done+"/"+((b.units||[]).length);
     const runN=(s.roles||[]).filter(r=>(ag[r]||{}).status==="running").length;
     $("runCount").textContent=runN+"개";
-    $("running").textContent=s.running?"running":"stopped";
+    // 3-state: 실행중 / 완료(done) / 중단(stopped)
+    $("running").textContent=s.running?"running":(b.phase==="done"?"✅ done":"⏹ stopped");
     $("stopBtn").style.display=s.running?"":"none";       // 실행 중에만 정지
-    $("rerunBtn").style.display=s.running?"none":"";      // 정지 상태에서만 재실행
+    $("rerunBtn").style.display=s.running?"none":"";      // 정지/완료 상태에서만 재실행
     // 에이전트 카드 — 각 카드에 모델·비용·유닛 + 실시간 로그(프롬프트·스트리밍·결과)
     const logs=s.agent_logs||{};
     $("agentCards").innerHTML=(s.roles||[]).map(r=>{const a=ag[r]||{};
