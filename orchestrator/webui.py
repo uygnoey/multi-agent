@@ -540,6 +540,7 @@ INDEX_HTML = r"""<!doctype html>
       <div class="muted">phase <b id="phase">—</b></div>
       <div class="muted">cost <b class="cost" id="cost">$0</b></div>
       <div class="muted">units <b id="units">0/0</b></div>
+      <div class="muted">동시 실행 <b id="runCount">0</b></div>
       <div class="muted">상태 <span class="pill" id="running">—</span></div>
     </div>
 
@@ -641,6 +642,8 @@ async function tick(){
     $("phase").textContent=b.phase||"—";
     $("cost").textContent="$"+(b.total_cost_usd||0).toFixed(4);
     $("units").textContent=done+"/"+((b.units||[]).length);
+    const runN=(s.roles||[]).filter(r=>(ag[r]||{}).status==="running").length;
+    $("runCount").textContent=runN+"개";
     $("running").textContent=s.running?"running":"stopped";
     $("stopBtn").style.display=s.running?"":"none";
     // 에이전트 카드 — 각 카드에 모델·비용·유닛 + 실시간 로그(프롬프트·스트리밍·결과)
