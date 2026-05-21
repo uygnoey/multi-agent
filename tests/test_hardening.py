@@ -92,6 +92,65 @@ def test_wait_for_deps_keeps_waiting_while_progressing(tmp_path, sample_spec_pat
     assert asyncio.run(go()) is True
 
 
+def test_coerce_result_success_whitelist():
+    ok = RoleResult(ok=True)
+    for bad in ("fail", "failure", "error", "incomplete", "partial", "blocked"):
+        assert runner_mod._coerce_result({"status": bad}, ok)["_ok"] is False, bad
+    for good in ("done", "tested", "passed", "complete"):
+        assert runner_mod._coerce_result({"status": good}, ok)["_ok"] is True, good
+
+
+def test_normalize_role_handles_common_variants():
+    from orchestrator.config import normalize_role
+
+    assert normalize_role("backend developer") == "backend-developer"
+    assert normalize_role("backend_developer") == "backend-developer"
+    assert normalize_role("front end") == "frontend-developer"
+    assert normalize_role("database-admin") == "dba"
+    assert normalize_role("DevOps") == "cicd"
+
+
+def test_runconfig_clamps_numeric_options(tmp_path, sample_spec_path):
+    cfg = RunConfig(
+        spec_path=sample_spec_path,
+        project_dir=tmp_path / "p",
+        concurrency=-10,
+        max_attempts=0,
+        retries=-5,
+        max_units=0,
+    )
+    assert cfg.concurrency == 1 and cfg.max_attempts == 1 and cfg.retries == 0
+    assert cfg.max_units is None  # 0/음수 → 제한 없음
+    assert RunConfig(spec_path=sample_spec_path, project_dir=tmp_path / "q", max_units=-1).max_units is None
+
+
+def test_add_units_ignores_dict_and_none_deps_roles(tmp_path):
+    board = Board(tmp_path / "p")
+    asyncio.run(board.init("s", {}))
+    asyncio.run(board.add_units([{"id": "U1", "title": "a", "deps": {"x": 1}, "roles": None}]))
+    u = board.units()[0]
+    assert u["deps"] == []  # dict → 무시 (repr 문자열화 X)
+    assert u["roles"] == ["frontend-developer", "backend-developer", "dba"]  # None → 기본
+
+
+def test_test_unit_safe_marks_unit_failed_on_exception(tmp_path, sample_spec_path):
+    from orchestrator.board import FAILED
+
+    cfg = RunConfig(spec_path=sample_spec_path, project_dir=tmp_path / "p", mock=True)
+    sched = Scheduler(cfg)
+    asyncio.run(sched.board.init("s", {}))
+    asyncio.run(sched.board.add_units([{"id": "U1", "title": "a"}]))
+
+    async def boom(role, unit=None):
+        return None  # 비정상 반환 → _test_unit 내부에서 예외
+
+    sched.runner.run_role = boom
+    asyncio.run(sched._test_unit_safe({"id": "U1"}, asyncio.Semaphore(1)))
+    u = next(u for u in sched.board.units() if u["id"] == "U1")
+    assert u["status"] == FAILED  # 예외가 삼켜져 비종료로 남지 않고 실패 처리
+    assert any("U1" in w for w in sched.board.snapshot()["warnings"])
+
+
 def test_coerce_result_marks_failure_from_status_and_blockers():
     ok = RoleResult(ok=True)
     assert runner_mod._coerce_result({"status": "done"}, ok)["_ok"] is True

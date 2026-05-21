@@ -113,11 +113,18 @@ class Scheduler:
                 # dev 가 끝나면(dev_done) test/qa 는 별도 태스크로 즉시 실행하고,
                 # 개발 슬롯은 반납 → 개발은 곧바로 다음 unit 으로 진행한다.
                 if await self._develop_unit(unit, sem, 1):
-                    test_tasks.append(asyncio.create_task(self._test_unit(unit, sem, 1)))
+                    test_tasks.append(asyncio.create_task(self._test_unit_safe(unit, sem)))
 
             await asyncio.gather(*[pipeline(u) for u in unit_list])
             if test_tasks:  # 마지막 unit 들의 test/qa 완료 대기
                 await asyncio.gather(*test_tasks, return_exceptions=True)
+
+            # 비종료 상태로 남은 unit 정리 (태스크 비정상 종료로 testing/in_progress 멈춘 경우 등).
+            # done 으로 오탐하지 않도록 실패 처리 + 경고. (DESIGNED=미처리는 건드리지 않음)
+            for u in self.board.units():
+                if u["status"] in (IN_PROGRESS, DEV_DONE, TESTING):
+                    await self.board.set_status(u["id"], FAILED, "left non-terminal")
+                    await self.board.add_warning(f"{u['id']}: '{u['status']}' 상태로 비정상 종료")
 
             # Phase D — CI/CD
             await self.board.set_phase("cicd")
@@ -181,6 +188,14 @@ class Scheduler:
                 return False
             await self.board.set_status(uid, DEV_DONE)
             return True
+
+    async def _test_unit_safe(self, unit: dict, sem: asyncio.Semaphore) -> None:
+        """test/qa 파이프라인 래퍼 — 예외가 gather 에서 조용히 삼켜져 unit 이 비종료로 남지 않게."""
+        try:
+            await self._test_unit(unit, sem, 1)
+        except Exception as e:
+            await self.board.set_status(unit["id"], FAILED, f"test pipeline error: {e}")
+            await self.board.add_warning(f"{unit['id']}: test/qa 파이프라인 예외: {e}")
 
     async def _test_unit(self, unit: dict, sem: asyncio.Semaphore, attempt: int) -> None:
         """unit 개발 완료 직후 test-engineer → qa 를 실행 (개발 슬롯 비점유).

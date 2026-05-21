@@ -29,6 +29,15 @@ FAILED = "failed"
 TERMINAL_OK = (DONE, TESTED)
 
 
+def _norm_str_list(v) -> list[str]:
+    """deps/roles 입력 정규화: list→[str…], scalar→[str], dict/None/빈값→[] (이상값 방어)."""
+    if v in (None, "") or isinstance(v, dict):
+        return []
+    if isinstance(v, (list, tuple)):
+        return [str(x) for x in v]
+    return [str(v)]
+
+
 class Board:
     def __init__(self, project_dir: Path):
         self.project_dir = Path(project_dir)
@@ -78,16 +87,9 @@ class Board:
                 if not uid or uid in existing:
                     continue
                 existing.add(uid)
-                # 스칼라(문자열/숫자 등) deps/roles 도 안전하게 정규화
-                # ("U1" → ["U1"], 1 → ["1"]; 문자단위 분해나 TypeError 방지)
-                deps = u.get("deps") or []
-                deps = [str(d) for d in deps] if isinstance(deps, (list, tuple)) else [str(deps)]
-                roles_raw = u.get("roles") or []
-                roles_raw = (
-                    [str(r) for r in roles_raw]
-                    if isinstance(roles_raw, (list, tuple))
-                    else [str(roles_raw)]
-                )
+                # deps/roles 정규화: list→문자열들, scalar→[scalar], dict/None→[] (이상값 방어)
+                deps = _norm_str_list(u.get("deps"))
+                roles_raw = _norm_str_list(u.get("roles"))
                 self._data["units"].append(
                     {
                         "id": uid,
