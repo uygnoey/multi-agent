@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .config import normalize_role
+
 # unit 상태 머신
 TODO = "todo"
 DESIGNING = "designing"
@@ -79,7 +81,7 @@ class Board:
                         "description": u.get("description", ""),
                         "status": DESIGNED,
                         "deps": list(u.get("deps", [])),
-                        "roles": list(u.get("roles", []))
+                        "roles": [normalize_role(r) for r in u.get("roles", [])]
                         or ["frontend-developer", "backend-developer", "dba"],
                         "artifacts": [],
                         "test_status": None,

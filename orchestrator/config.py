@@ -47,6 +47,45 @@ SUPERVISOR_ROLES = ["project-manager", "project-leader"]
 DESIGN_ROLES = ["architecture-engineer", "testsheet-creator"]
 DEV_ROLES = ["frontend-developer", "backend-developer", "dba"]
 
+# 아키텍트가 unit.roles 에 단축명/변형을 써도 정식 역할명으로 매핑 (백엔드 무관 견고성).
+ROLE_NAME_ALIASES = {
+    "architect": "architecture-engineer",
+    "architecture": "architecture-engineer",
+    "frontend": "frontend-developer",
+    "front-end": "frontend-developer",
+    "fe": "frontend-developer",
+    "frontend-dev": "frontend-developer",
+    "backend": "backend-developer",
+    "back-end": "backend-developer",
+    "be": "backend-developer",
+    "backend-dev": "backend-developer",
+    "db": "dba",
+    "database": "dba",
+    "testsheet": "testsheet-creator",
+    "test-sheet": "testsheet-creator",
+    "test": "test-engineer",
+    "tester": "test-engineer",
+    "testing": "test-engineer",
+    "quality-assurance": "qa",
+    "pm": "project-manager",
+    "manager": "project-manager",
+    "pl": "project-leader",
+    "lead": "project-leader",
+    "tech-lead": "project-leader",
+    "ci": "cicd",
+    "cd": "cicd",
+    "ci-cd": "cicd",
+    "ci/cd": "cicd",
+}
+
+
+def normalize_role(name: str) -> str:
+    n = str(name).strip().lower()
+    if n in ROLES:
+        return n
+    return ROLE_NAME_ALIASES.get(n, n)
+
+
 # 페이즈별 세션 최대 턴 (안전장치)
 MAX_TURNS = {
     PHASE_SUPERVISOR: 8,
