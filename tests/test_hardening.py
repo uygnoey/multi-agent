@@ -56,6 +56,42 @@ def test_wait_for_deps_fast_fails_on_failed_dep(tmp_path, sample_spec_path):
     assert ok is False
 
 
+def test_wait_for_deps_stalls_only_without_progress(tmp_path, sample_spec_path):
+    from orchestrator.board import IN_PROGRESS
+
+    cfg = RunConfig(spec_path=sample_spec_path, project_dir=tmp_path / "p", mock=True)
+    sched = Scheduler(cfg)
+    asyncio.run(sched.board.init("spec", {}))
+    asyncio.run(sched.board.add_units([{"id": "U1", "title": "a"}, {"id": "U2", "title": "b"}]))
+    asyncio.run(sched.board.set_status("U1", IN_PROGRESS))
+    # 진행이 전혀 없으면 stall(=2s) 후 실패
+    ok = asyncio.run(sched._wait_for_deps({"id": "U2", "deps": ["U1"]}, timeout=2.0))
+    assert ok is False
+
+
+def test_wait_for_deps_keeps_waiting_while_progressing(tmp_path, sample_spec_path):
+    from orchestrator.board import DONE, IN_PROGRESS
+
+    cfg = RunConfig(spec_path=sample_spec_path, project_dir=tmp_path / "p", mock=True)
+    sched = Scheduler(cfg)
+    asyncio.run(sched.board.init("spec", {}))
+    asyncio.run(sched.board.add_units([{"id": "U1", "title": "a"}, {"id": "U2", "title": "b"}]))
+    asyncio.run(sched.board.set_status("U1", IN_PROGRESS))
+
+    async def go():
+        async def finish():
+            await asyncio.sleep(1.2)
+            await sched.board.set_status("U1", DONE)  # 진행 → 완료
+
+        t = asyncio.create_task(finish())
+        ok = await sched._wait_for_deps({"id": "U2", "deps": ["U1"]}, timeout=5.0)
+        await t
+        return ok
+
+    # dep 가 진행 중이면 stall(5s)에 걸리지 않고 완료를 기다려 True
+    assert asyncio.run(go()) is True
+
+
 def test_run_subprocess_streams_to_log(tmp_path):
     # 긴 호출 중에도 출력이 실시간으로 로그파일에 쌓이도록 tee 한다.
     lp = tmp_path / "live.log"

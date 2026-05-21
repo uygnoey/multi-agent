@@ -197,28 +197,46 @@ class Scheduler:
                 return
         await self.board.set_status(uid, FAILED, "QA failed after retries")
 
-    async def _wait_for_deps(self, unit: dict, timeout: float = 1800.0) -> bool:
+    async def _wait_for_deps(self, unit: dict, timeout: float | None = None) -> bool:
         """deps 가 모두 완료되면 True. 실패/blocked dep 이 있으면 즉시 False(패스트페일).
 
-        존재하지 않는 dep id 는 무시한다. 타임아웃 시 False.
+        존재하지 않는 dep id 는 무시한다. 타임아웃은 의존 unit 의 재작업(max_attempts)까지
+        고려해 넉넉히 잡는다(빠른 실패는 FAILED/BLOCKED 로만, 오래 걸린다고 막지 않음).
         """
         deps = unit.get("deps", [])
         if not deps:
             return True
         uid = unit["id"]
-        waited = 0.0
-        while waited < timeout:
-            status = {u["id"]: u["status"] for u in self.board.units()}
-            pending = [d for d in deps if d in status]  # 미지 dep 은 스킵
-            if any(status.get(d) in (FAILED, BLOCKED) for d in pending):
+        # 단순 시간초과가 아니라 '진행이 멈췄을 때'만 포기한다(stall). dep 가 아직 작업 중이면
+        # (상태가 바뀌거나 에이전트가 활동 중이면) 계속 기다린다 — 한 role 호출이 상태를 붙잡는
+        # 최대 시간(session_timeout)보다 넉넉한 윈도. timeout 인자를 주면 그 값을 stall 로 쓴다.
+        stall = timeout if timeout is not None else max(1800.0, self.cfg.session_timeout * 2)
+        prev_sig = None
+        idle = 0.0
+        while True:
+            units = {u["id"]: u for u in self.board.units()}
+            pending = [d for d in deps if d in units]  # 미지 dep 은 스킵
+            if any(units.get(d, {}).get("status") in (FAILED, BLOCKED) for d in pending):
                 await self.board.log_event(uid, f"deps failed/blocked → fast-fail: {pending}")
                 return False
-            if all(status.get(d) in TERMINAL_OK for d in pending):
+            if all(units.get(d, {}).get("status") in TERMINAL_OK for d in pending):
                 return True
+            # 진행 신호: dep 상태 + 에이전트 활동(updated_at). 변하면 작업이 살아있다는 뜻.
+            agents = self.board.agents()
+            sig = (
+                tuple(units.get(d, {}).get("status") for d in pending),
+                round(max((a.get("updated_at", 0.0) for a in agents.values()), default=0.0), 1),
+            )
+            if sig != prev_sig:
+                prev_sig, idle = sig, 0.0  # 진행 있음 → 리셋 (살아있으면 막지 않음)
+            else:
+                idle += 1.0
+                if idle >= stall:
+                    await self.board.log_event(
+                        uid, f"deps stalled {stall:.0f}s (no progress) → fail: {pending}"
+                    )
+                    return False
             await asyncio.sleep(1.0)
-            waited += 1.0
-        await self.board.log_event(uid, f"deps timeout after {timeout:.0f}s: {deps}")
-        return False
 
     async def _supervise(self, role: str) -> None:
         """PM/PL 상시 감독: 매 tick 마다 1-shot 리뷰 → 디렉티브 기록.

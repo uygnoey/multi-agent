@@ -47,10 +47,13 @@
 
 ```
 스캐폴딩 → 보드 초기화 → PM/PL 상시 감독(백그라운드)
-  → Phase A:  architect ‖ testsheet-creator           (병렬)
+  → Phase A:  architect ‖ testsheet-creator              (병렬)
   → Phase B:  frontend ‖ backend ‖ dba   (unit별 동시) → dev_done
-  → Phase C:  test-engineer → qa          (unit 완료 시 트리거) → tested/done
+              dev 끝나면 test/qa 는 별도 태스크로 즉시(개발 슬롯 반납 → 다음 unit 진행)
+  → Phase C:  test-engineer → qa   (QA 실패 시 max_attempts 내 재작업) → tested/done
   → Phase D:  cicd
+  → Phase E:  docs-writer — 산출물 문서(ERD·시퀀스·DB·API·매뉴얼·배포·실행·아키텍처, EN/KO)
+  → 감독(PM/PL) graceful 종료 후 done   (done = 모든 에이전트 종료 시점)
 ```
 
 ## 설치
@@ -135,8 +138,8 @@ python -m orchestrator --watch --project-dir /tmp/demo-web
 
 ## 웹 UI
 
-브라우저에서 **기획서 파일을 업로드해 실행**하고, TUI와 동일한 기능(에이전트 리스트 →
-클릭 상세(실시간 활동·비용) → 뒤로)을 본다. 의존성 0(stdlib `http.server`), 기본 `127.0.0.1`.
+브라우저에서 **기획서 파일을 업로드해 실행**하고, 클릭 없이 진행을 실시간으로 본다.
+의존성 0(stdlib `http.server`), 기본 `127.0.0.1`.
 
 ```bash
 python -m orchestrator --web --port 8765          # 또는: web-team-web --port 8765
@@ -144,12 +147,16 @@ python -m orchestrator --web --port 8765          # 또는: web-team-web --port 
 ```
 
 - **백엔드 상태 패널**: 각 백엔드 가용성(✅/❌)·설명을 실행 전에 확인 (`/api/check`)
-- **새 실행** 패널: 기획서(.md/.txt) 업로드 + 백엔드·우선순위·동시성·mock·delegate·max-units 설정 → ▶ 실행
-- **모니터**: phase·총비용·units, 에이전트 표(● 실행중/○ 대기·$비용·calls·unit) → 행 클릭 시 상세
-- **상세**: 그 에이전트의 실시간 활동 로그·비용·백엔드 → 뒤로 버튼으로 리스트 복귀
+- **새 실행** 패널: 기획서(.md/.txt) 업로드 + 백엔드(1개=단일 / 콤마로 여러 개=폴오버·분산·교차)·
+  동시성·mock·delegate·max-units → ▶ 실행
+- **run picker**: 자동선택 없이 사용자가 run 을 골라야 대시보드 표시
+- **대시보드(클릭 불필요)**: phase·비용(구독은 `est.`)·**토큰**·units·**동시 실행 수**·
+  상태(**running / done / stopped**)
+- **에이전트 카드**: 역할별 카드에 모델·비용·토큰·현재 unit + **실시간 로그(프롬프트·생각·응답 스트리밍)** 내장
+- **정지/재실행**: 실행 중 ■ 정지(프로세스 그룹 종료), **정지/완료 후에만** ↻ 재실행
 - 실행 결과물은 `--base-dir`(기본 `~/agent-runs`)/`<run-id>/` 에 생성됨
 - 같은 데이터(`board.json` + `agents/<role>.log`)를 읽으므로 TUI와 표시가 일치
-- ⚠️ 실 백엔드 선택 시 LLM 비용 발생 — 기본값은 `mock`. 외부 노출 시 인증/방화벽 직접 구성
+- ⚠️ 실 백엔드 선택 시 비용 발생(구독은 토큰 환산 `est.`) — 기본값은 `mock`. 외부 노출 시 인증/방화벽 직접 구성
 
 ## 산출물 위치 (타깃)
 
@@ -158,8 +165,9 @@ python -m orchestrator --web --port 8765          # 또는: web-team-web --port 
   CLAUDE.md  AGENTS.md          # 스캐폴딩된 공유 지침
   .claude/agents/*.md           # 노출된 팀 에이전트 (네이티브 서브에이전트)
   docs/design/  docs/test/      # 설계 / 테스트 시트
-  docs/RUN_GUIDE.md  RUN_GUIDE.ko.md        # 실행 가이드 (영문/한글)
-  docs/DELIVERABLES.md  DELIVERABLES.ko.md  # 개발 산출물 요약 (영문/한글)
+  docs/                          # 산출물 문서 — 각 영문(.md) + 한글(.ko.md):
+    index ERD SEQUENCE DB_TABLES API USER_MANUAL DEPLOY RUN_GUIDE ARCHITECTURE DELIVERABLES
+    # ERD/SEQUENCE/ARCHITECTURE 는 mermaid 다이어그램 포함 (사람이 보기 쉬움)
   backend/  frontend/  db/  tests/
   .github/workflows/ci.yml
   .orchestrator/                # 런 상태 (board.json, events.log, results/, directives.md, report.md)
