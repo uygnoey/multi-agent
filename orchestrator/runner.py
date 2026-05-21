@@ -278,7 +278,15 @@ def _coerce_result(data: dict, res) -> dict:
     (백엔드 호출이 성공했더라도) _ok=False 로 내린다. 그래야 스케줄러 판정이 제대로 잡힌다.
     """
     if not isinstance(data, dict):
-        data = {}
+        # [] / "done" / 숫자 같은 비-객체 JSON 은 계약 위반 → 성공으로 보지 않는다
+        return {
+            "status": "failed",
+            "artifacts": [],
+            "notes": [],
+            "blockers": ["result JSON is not an object (contract violation)"],
+            "units": [],
+            "_ok": False,
+        }
     status = str(data.get("status") or ("done" if res.ok else "failed")).strip().lower()
     # 빈/공백 blocker 슬롯은 무시 (LLM 이 빈 칸을 남겨도 불필요한 실패가 나지 않게)
     blockers = [s for b in _as_list(data.get("blockers")) if (s := str(b).strip())]

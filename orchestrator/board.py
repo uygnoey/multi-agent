@@ -8,11 +8,27 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
 
 from .config import normalize_role
+
+_UNSAFE_ID = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def _safe_unit_id(raw) -> str:
+    """unit id 를 경로/파일명/식별자에 안전한 문자만 남겨 정규화.
+
+    '/', '..', 공백, 특수문자를 '-' 로 치환 → result 파일/마이그레이션/생성코드에서 traversal 차단.
+    안전화 후 빈 문자열이면 "" (호출부에서 skip).
+    """
+    if raw in (None, ""):
+        return ""
+    s = _UNSAFE_ID.sub("-", str(raw).strip()).strip("-")
+    return s
+
 
 # unit 상태 머신
 TODO = "todo"
@@ -89,8 +105,8 @@ class Board:
         async with self._lock:
             existing = {u["id"] for u in self._data["units"]}
             for u in units:
-                raw_id = u.get("id")  # 숫자 ID 도 문자열로 통일
-                uid = str(raw_id).strip() if raw_id not in (None, "") else ""
+                # 숫자 ID 문자열화 + 경로/식별자 안전 문자만 (traversal·특수문자 차단)
+                uid = _safe_unit_id(u.get("id"))
                 if not uid or uid in existing:
                     continue
                 existing.add(uid)

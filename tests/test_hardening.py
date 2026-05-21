@@ -170,7 +170,10 @@ def test_runconfig_clamps_numeric_options(tmp_path, sample_spec_path):
     )
     assert cfg.concurrency == 1 and cfg.max_attempts == 1 and cfg.retries == 0
     assert cfg.max_units is None  # 0/음수 → 제한 없음
-    assert RunConfig(spec_path=sample_spec_path, project_dir=tmp_path / "q", max_units=-1).max_units is None
+    assert (
+        RunConfig(spec_path=sample_spec_path, project_dir=tmp_path / "q", max_units=-1).max_units
+        is None
+    )
 
 
 def test_add_units_ignores_dict_and_none_deps_roles(tmp_path):
@@ -276,7 +279,9 @@ def test_test_engineer_failure_fails_unit(tmp_path, sample_spec_path):
     # test-engineer 가 실패하면 QA 가 통과해도 unit 은 done/pass 가 되면 안 됨.
     from orchestrator.board import FAILED
 
-    cfg = RunConfig(spec_path=sample_spec_path, project_dir=tmp_path / "p", mock=True, max_attempts=1)
+    cfg = RunConfig(
+        spec_path=sample_spec_path, project_dir=tmp_path / "p", mock=True, max_attempts=1
+    )
     sched = Scheduler(cfg)
     asyncio.run(sched.board.init("spec", {}))
     asyncio.run(sched.board.add_units([{"id": "U1", "title": "a"}]))
@@ -302,7 +307,9 @@ def test_run_role_failover_on_backend_exception(tmp_path, sample_spec_path, monk
         async def run_role(self, req):
             raise RuntimeError("boom")
 
-    monkeypatch.setattr(runner_mod, "get_backend", lambda n: Boom() if n == "boom" else MockBackend())
+    monkeypatch.setattr(
+        runner_mod, "get_backend", lambda n: Boom() if n == "boom" else MockBackend()
+    )
     cfg = RunConfig(
         spec_path=sample_spec_path,
         project_dir=tmp_path / "p",

@@ -87,6 +87,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument("--port", type=int, default=8765, help="--web 포트 (기본 8765)")
     p.add_argument("--host", default="127.0.0.1", help="--web 바인드 호스트")
+    p.add_argument(
+        "--base-dir", type=Path, help="--web 실행 결과 베이스 디렉터리 (기본 ~/agent-runs)"
+    )
     return p.parse_args(argv)
 
 
@@ -173,7 +176,8 @@ def main(argv=None) -> int:
     if a.web:
         from .webui import serve
 
-        serve(a.port, a.project_dir, a.host)
+        # --web 은 --base-dir(우선) 또는 --project-dir 를 결과 베이스로 사용
+        serve(a.port, a.base_dir or a.project_dir, a.host)
         return 0
     if a.watch:
         if not a.project_dir:
