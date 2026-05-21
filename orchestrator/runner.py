@@ -87,11 +87,16 @@ class Runner:
             teammates=teammates,
         )
 
-        await self.board.log_event(
+        team = f" +team={[m['name'] for m in teammates]}" if teammates else ""
+        start_line = f"start [{backend_name}]" + (f" unit={key}" if unit else "") + team
+        await self.board.log_event(role, start_line)
+        await self.board.agent_update(
             role,
-            f"start [{backend_name}]"
-            + (f" unit={key}" if unit else "")
-            + (f" +team={[m['name'] for m in teammates]}" if teammates else ""),
+            status="running",
+            unit=key,
+            backend=backend_name,
+            call=True,
+            activity=("▶ " + (f"unit={key} " if unit else "") + f"[{backend_name}]{team}"),
         )
 
         res = await self._run_with_retries(backend, req, role, key)
@@ -103,6 +108,18 @@ class Runner:
         await self.board.log_event(
             role,
             f"done ok={res.ok}{cost}" + ("" if res.ok else f" err={res.error}"),
+        )
+        summary = (outcome.get("status") or "?") + (
+            f" · {len(outcome.get('artifacts', []))} files" if outcome.get("artifacts") else ""
+        )
+        await self.board.agent_update(
+            role,
+            status="idle",
+            cost_add=res.cost_usd,
+            message=res.final_message or (res.error or ""),
+            activity=f"✓ done ok={res.ok}{cost} → {summary}"
+            if res.ok
+            else f"✗ failed{cost}: {res.error}",
         )
         return outcome
 
