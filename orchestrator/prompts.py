@@ -71,6 +71,21 @@ def compose_prompt(
 
     parts.append("## Instruction\n" + _ROLE_INSTRUCTION.get(role, "Perform your role."))
 
+    if role == "qa":
+        parts.append(
+            "## Constraints (cost & environment)\n"
+            "- You MAY run the existing test suite to verify; "
+            "install test deps only if missing, once.\n"
+            "- Do NOT build production bundles or start long-running servers."
+        )
+    elif role not in ("project-manager", "project-leader"):
+        parts.append(
+            "## Constraints (cost & environment)\n"
+            "- Do NOT create virtualenvs, install dependencies (pip/npm install), build production "
+            "bundles, or start servers — CI handles install/build.\n"
+            "- Write and edit source files only; QA runs the tests."
+        )
+
     parts.append(
         "## Completion report (required)\n"
         f"When done, write your result as JSON to `{result_rel}`. Schema:\n"

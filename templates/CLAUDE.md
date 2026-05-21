@@ -31,5 +31,10 @@ Every role agent follows the conventions here. (Auto-loaded by Claude-family bac
 - Secrets via env vars/secrets only; no plaintext secrets.
 - Commit only runnable code. Record how to run/test in `notes`.
 
+## Cost & environment discipline
+- Do NOT create virtualenvs, install dependencies (pip/npm install), download packages, build
+  production bundles, or start long-running servers — CI handles install/build, and only QA runs tests.
+- Write and edit source files; keep output focused. Avoid redundant scaffolding.
+
 ## Spec excerpt
 {{SPEC_EXCERPT}}

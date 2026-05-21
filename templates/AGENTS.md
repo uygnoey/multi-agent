@@ -21,5 +21,9 @@ This file is auto-loaded by agents that read `AGENTS.md` (e.g. OpenAI Codex).
 ## Coding conventions
 - Small, clear changes; match existing style; secrets via env/secret store; runnable code only.
 
+## Cost & environment discipline
+- Do NOT create virtualenvs, install dependencies (pip/npm install), build production bundles, or
+  start servers — CI handles install/build, and only QA runs tests. Write/edit source; stay focused.
+
 ## Spec excerpt
 {{SPEC_EXCERPT}}
