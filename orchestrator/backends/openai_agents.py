@@ -62,9 +62,11 @@ class OpenAIAgentsBackend(Backend):
                 return f"<no dir: {path}>"
             return "\n".join(sorted(x.name + ("/" if x.is_dir() else "") for x in p.iterdir()))
 
+        bash_timeout = req.timeout if req.timeout else 120  # config 의 세션 타임아웃을 따른다
+
         @function_tool
         def run_bash(command: str) -> str:
-            """셸 명령 실행 (cwd=타깃, 120s). 주의: 셸 자체는 FS 경계를 강제하지 않는다."""
+            """셸 명령 실행 (cwd=타깃). 주의: 셸 자체는 FS 경계를 강제하지 않는다."""
             try:
                 r = subprocess.run(
                     command,
@@ -72,7 +74,7 @@ class OpenAIAgentsBackend(Backend):
                     cwd=str(root),
                     capture_output=True,
                     text=True,
-                    timeout=120,
+                    timeout=bash_timeout,
                 )
                 return (r.stdout + r.stderr)[:4000]
             except Exception as e:

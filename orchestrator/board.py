@@ -29,6 +29,11 @@ FAILED = "failed"
 TERMINAL_OK = (DONE, TESTED)
 
 
+def _md_cell(v) -> str:
+    """마크다운 표 셀 안전화: 파이프/개행이 표를 깨지 않게 이스케이프."""
+    return str(v).replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+
+
 def _norm_str_list(v) -> list[str]:
     """deps/roles 입력 정규화: list→[str…], scalar→[str], dict/None/빈값→[] (이상값 방어)."""
     if v in (None, "") or isinstance(v, dict):
@@ -80,13 +85,16 @@ class Board:
 
     # ---- mutations (single writer) ----
     async def add_units(self, units: list[dict]) -> None:
+        added = 0
         async with self._lock:
             existing = {u["id"] for u in self._data["units"]}
             for u in units:
-                uid = u.get("id")
+                raw_id = u.get("id")  # 숫자 ID 도 문자열로 통일
+                uid = str(raw_id).strip() if raw_id not in (None, "") else ""
                 if not uid or uid in existing:
                     continue
                 existing.add(uid)
+                added += 1
                 # deps/roles 정규화: list→문자열들, scalar→[scalar], dict/None→[] (이상값 방어)
                 deps = _norm_str_list(u.get("deps"))
                 roles_raw = _norm_str_list(u.get("roles"))
@@ -105,7 +113,9 @@ class Board:
                     }
                 )
             self._flush()
-        await self.log_event("board", f"added {len(units)} unit(s)")
+        skipped = len(units) - added
+        extra = f" ({skipped} skipped: dup/invalid id)" if skipped else ""
+        await self.log_event("board", f"added {added} unit(s){extra}")
 
     async def add_warning(self, msg: str) -> None:
         """치명적이지 않지만 최종 성공으로 오해되면 안 되는 실패(설계/CI/문서 등)를 기록."""
@@ -249,12 +259,19 @@ class Board:
         d = self._data
         units = d.get("units", [])
         done = sum(1 for u in units if u["status"] == "done")
+        failed = [u for u in units if u["status"] in (BLOCKED, FAILED)]
         warnings = d.get("warnings") or []
+        if failed:
+            result = f"❌ failed ({len(failed)} unit)"
+        elif warnings:
+            result = "⚠ done with warnings"
+        else:
+            result = "ok"
         lines = [
             "# Run Report",
             "",
             f"- phase: **{d.get('phase')}**",
-            f"- result: **{'⚠ done with warnings' if warnings else 'ok'}**",
+            f"- result: **{result}**",
             f"- units done: **{done}/{len(units)}**",
             f"- total cost: **${d.get('total_cost_usd', 0.0):.4f}**",
             f"- stack: {d.get('stack')}",
@@ -270,8 +287,9 @@ class Board:
         ]
         for u in units:
             lines.append(
-                f"| {u['id']} | {u['status']} | {u.get('test_status')} | "
-                f"{len(u.get('artifacts', []))} | {u.get('title', '')} |"
+                f"| {_md_cell(u['id'])} | {_md_cell(u['status'])} | "
+                f"{_md_cell(u.get('test_status'))} | "
+                f"{len(u.get('artifacts', []))} | {_md_cell(u.get('title', ''))} |"
             )
         report = self.orch_dir / "report.md"
         report.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -290,8 +308,9 @@ class Board:
             out = ["| " + " | ".join(headers) + " |", "|" + "|".join(["---"] * len(headers)) + "|"]
             for u in units:
                 out.append(
-                    f"| {u['id']} | {u['status']} | {u.get('test_status')} | "
-                    f"{len(u.get('artifacts', []))} | {u.get('title', '')} |"
+                    f"| {_md_cell(u['id'])} | {_md_cell(u['status'])} | "
+                    f"{_md_cell(u.get('test_status'))} | "
+                    f"{len(u.get('artifacts', []))} | {_md_cell(u.get('title', ''))} |"
                 )
             return out
 

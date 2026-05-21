@@ -61,3 +61,16 @@ def test_tui_stop_and_rerun_helpers(tmp_path):
     # rerun.json 있으면 launch 시도 (argv 파싱 성공 경로)
     ok2, _ = _rerun(orch)
     assert ok2 is True
+
+
+def test_rerun_refused_when_run_alive(tmp_path):
+    import os
+
+    from orchestrator.monitor import _rerun
+
+    orch = tmp_path / ".orchestrator"
+    orch.mkdir()
+    (orch / "rerun.json").write_text('{"argv":["--help"]}', encoding="utf-8")
+    (orch / "run.pid").write_text(str(os.getpid()), encoding="utf-8")  # 살아있는 run
+    ok, msg = _rerun(orch)
+    assert ok is False and "실행 중" in msg

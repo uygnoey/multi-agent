@@ -190,6 +190,11 @@ def main(argv=None) -> int:
     cfg = build_config(a)
     snap = asyncio.run(Scheduler(cfg).run())
     _print_summary(snap, cfg)
+    # 실패/blocked unit 또는 경고가 있으면 비정상 종료 코드 → CI/자동화가 실패를 인지
+    units = snap.get("units", [])
+    failed = [u for u in units if u.get("status") in ("failed", "blocked")]
+    if failed or snap.get("warnings"):
+        return 1
     return 0
 
 

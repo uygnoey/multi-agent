@@ -92,6 +92,35 @@ def test_wait_for_deps_keeps_waiting_while_progressing(tmp_path, sample_spec_pat
     assert asyncio.run(go()) is True
 
 
+def test_report_result_reflects_failed_units(tmp_path):
+    # failed/blocked unit 이 있으면 warning 이 없어도 report 가 'ok' 가 되면 안 됨.
+    from orchestrator.board import FAILED
+
+    board = Board(tmp_path / "p")
+    asyncio.run(board.init("s", {}))
+    asyncio.run(board.add_units([{"id": "U1", "title": "a"}]))
+    asyncio.run(board.set_status("U1", FAILED))
+    text = board.write_report().read_text(encoding="utf-8")
+    assert "failed" in text and "result: **ok**" not in text
+
+
+def test_add_units_coerces_numeric_id_and_counts(tmp_path):
+    board = Board(tmp_path / "p")
+    asyncio.run(board.init("s", {}))
+    asyncio.run(board.add_units([{"id": 1, "title": "a"}, {"id": "U1", "title": "b"}]))
+    ids = [u["id"] for u in board.units()]
+    assert ids == ["1", "U1"]  # 숫자 ID → 문자열
+
+
+def test_split_frontmatter_requires_exact_marker():
+    from orchestrator.agents import _split_frontmatter
+
+    fm, body = _split_frontmatter("---\nname: x\n---\nBODY")
+    assert "name: x" in fm and body == "BODY"
+    fm2, body2 = _split_frontmatter("----\nhr not frontmatter")  # ---- 은 frontmatter 아님
+    assert fm2 == "" and body2 == "----\nhr not frontmatter"
+
+
 def test_read_result_missing_file_fails_required_role(tmp_path):
     # dev/test/cicd/docs/architect 등은 결과 JSON 이 계약 — 안 쓰면 res.ok 라도 실패.
     rp = tmp_path / "missing.json"  # 존재하지 않음

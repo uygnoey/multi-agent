@@ -21,7 +21,8 @@ class AgentDef:
 
 
 def _split_frontmatter(text: str) -> tuple[str, str]:
-    if not text.startswith("---"):
+    # 첫 줄이 정확히 '---' 여야 frontmatter (----- 같은 구분선/수평선 오인 방지)
+    if text.split("\n", 1)[0].strip() != "---":
         return "", text
     end = text.find("\n---", 3)
     if end == -1:
