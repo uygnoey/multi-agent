@@ -92,6 +92,80 @@ def test_wait_for_deps_keeps_waiting_while_progressing(tmp_path, sample_spec_pat
     assert asyncio.run(go()) is True
 
 
+def test_wait_for_deps_handles_none_session_timeout(tmp_path, sample_spec_path):
+    # --timeout 0 → session_timeout=None. stall 계산에서 None*2 크래시하면 안 됨.
+    from orchestrator.board import DONE
+
+    cfg = RunConfig(
+        spec_path=sample_spec_path, project_dir=tmp_path / "p", mock=True, session_timeout=None
+    )
+    sched = Scheduler(cfg)
+    asyncio.run(sched.board.init("spec", {}))
+    asyncio.run(sched.board.add_units([{"id": "U1", "title": "a"}, {"id": "U2", "title": "b"}]))
+    asyncio.run(sched.board.set_status("U1", DONE))
+    assert asyncio.run(sched._wait_for_deps({"id": "U2", "deps": ["U1"]})) is True
+
+
+def test_test_engineer_failure_fails_unit(tmp_path, sample_spec_path):
+    # test-engineer 가 실패하면 QA 가 통과해도 unit 은 done/pass 가 되면 안 됨.
+    from orchestrator.board import FAILED
+
+    cfg = RunConfig(spec_path=sample_spec_path, project_dir=tmp_path / "p", mock=True, max_attempts=1)
+    sched = Scheduler(cfg)
+    asyncio.run(sched.board.init("spec", {}))
+    asyncio.run(sched.board.add_units([{"id": "U1", "title": "a"}]))
+
+    async def fake(role, unit=None):
+        ok = role != "test-engineer"
+        return {"_ok": ok, "status": "tested" if ok else "failed", "artifacts": []}
+
+    sched.runner.run_role = fake
+    asyncio.run(sched._test_unit({"id": "U1"}, asyncio.Semaphore(1), 1))
+    u = next(u for u in sched.board.units() if u["id"] == "U1")
+    assert u["status"] == FAILED and u["test_status"] == "fail"
+
+
+def test_run_role_failover_on_backend_exception(tmp_path, sample_spec_path, monkeypatch):
+    # 후보가 예외를 던져도 다음 후보로 폴오버해야 한다 (전체 role 실패 X).
+    from orchestrator.backends.mock import MockBackend
+
+    class Boom:
+        def available(self):
+            return (True, "ok")
+
+        async def run_role(self, req):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(runner_mod, "get_backend", lambda n: Boom() if n == "boom" else MockBackend())
+    cfg = RunConfig(
+        spec_path=sample_spec_path,
+        project_dir=tmp_path / "p",
+        backend_priority=["boom", "mock"],
+        retries=0,
+    )
+    board = Board(cfg.project_dir)
+    asyncio.run(board.init("s", {}))
+    out = asyncio.run(runner_mod.Runner(cfg, board).run_role("backend-developer", {"id": "U1"}))
+    assert out["_ok"] is True  # boom 예외 → mock 으로 폴오버 성공
+
+
+def test_concurrency_zero_does_not_hang(tmp_path, sample_spec_path):
+    # concurrency=0 이면 Semaphore(0) 로 영원히 멈출 수 있다 → 최소 1 로 클램프되어 완료돼야 함.
+    cfg = RunConfig(
+        spec_path=sample_spec_path.resolve(),
+        project_dir=tmp_path / "demo",
+        mock=True,
+        concurrency=0,
+        poll_interval=600.0,
+    )
+
+    async def go():
+        return await asyncio.wait_for(Scheduler(cfg).run(), timeout=30)
+
+    snap = asyncio.run(go())
+    assert snap["phase"] == "done"
+
+
 def test_run_subprocess_streams_to_log(tmp_path):
     # 긴 호출 중에도 출력이 실시간으로 로그파일에 쌓이도록 tee 한다.
     lp = tmp_path / "live.log"

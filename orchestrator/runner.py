@@ -132,7 +132,11 @@ class Runner:
                     f"PROMPT → [{name}]" + (f" unit={key}" if unit else ""),
                     "[SYSTEM]\n" + agent.system_prompt + "\n\n[TASK]\n" + prompt,
                 )
-                res = await self._run_with_retries(get_backend(name), req, role, key)
+                # 후보가 예외를 던져도 다음 후보로 폴오버 (전체 role 을 죽이지 않는다)
+                try:
+                    res = await self._run_with_retries(get_backend(name), req, role, key)
+                except Exception as e:
+                    res = RoleResult(ok=False, error=f"backend {name} raised: {e}")
                 # 상세 로그: 받은 결과 전문 (절단 없음). CLI 는 위에 원시 스트리밍도 기록됨
                 self.board.write_agent_block(
                     role,

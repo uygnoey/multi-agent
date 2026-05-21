@@ -97,7 +97,7 @@ class Scheduler:
                 "scheduler",
                 f"Phase B/C: {len(unit_list)} unit(s), concurrency={self.cfg.concurrency}",
             )
-            sem = asyncio.Semaphore(self.cfg.concurrency)
+            sem = asyncio.Semaphore(max(1, self.cfg.concurrency))  # 0/음수면 hang → 최소 1
             test_tasks: list[asyncio.Task] = []
 
             async def pipeline(unit: dict) -> None:
@@ -185,7 +185,13 @@ class Scheduler:
         qa = await self.runner.run_role("qa", unit)
         await self.board.add_artifacts(uid, qa.get("artifacts", []))
 
-        passed = qa.get("_ok", True) and qa.get("status") != "failed"
+        # test-engineer 와 qa 가 모두 성공해야 통과 (test 작성 실패도 미통과로 본다)
+        passed = (
+            te.get("_ok", True)
+            and qa.get("_ok", True)
+            and qa.get("status") != "failed"
+            and te.get("status") != "failed"
+        )
         await self.board.set_test_status(uid, "pass" if passed else "fail")
         if passed:
             await self.board.set_status(uid, DONE)
@@ -210,7 +216,8 @@ class Scheduler:
         # 단순 시간초과가 아니라 '진행이 멈췄을 때'만 포기한다(stall). dep 가 아직 작업 중이면
         # (상태가 바뀌거나 에이전트가 활동 중이면) 계속 기다린다 — 한 role 호출이 상태를 붙잡는
         # 최대 시간(session_timeout)보다 넉넉한 윈도. timeout 인자를 주면 그 값을 stall 로 쓴다.
-        stall = timeout if timeout is not None else max(1800.0, self.cfg.session_timeout * 2)
+        base_to = self.cfg.session_timeout or 1200.0  # --timeout 0 → None(무제한) 이어도 안전
+        stall = timeout if timeout is not None else max(1800.0, base_to * 2)
         prev_sig = None
         idle = 0.0
         while True:
