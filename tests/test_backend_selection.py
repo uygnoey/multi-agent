@@ -84,6 +84,18 @@ def test_cross_check_seeded_by_user_pick():
     assert cfg.backends_for("test-engineer")[0] == "codex"  # verify
 
 
+def test_cross_check_infers_pool_from_single_default_plus_role_pick():
+    # 웹 케이스: 단일 기본 claude-cli + QA만 codex + cross_check, --backends 미지정
+    # → 풀을 {claude-cli, codex}로 추론해 교차되어야 한다 (예전엔 풀이 1개라 교차 무시됨).
+    cfg = _cfg(default_backend="claude-cli", cross_check=True, role_priority={"qa": ["codex"]})
+    assert cfg.backends_for("qa")[0] == "codex"  # 명시
+    assert cfg.backends_for("test-engineer")[0] == "codex"  # verify → codex (QA 시드)
+    assert cfg.backends_for("project-leader")[0] == "codex"  # verify
+    assert cfg.backends_for("backend-developer")[0] == "claude-cli"  # build
+    assert cfg.backends_for("architecture-engineer")[0] == "claude-cli"  # build
+    assert cfg.backends_for("project-manager")[0] == "claude-cli"  # build
+
+
 def test_explicit_picks_always_win():
     # 유저가 각 역할을 다 골랐으면 cross_check 와 무관하게 그 선택을 따른다.
     cfg = _cfg(

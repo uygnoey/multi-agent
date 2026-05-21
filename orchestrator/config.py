@@ -172,10 +172,13 @@ class RunConfig:
         if role in self.role_backend:
             return [self.role_backend[role]]
         base = list(self.backend_priority) if self.backend_priority else [self.default_backend]
-        if self.cross_check and len(base) >= 2:
-            build_side, verify_side = self._cross_sides(base)
-            primary = build_side if CROSS_GROUPS.get(role, "build") == "build" else verify_side
-            return [primary, *[b for b in base if b != primary]]
+        if self.cross_check:
+            # 풀을 역할별 선택값까지 합쳐 추론 (예: 기본 claude + QA=codex → {claude, codex})
+            pool = self._cross_pool(base)
+            if len(pool) >= 2:
+                build_side, verify_side = self._cross_sides(pool)
+                primary = build_side if CROSS_GROUPS.get(role, "build") == "build" else verify_side
+                return [primary, *[b for b in pool if b != primary]]
         if self.distribute and len(base) > 1:
             try:
                 idx = list(ROLES).index(role) % len(base)
@@ -183,6 +186,18 @@ class RunConfig:
                 idx = 0
             base = base[idx:] + base[:idx]
         return base
+
+    def _cross_pool(self, base: list[str]) -> list[str]:
+        """교차 배치용 백엔드 풀 = base + 역할별 명시 선택값(중복 제거, 순서 유지).
+
+        단일 백엔드 + 일부 역할만 지정한 경우에도 교차가 성립하도록 풀을 넓힌다.
+        """
+        pool = list(base)
+        for picks in self.role_priority.values():
+            for p in picks:
+                if p not in pool:
+                    pool.append(p)
+        return pool
 
     def _cross_sides(self, base: list[str]) -> tuple[str, str]:
         """교차 배치의 build/verify 측 프로바이더를 결정.
