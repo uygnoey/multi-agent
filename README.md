@@ -157,6 +157,8 @@ python -m orchestrator --web --port 8765          # 또는: web-team-web --port 
   CLAUDE.md  AGENTS.md          # 스캐폴딩된 공유 지침
   .claude/agents/*.md           # 노출된 팀 에이전트 (네이티브 서브에이전트)
   docs/design/  docs/test/      # 설계 / 테스트 시트
+  docs/RUN_GUIDE.md  RUN_GUIDE.ko.md        # 실행 가이드 (영문/한글)
+  docs/DELIVERABLES.md  DELIVERABLES.ko.md  # 개발 산출물 요약 (영문/한글)
   backend/  frontend/  db/  tests/
   .github/workflows/ci.yml
   .orchestrator/                # 런 상태 (board.json, events.log, results/, directives.md, report.md)

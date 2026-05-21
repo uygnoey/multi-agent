@@ -111,6 +111,14 @@ class Scheduler:
             cicd_out = await self.runner.run_role("cicd")
             await self.board.add_global_artifacts(cicd_out.get("artifacts", []))
 
+            # Phase E — 문서화: 실행 가이드(EN/KO) + 개발 산출물(EN/KO)
+            await self.board.set_phase("docs")
+            await self.board.log_event("scheduler", "Phase E: docs (EN/KO)")
+            docs_out = await self.runner.run_role("docs-writer")
+            await self.board.add_global_artifacts(docs_out.get("artifacts", []))
+            # 보드 기반 산출물 문서는 백엔드와 무관하게 항상 EN/KO 생성
+            await self.board.add_global_artifacts(self.board.write_deliverables())
+
             # 모든 작업 완료 → 감독(PM/PL)을 graceful 종료(현재 tick 끝까지 대기, 취소 X).
             # 감독이 다 멈춘 뒤에야 done — done 시점엔 어떤 에이전트도 돌고 있지 않다.
             await self.board.set_phase("finishing")

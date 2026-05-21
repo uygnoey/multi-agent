@@ -16,6 +16,7 @@ PHASE_DESIGN = "design"
 PHASE_DEV = "dev"
 PHASE_TEST = "test"
 PHASE_CICD = "cicd"
+PHASE_DOCS = "docs"
 
 DEV_TOOLS = ("Read", "Write", "Edit", "Bash")
 RO_TOOLS = ("Read", "Bash")
@@ -40,6 +41,7 @@ ROLES: dict[str, RoleSpec] = {
     "test-engineer": RoleSpec("test-engineer", PHASE_TEST, DEV_TOOLS),
     "qa": RoleSpec("qa", PHASE_TEST, DEV_TOOLS),
     "cicd": RoleSpec("cicd", PHASE_CICD, DEV_TOOLS),
+    "docs-writer": RoleSpec("docs-writer", PHASE_DOCS, DEV_TOOLS),
 }
 
 SUPERVISOR_ROLES = ["project-manager", "project-leader"]
@@ -93,6 +95,7 @@ MAX_TURNS = {
     PHASE_DEV: 40,
     PHASE_TEST: 25,
     PHASE_CICD: 20,
+    PHASE_DOCS: 20,
 }
 
 DEFAULT_BACKEND = "mock"

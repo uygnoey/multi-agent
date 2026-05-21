@@ -23,6 +23,10 @@ _ROLE_INSTRUCTION = {
     "test-engineer": "Write automated tests for this unit under tests/.",
     "qa": "Run this unit's tests and verify results. Report pass/fail with evidence.",
     "cicd": "Set up the build/test/deploy pipeline (.github/workflows/).",
+    "docs-writer": (
+        "Write the bilingual run guide from the actual code: docs/RUN_GUIDE.md (English) and "
+        "docs/RUN_GUIDE.ko.md (Korean) — prerequisites, install, DB init, run, tests."
+    ),
     "project-manager": (
         "Review the current board and recent events, then write a short, actionable directive "
         "on progress, risk, and priorities."
