@@ -8,7 +8,14 @@ import sys
 from pathlib import Path
 
 from .backends import ALIASES, backend_status, resolve
-from .config import BACKEND_INFO, DEFAULT_BACKEND, ROLES, VALID_BACKENDS, RunConfig
+from .config import (
+    BACKEND_INFO,
+    DEFAULT_BACKEND,
+    ROLES,
+    VALID_BACKENDS,
+    RunConfig,
+    normalize_role,
+)
 from .scheduler import Scheduler
 
 
@@ -60,6 +67,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument("--max-attempts", type=int, default=2, help="unit별 dev→test→qa 재작업 횟수")
     p.add_argument("--retries", type=int, default=1, help="역할 호출 전이성 실패 재시도 횟수")
+    p.add_argument(
+        "--timeout",
+        type=float,
+        default=1200.0,
+        help="역할 호출 1회 최대 시간(초). 0=무제한 (기본 1200)",
+    )
     p.add_argument("--mock", action="store_true", help="무비용 mock 백엔드로 전체 실행")
     p.add_argument("--check", action="store_true", help="백엔드 가용성 진단 후 종료")
     p.add_argument(
@@ -103,9 +116,16 @@ def build_config(a: argparse.Namespace) -> RunConfig:
         if "=" not in item:
             raise SystemExit(f"--role-backend 형식 오류: {item} (ROLE=B1[,B2,...])")
         role, backends = item.split("=", 1)
+        role = normalize_role(role)
         if role not in ROLES:
             raise SystemExit(f"알 수 없는 역할: {role} (가능: {', '.join(ROLES)})")
         role_priority[role] = _parse_backend_list(backends)
+    if a.cross_check and not a.mock and len(backend_priority) < 2:
+        print(
+            "⚠️  --cross-check 는 백엔드가 2개 이상이어야 동작합니다 "
+            "(--backends 로 2종 이상 지정). 지금은 교차 배치가 적용되지 않습니다.",
+            file=sys.stderr,
+        )
     return RunConfig(
         spec_path=a.spec.resolve(),
         project_dir=a.project_dir.resolve(),
@@ -123,6 +143,7 @@ def build_config(a: argparse.Namespace) -> RunConfig:
         delegate=a.delegate,
         max_attempts=a.max_attempts,
         retries=a.retries,
+        session_timeout=(a.timeout if a.timeout and a.timeout > 0 else None),
     )
 
 

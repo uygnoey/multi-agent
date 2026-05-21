@@ -26,6 +26,9 @@ from .backends import backend_status, resolve
 from .config import BACKEND_INFO, FRAMEWORK_ROOT, ROLES, VALID_BACKENDS
 from .monitor import _read_agent_log, _read_board
 
+MAX_BODY_BYTES = 4 * 1024 * 1024  # 요청 바디 상한 (메모리 고갈 방지)
+MAX_SPEC_BYTES = 1024 * 1024  # 기획서 텍스트 상한
+
 
 def slugify(name: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9_-]+", "-", (name or "").strip()).strip("-").lower()
@@ -94,11 +97,18 @@ class RunManager:
 
     @staticmethod
     def _default_spawn(cmd: list[str], log_path: Path):
-        f = open(log_path, "w", encoding="utf-8")  # noqa: SIM115 (lifetime = process)
-        return subprocess.Popen(cmd, cwd=str(FRAMEWORK_ROOT), stdout=f, stderr=subprocess.STDOUT)
+        f = open(log_path, "w", encoding="utf-8")  # noqa: SIM115 (closed on reap)
+        proc = subprocess.Popen(cmd, cwd=str(FRAMEWORK_ROOT), stdout=f, stderr=subprocess.STDOUT)
+        proc._logfile = f  # is_running 에서 reap 시 close
+        return proc
 
     def project_dir(self, run_id: str) -> Path:
-        return self.base_dir / run_id
+        """run_id 를 base_dir 안으로 한정 (경로 traversal 차단)."""
+        base = self.base_dir.resolve()
+        p = (base / str(run_id)).resolve()
+        if p != base and base not in p.parents:
+            raise ValueError(f"invalid run id: {run_id!r}")
+        return p
 
     def start(self, spec_text: str, opts: dict) -> str:
         run_id = new_run_id(opts.get("name", "run"))
@@ -115,7 +125,23 @@ class RunManager:
     def is_running(self, run_id: str) -> bool:
         with self._lock:
             proc = self._procs.get(run_id)
-        return bool(proc is not None and getattr(proc, "poll", lambda: 0)() is None)
+        if proc is None:
+            return False
+        if getattr(proc, "poll", lambda: 0)() is None:
+            return True
+        # 종료됨 → 좀비 reap + 로그 핸들 close
+        try:
+            if hasattr(proc, "wait"):
+                proc.wait()
+        except Exception:
+            pass
+        fh = getattr(proc, "_logfile", None)
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
+        return False
 
 
 # ----------------- HTTP -----------------
@@ -152,19 +178,30 @@ def _make_handler(manager: RunManager):
                 self._json({"backends": rows, "roles": list(ROLES)})
             elif u.path == "/api/state":
                 run = (q.get("run") or [""])[0]
-                board = _read_board(manager.project_dir(run) / ".orchestrator") if run else {}
+                try:
+                    board = _read_board(manager.project_dir(run) / ".orchestrator") if run else {}
+                except ValueError:
+                    self._json({"error": "invalid run id"}, 400)
+                    return
                 self._json(
                     {"roles": list(ROLES), "board": board, "running": manager.is_running(run)}
                 )
             elif u.path == "/api/agent":
                 run = (q.get("run") or [""])[0]
                 role = (q.get("role") or [""])[0]
-                orch = manager.project_dir(run) / ".orchestrator"
+                if role and role not in ROLES:  # 경로 traversal/임의 파일 읽기 차단
+                    self._json({"error": "invalid role"}, 400)
+                    return
+                try:
+                    orch = manager.project_dir(run) / ".orchestrator"
+                except ValueError:
+                    self._json({"error": "invalid run id"}, 400)
+                    return
                 board = _read_board(orch)
                 self._json(
                     {
                         "agent": board.get("agents", {}).get(role, {}),
-                        "log": _read_agent_log(orch, role),
+                        "log": _read_agent_log(orch, role) if role else "",
                     }
                 )
             else:
@@ -176,10 +213,16 @@ def _make_handler(manager: RunManager):
                 self._json({"error": "not found"}, 404)
                 return
             length = int(self.headers.get("Content-Length", 0) or 0)
+            if length > MAX_BODY_BYTES:
+                self._json({"error": f"body too large (> {MAX_BODY_BYTES} bytes)"}, 413)
+                return
             try:
                 data = json.loads(self.rfile.read(length) or b"{}")
             except Exception:
                 self._json({"error": "invalid json"}, 400)
+                return
+            if len(data.get("spec_text", "") or "") > MAX_SPEC_BYTES:
+                self._json({"error": f"spec too large (> {MAX_SPEC_BYTES} chars)"}, 413)
                 return
             backend = data.get("backend", "mock")
             if backend not in VALID_BACKENDS:

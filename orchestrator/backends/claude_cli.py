@@ -6,11 +6,10 @@ ANTHROPIC_API_KEY 미설정 시 로그인된 구독을 사용한다. cwd 의 CLA
 
 from __future__ import annotations
 
-import asyncio
 import json
 import shutil
 
-from .base import Backend, RoleRequest, RoleResult
+from .base import Backend, RoleRequest, RoleResult, run_subprocess
 
 
 class ClaudeCLIBackend(Backend):
@@ -38,20 +37,14 @@ class ClaudeCLIBackend(Backend):
         if req.model:
             cmd += ["--model", req.model]
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=str(req.cwd),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            out, err = await proc.communicate()
+            rc, out, err, timed_out = await run_subprocess(cmd, str(req.cwd), req.timeout)
         except Exception as e:
             return RoleResult(ok=False, error=str(e))
 
-        if proc.returncode != 0:
-            return RoleResult(
-                ok=False, error=err.decode(errors="replace")[:500] or f"exit {proc.returncode}"
-            )
+        if timed_out:
+            return RoleResult(ok=False, error=f"claude-cli timed out after {req.timeout}s")
+        if rc != 0:
+            return RoleResult(ok=False, error=err.decode(errors="replace")[:500] or f"exit {rc}")
 
         text = out.decode(errors="replace")
         final, cost = text, None

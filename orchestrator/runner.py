@@ -11,7 +11,7 @@ import json
 
 from .agents import load_agent
 from .backends import get_backend
-from .backends.base import RoleRequest
+from .backends.base import RoleRequest, RoleResult
 from .board import Board
 from .config import (
     DELEGATES,
@@ -31,8 +31,15 @@ class Runner:
 
     def _candidates(self, role: str) -> list[str]:
         """우선순위 순서의 백엔드 후보. 가용한 것만 남기되, 없으면 첫 후보로 명확히 실패시킨다."""
-        cands = self.cfg.backends_for(role)
-        avail = [c for c in cands if get_backend(c).available()[0]]
+        cands = self.cfg.backends_for(role) or [self.cfg.default_backend or "mock"]
+
+        def _ok(name: str) -> bool:
+            try:
+                return bool(get_backend(name).available()[0])
+            except Exception:
+                return False
+
+        avail = [c for c in cands if _ok(c)]
         return avail or cands[:1]
 
     def _build_teammates(self, role: str) -> list[dict]:
@@ -70,6 +77,7 @@ class Runner:
             result_path=result_path,
             result_rel=result_rel,
             spec_text=self.board.spec_text,
+            timeout=self.cfg.session_timeout,
             delegate=delegate,
             teammates=teammates,
         )
@@ -92,40 +100,51 @@ class Runner:
         )
 
         candidates = self._candidates(role)
-        res = None
+        res: RoleResult | None = None
         chosen = candidates[0]
-        for i, name in enumerate(candidates):
-            chosen = name
-            req = self._build_req(role, spec, unit, agent, prompt, result_path, result_rel, name)
-            team = f" +team={[m['name'] for m in req.teammates]}" if req.teammates else ""
-            fo = f" (failover {i + 1}/{len(candidates)})" if i else ""
-            await self.board.log_event(
-                role, f"start [{name}]" + (f" unit={key}" if unit else "") + team + fo
-            )
-            await self.board.agent_update(
-                role,
-                status="running",
-                unit=key,
-                backend=name,
-                call=True,
-                activity="▶ " + (f"unit={key} " if unit else "") + f"[{name}]{team}{fo}",
-            )
-            if result_path.exists():
-                result_path.unlink()  # 후보마다 직전 결과 제거 → 신선도 보장
+        role_cost = 0.0
+        try:
+            for i, name in enumerate(candidates):
+                chosen = name
+                req = self._build_req(
+                    role, spec, unit, agent, prompt, result_path, result_rel, name
+                )
+                team = f" +team={[m['name'] for m in req.teammates]}" if req.teammates else ""
+                fo = f" (failover {i + 1}/{len(candidates)})" if i else ""
+                await self.board.log_event(
+                    role, f"start [{name}]" + (f" unit={key}" if unit else "") + team + fo
+                )
+                await self.board.agent_update(
+                    role,
+                    status="running",
+                    unit=key,
+                    backend=name,
+                    call=True,
+                    activity="▶ " + (f"unit={key} " if unit else "") + f"[{name}]{team}{fo}",
+                )
+                if result_path.exists():
+                    result_path.unlink()  # 후보마다 직전 결과 제거 → 신선도 보장
 
-            res = await self._run_with_retries(get_backend(name), req, role, key)
-            if res.cost_usd:
-                await self.board.add_cost(res.cost_usd)
-                await self.board.agent_update(role, cost_add=res.cost_usd)
-            if res.ok:
-                break
-            if i < len(candidates) - 1:
-                nxt = candidates[i + 1]
-                await self.board.log_event(role, f"failover [{name}]→[{nxt}]: {res.error}")
-                await self.board.agent_update(role, activity=f"↪ failover [{name}]→[{nxt}]")
+                res = await self._run_with_retries(get_backend(name), req, role, key)
+                if res.cost_usd:
+                    role_cost += res.cost_usd
+                    await self.board.add_cost(res.cost_usd)
+                    await self.board.agent_update(role, cost_add=res.cost_usd)
+                if res.ok:
+                    break
+                if i < len(candidates) - 1:
+                    nxt = candidates[i + 1]
+                    await self.board.log_event(role, f"failover [{name}]→[{nxt}]: {res.error}")
+                    await self.board.agent_update(role, activity=f"↪ failover [{name}]→[{nxt}]")
+        except Exception as e:  # 예기치 못한 오류라도 절대 전파 금지 (gather 형제 취소 방지)
+            res = RoleResult(ok=False, error=f"runner error: {e}")
+            await self.board.log_event(role, f"error [{chosen}]: {e}")
+
+        if res is None:
+            res = RoleResult(ok=False, error="no backend candidate")
 
         outcome = self._read_result(result_path, res)
-        cost = f" ${res.cost_usd:.4f}" if res and res.cost_usd else ""
+        cost = f" ${role_cost:.4f}" if role_cost else ""
         await self.board.log_event(
             role,
             f"done [{chosen}] ok={res.ok}{cost}" + ("" if res.ok else f" err={res.error}"),
@@ -162,7 +181,9 @@ class Runner:
 
     @staticmethod
     def _read_result(result_path, res) -> dict:
-        if result_path.exists():
+        # 백엔드 호출이 성공한 경우에만 결과파일을 신뢰한다. 실패 시 남아있는
+        # 부분/이전 결과파일을 성공으로 오탐하지 않도록 합성 실패 결과를 쓴다.
+        if res.ok and result_path.exists():
             try:
                 data = json.loads(result_path.read_text(encoding="utf-8"))
                 return _coerce_result(data, res)
