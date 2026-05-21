@@ -8,8 +8,10 @@ CI/CD → graceful shutdown.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
+import sys
 
 from . import workspace
 from .board import (
@@ -45,6 +47,13 @@ class Scheduler:
         pid_file = self.board.orch_dir / "run.pid"
         try:
             pid_file.write_text(str(os.getpid()), encoding="utf-8")
+        except Exception:
+            pass
+        # 재실행(rerun)용 커맨드 저장 (웹/CLI/TUI 어디서 띄웠든 동일하게 재실행 가능)
+        try:
+            (self.board.orch_dir / "rerun.json").write_text(
+                json.dumps({"argv": sys.argv[1:]}), encoding="utf-8"
+            )
         except Exception:
             pass
 
