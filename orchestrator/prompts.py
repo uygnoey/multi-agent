@@ -24,8 +24,11 @@ _ROLE_INSTRUCTION = {
     "qa": "Run this unit's tests and verify results. Report pass/fail with evidence.",
     "cicd": "Set up the build/test/deploy pipeline (.github/workflows/).",
     "docs-writer": (
-        "Write the bilingual run guide from the actual code: docs/RUN_GUIDE.md (English) and "
-        "docs/RUN_GUIDE.ko.md (Korean) — prerequisites, install, DB init, run, tests."
+        "From the ACTUAL code/design, write the full human-readable deliverable set in EN and KO "
+        "(docs/<NAME>.md + <NAME>.ko.md): index, ERD (mermaid erDiagram), SEQUENCE (mermaid "
+        "sequenceDiagram), DB_TABLES (테이블 정의서), API (API 정의서), USER_MANUAL (사용자 매뉴얼), "
+        "DEPLOY (배포 가이드), RUN_GUIDE (실행 가이드), ARCHITECTURE. Use mermaid diagrams and tables; "
+        "match real tables/endpoints/commands — no filler."
     ),
     "project-manager": (
         "Review the current board and recent events, then write a short, actionable directive "
