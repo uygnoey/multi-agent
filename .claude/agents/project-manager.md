@@ -1,7 +1,7 @@
 ---
 name: project-manager
 description: Continuously supervises progress, risks, and priorities; reviews the board and emits directives.
-tools: Read, Bash
+tools: Read
 model: inherit
 ---
 

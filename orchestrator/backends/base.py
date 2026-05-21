@@ -60,27 +60,55 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None):
                 except Exception:
                     pass
 
-    try:
-        await asyncio.wait_for(
-            asyncio.gather(
-                _pump(proc.stdout, out_chunks, line_render),
-                _pump(proc.stderr, err_chunks, None),
-            ),
-            timeout=timeout,
+    async def _drain_and_wait():
+        # #21: stdout/stderr pump 와 proc.wait() 를 한 타임아웃 창 안에 함께 넣는다.
+        # 그래야 stdout/stderr 를 닫고도 계속 실행되는 프로세스가 타임아웃을 우회하지 못한다.
+        await asyncio.gather(
+            _pump(proc.stdout, out_chunks, line_render),
+            _pump(proc.stderr, err_chunks, None),
         )
         await proc.wait()
+
+    try:
+        await asyncio.wait_for(_drain_and_wait(), timeout=timeout)
         return proc.returncode, b"".join(out_chunks), b"".join(err_chunks), False
     except asyncio.TimeoutError:
-        # 프로세스 그룹째 종료 (CLI 가 spawn 한 자식 — node/codex 등 — 이 살아남지 않도록)
+        # #17: 즉시 SIGKILL 대신 SIGTERM 으로 정리(락/임시파일 등) 유예를 준 뒤 SIGKILL.
+        # 프로세스 그룹째 종료한다 (CLI 가 spawn 한 자식 — node/codex 등 — 이 살아남지 않도록).
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            pgid = os.getpgid(proc.pid)
+        except Exception:
+            pgid = None
+        # 1) SIGTERM (graceful) — 그룹 우선, 실패 시 단일 프로세스
+        try:
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                proc.terminate()
         except Exception:
             try:
-                proc.kill()
+                proc.terminate()
             except Exception:
                 pass
+        # 2) 최대 ~3초까지 자발적 종료 대기
         try:
-            await proc.wait()
+            await asyncio.wait_for(proc.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            # 3) 아직 살아있으면 SIGKILL 로 강제 종료
+            try:
+                if pgid is not None:
+                    os.killpg(pgid, signal.SIGKILL)
+                else:
+                    proc.kill()
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            try:
+                await proc.wait()
+            except Exception:
+                pass
         except Exception:
             pass
         return None, b"".join(out_chunks), b"".join(err_chunks), True

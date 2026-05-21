@@ -13,8 +13,12 @@ This file is auto-loaded by agents that read `AGENTS.md` (e.g. OpenAI Codex).
 
 ## Result-file coordination protocol (important)
 - Edit only files inside cwd. Never access paths outside it.
-- When done, write a result JSON to the assigned `.orchestrator/results/<role>__<unit>.json`:
-  `{"status","artifacts":[],"notes":[],"blockers":[],"units":[]}`.
+- When done, write a result JSON to the assigned `.orchestrator/results/<role>__<key>.json`.
+  The key is the unit id for unit-scoped roles, or the literal `global` for non-unit roles
+  (architect/testsheet/cicd/docs-writer). Supervisors (project-manager/project-leader) write no
+  result file. Use a valid JSON object, e.g.:
+  `{"status":"done","artifacts":[],"notes":[],"blockers":[],"units":[]}`.
+  Allowed status values: `done`, `passed`, `success`, `completed` (success); `failed`/`blocked` (failure).
 - The board (`.orchestrator/board.json`) is written only by the orchestrator.
 - Do not touch other work units' files. Report shared needs via `blockers`.
 

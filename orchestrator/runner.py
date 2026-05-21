@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 
 from .agents import load_agent
 from .backends import get_backend
@@ -65,6 +66,9 @@ class Runner:
         teammates = self._build_teammates(role) if delegate else []
         if delegate and DELEGATION_TOOL not in allowed_tools:
             allowed_tools = [*allowed_tools, DELEGATION_TOOL]
+        # cfg 모델 미지정 시 frontmatter 의 per-agent model 을 fallback 으로 사용 (#93/#94).
+        # agent.model 은 load_agent 에서 이미 'inherit'→None 정규화됨.
+        model = self.cfg.model_for(backend_name) or agent.model
         return RoleRequest(
             role=role,
             phase=spec.phase,
@@ -73,7 +77,7 @@ class Runner:
             prompt=prompt,
             cwd=self.board.project_dir,
             allowed_tools=allowed_tools,
-            model=self.cfg.model_for(backend_name),
+            model=model,
             max_turns=MAX_TURNS.get(spec.phase, 20),
             budget=self.cfg.budget,
             result_path=result_path,
@@ -91,6 +95,25 @@ class Runner:
         key = unit["id"] if unit else "global"
         result_rel = f".orchestrator/results/{role}__{key}.json"
         result_path = self.board.project_dir / result_rel
+
+        # 누적 예산 enforcement: 백엔드 무관하게 runner 에서 강제 (#112). 보드 누적 비용이 이미
+        # 예산 이상이면 백엔드를 호출하지 않고 blocked 반환 → --budget 가 모든 백엔드에 의미.
+        if self.cfg.budget is not None:
+            total = self.board.snapshot().get("total_cost_usd", 0.0) or 0.0
+            if total >= self.cfg.budget:
+                blocker = f"budget exceeded: spent ${total:.4f} >= budget ${self.cfg.budget:.4f}"
+                await self.board.log_event(role, f"skip [budget] {blocker}")
+                await self.board.agent_update(
+                    role, status="idle", activity=f"⏸ skipped (budget) {key if unit else ''}"
+                )
+                return {
+                    "status": "blocked",
+                    "artifacts": [],
+                    "notes": [],
+                    "blockers": [blocker],
+                    "units": [],
+                    "_ok": False,
+                }
 
         prompt = compose_prompt(
             role=role,
@@ -127,8 +150,8 @@ class Runner:
                     call=True,
                     activity="▶ " + (f"unit={key} " if unit else "") + f"[{name}]{team}{fo}",
                 )
-                if result_path.exists():
-                    result_path.unlink()  # 후보마다 직전 결과 제거 → 신선도 보장
+                if result_path.exists() and _under_results_dir(result_path, self.board):
+                    result_path.unlink()  # 후보마다 직전 결과 제거 → 신선도 보장 (#25)
 
                 # 상세 로그: 보낸 프롬프트 (시스템 + 작업)
                 self.board.write_agent_block(
@@ -141,7 +164,9 @@ class Runner:
                     res = await self._run_with_retries(get_backend(name), req, role, key)
                 except Exception as e:
                     res = RoleResult(ok=False, error=f"backend {name} raised: {e}")
-                # 상세 로그: 받은 결과 전문 (절단 없음). CLI 는 위에 원시 스트리밍도 기록됨
+                # 상세 로그: 받은 결과. board.write_agent_block 가 본문을 ~20000자로 절단하므로
+                # spec/directives/대용량 출력이 로그를 무한히 키우지 않음 (#31/#32). 단, spec 내
+                # 민감정보는 여전히 .orchestrator/agents 로그에 (절단된 형태로) 남을 수 있음.
                 self.board.write_agent_block(
                     role,
                     f"RESULT ← [{name}] ok={res.ok}",
@@ -271,6 +296,39 @@ def _as_list(v) -> list:
     return [v]
 
 
+def _under_results_dir(path, board) -> bool:
+    """result_path 가 board.results_dir 하위에 있는지 검증 (디렉터리 밖 삭제 방지; #25).
+
+    unit id 는 보드에서 슬러그되어 안전하지만, 방어적으로 resolve 후 results_dir 경계를 확인한다.
+    """
+    try:
+        results_dir = board.results_dir.resolve()
+        return board.results_dir.exists() and results_dir in path.resolve().parents
+    except Exception:
+        return False
+
+
+def _safe_rel_artifact(raw) -> str | None:
+    """아티팩트 경로 경량 검증 (보드 add_artifacts 와 동일 정책; #11).
+
+    str 만 허용하고 strip 후 절대경로(POSIX '/' · Windows 드라이브/역슬래시) 와 '..' traversal
+    토큰을 drop. 타깃 프로젝트 기준 상대경로만 유지. 비-str/빈값/안전하지 않은 값은 None.
+    """
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    if s.startswith("/") or s.startswith("\\"):
+        return None
+    if len(s) >= 2 and s[1] == ":":  # 예: C:\... 드라이브 절대경로
+        return None
+    parts = re.split(r"[\\/]+", s)
+    if ".." in parts:
+        return None
+    return s
+
+
 def _coerce_result(data: dict, res) -> dict:
     """Normalize an agent-written result file to the expected schema.
 
@@ -292,9 +350,11 @@ def _coerce_result(data: dict, res) -> dict:
     blockers = [s for b in _as_list(data.get("blockers")) if (s := str(b).strip())]
     # 실패 변형(fail/failure/error/...)을 다 나열하기보다 성공 status 만 허용(whitelist)
     ok = res.ok and status in _SUCCESS_STATUSES and not blockers
+    # 아티팩트: str 만, 절대경로/'..' 등 안전하지 않은 값 drop (보드 정책과 일치; #11)
+    artifacts = [s for a in _as_list(data.get("artifacts")) if (s := _safe_rel_artifact(a))]
     return {
         "status": status,
-        "artifacts": [str(a) for a in _as_list(data.get("artifacts"))],
+        "artifacts": artifacts,
         "notes": [str(n) for n in _as_list(data.get("notes"))],
         "blockers": blockers,
         "units": [u for u in _as_list(data.get("units")) if isinstance(u, dict)],

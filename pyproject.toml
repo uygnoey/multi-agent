@@ -12,8 +12,12 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
+# Optional backend SDKs. Install from a source checkout (pip install -e .) so the
+# repo-root .claude/agents and templates dirs that the runtime expects stay on disk.
 [project.optional-dependencies]
 claude = ["claude-agent-sdk>=0.1.0"]
+# NOTE: openai-agents is published but its availability/version pinning is brittle in some
+# environments; the OpenAI backend may fail to install. mock/CLI backends never need it.
 openai = ["openai-agents>=0.0.1"]
 all = ["claude-agent-sdk>=0.1.0", "openai-agents>=0.0.1"]
 
@@ -27,3 +31,13 @@ packages = ["orchestrator", "orchestrator.backends"]
 
 [tool.setuptools.package-data]
 orchestrator = ["codex_pricing.json"]
+
+# config.FRAMEWORK_ROOT resolves to the repo root and loads .claude/agents/*.md and
+# templates/* from there. Those live OUTSIDE the orchestrator package, so a plain wheel
+# install cannot bundle them — install from a source checkout (`pip install -e .`) or use
+# the Docker image (which COPYs both dirs). See README "Install" / "Deploy (Docker)".
+
+# Make plain `pytest` work like `python -m pytest`: put the repo root on sys.path so the
+# `orchestrator` package imports without a prior install.
+[tool.pytest.ini_options]
+pythonpath = ["."]

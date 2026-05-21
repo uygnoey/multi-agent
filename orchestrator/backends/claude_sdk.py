@@ -12,10 +12,11 @@ import os
 from .base import Backend, RoleRequest, RoleResult
 
 
-def _make_options(cls, **kwargs):
+def _make_options(cls, dropped: list | None = None, **kwargs):
     """SDK 버전에 따라 지원되는 인자만 골라 옵션 생성 (시그니처 기반).
 
     예전의 에러문자열 부분매칭 방식은 지원되는 인자를 잘못 제거할 수 있어 폐기.
+    dropped 리스트를 주면, 호환성 때문에 떨어뜨린 인자 이름을 거기에 기록한다(#113).
     """
     import inspect
 
@@ -23,6 +24,9 @@ def _make_options(cls, **kwargs):
         params = inspect.signature(cls).parameters
         accepts_kwargs = any(p.kind == p.VAR_KEYWORD for p in params.values())
         if not accepts_kwargs:
+            removed = [k for k in kwargs if k not in params]
+            if dropped is not None:
+                dropped.extend(removed)
             kwargs = {k: v for k, v in kwargs.items() if k in params}
     except (ValueError, TypeError):
         pass
@@ -31,6 +35,8 @@ def _make_options(cls, **kwargs):
     except TypeError:
         # 최후 방어: 선택 인자를 제거하며 재시도
         for k in ("agents", "max_budget_usd", "setting_sources", "model", "max_turns"):
+            if k in kwargs and dropped is not None:
+                dropped.append(k)
             kwargs.pop(k, None)
             try:
                 return cls(**kwargs)
@@ -117,30 +123,75 @@ class ClaudeSDKBackend(Backend):
                 kwargs["agents"] = agents
                 if "Task" not in kwargs["allowed_tools"]:
                     kwargs["allowed_tools"].append("Task")
-        options = _make_options(ClaudeAgentOptions, **kwargs)
+        dropped: list[str] = []
+        options = _make_options(ClaudeAgentOptions, dropped=dropped, **kwargs)
 
-        state = {"final": "", "cost": None}
+        # #113: SDK 호환성 때문에 예산 옵션이 떨어졌으면 조용히 진행하지 말고 노트로 표면화한다.
+        budget_dropped = req.budget is not None and "max_budget_usd" in dropped
+
+        state = {"final": "", "cost": None, "model": req.model, "tokens": None}
+
+        def _capture_meta(msg) -> None:
+            # #45: SDK 결과가 usage/model 을 노출하면 best-effort 로 캡처 (getattr 가드).
+            c = getattr(msg, "total_cost_usd", None)
+            if c is not None:
+                state["cost"] = c
+            m = getattr(msg, "model", None)
+            if m:
+                state["model"] = m
+            usage = getattr(msg, "usage", None)
+            if usage is not None:
+                if isinstance(usage, dict):
+                    it = usage.get("input_tokens") or 0
+                    ot = usage.get("output_tokens") or 0
+                    tt = usage.get("total_tokens")
+                else:
+                    it = getattr(usage, "input_tokens", 0) or 0
+                    ot = getattr(usage, "output_tokens", 0) or 0
+                    tt = getattr(usage, "total_tokens", None)
+                total = int(tt) if tt else int(it + ot)
+                if total:
+                    state["tokens"] = total
 
         async def _consume():
             async for msg in query(prompt=req.prompt, options=options):
                 text = _extract_text(msg)
                 if text:
                     state["final"] = text
-                c = getattr(msg, "total_cost_usd", None)
-                if c is not None:
-                    state["cost"] = c
+                _capture_meta(msg)
+
+        def _note(base: str) -> str:
+            if budget_dropped:
+                return (
+                    f"{base} [warning: installed SDK rejected max_budget_usd "
+                    f"(${req.budget}); ran WITHOUT budget cap]"
+                ).strip()
+            return base
 
         try:
             await asyncio.wait_for(_consume(), timeout=req.timeout)
         except asyncio.TimeoutError:
             return RoleResult(
                 ok=False,
-                error=f"claude-sdk timed out after {req.timeout}s",
+                error=_note(f"claude-sdk timed out after {req.timeout}s"),
                 final_message=state["final"],
                 cost_usd=state["cost"],
+                model=state["model"],
+                tokens=state["tokens"],
             )
         except Exception as e:
             return RoleResult(
-                ok=False, error=str(e), final_message=state["final"], cost_usd=state["cost"]
+                ok=False,
+                error=_note(str(e)),
+                final_message=state["final"],
+                cost_usd=state["cost"],
+                model=state["model"],
+                tokens=state["tokens"],
             )
-        return RoleResult(ok=True, final_message=state["final"], cost_usd=state["cost"])
+        return RoleResult(
+            ok=True,
+            final_message=_note(state["final"]) if budget_dropped else state["final"],
+            cost_usd=state["cost"],
+            model=state["model"],
+            tokens=state["tokens"],
+        )

@@ -78,6 +78,14 @@ pip install -e ".[openai]"       # + OpenAI Agents SDK backend
 pip install -e ".[all]"          # both
 ```
 
+> **Install from a source checkout (`pip install -e .`) is recommended.** The runtime reads the
+> repo-root `.claude/agents/*.md` and `templates/*` directly, so a plain wheel install may miss
+> those files (#18). Use an editable install from the source checkout, or the Docker image (which
+> COPYs both dirs).
+> **OpenAI backend note (#51):** the `openai-agents` extra (`[openai]`/`[all]`) must install for the
+> OpenAI Agents backend to work. That package can fail to install in some environments — verify real
+> availability with `--check`. mock and the CLI backends (claude-cli/codex) work without this extra.
+
 CLI backends need separate install/login:
 - `claude-cli`: `npm i -g @anthropic-ai/claude-code`, then log in (subscription) or set `ANTHROPIC_API_KEY`
 - `codex`:      `npm i -g @openai/codex`, then `codex login` (ChatGPT subscription) or set `CODEX_API_KEY`
@@ -102,6 +110,11 @@ python -m orchestrator --spec examples/specs/sample-spec.md --project-dir /tmp/d
     --role-backend backend-developer=openai-agents
 ```
 
+> ⚠️ The `--max-units 2` above builds only the first 2 of the architect's units. Units beyond the
+> cap are **left unbuilt in the `designed` state**, and this is recorded as a warning in the board
+> `warnings`/`events.log` (not a silent partial success). To build everything, drop `--max-units`
+> or raise it to at least the number of units.
+
 ## Key options
 
 | Option | Description |
@@ -124,7 +137,8 @@ python -m orchestrator --spec examples/specs/sample-spec.md --project-dir /tmp/d
 | `--poll-interval SEC` | PM/PL supervision interval (default 20s) |
 | `--check` | Diagnose backend availability and exit |
 | `--watch` | Instead of running, watch a `--project-dir` live via the monitor TUI |
-| `--web [--port N]` | Run the web UI server (upload spec, run, and monitor in the browser) |
+| `--web [--port N] [--host H]` | Run the web UI server (upload spec, run, and monitor in the browser) |
+| `--base-dir PATH` | Base directory for `--web` run outputs (default `~/agent-runs`). Runs are created under `<base-dir>/<run-id>/` |
 
 ## Live monitor (TUI)
 
@@ -158,6 +172,8 @@ Zero deps (stdlib `http.server`), binds `127.0.0.1` by default.
 
 ```bash
 python -m orchestrator --web --port 8765          # or: web-team-web --port 8765
+# you can also set the output base directory (default ~/agent-runs)
+python -m orchestrator --web --port 8765 --base-dir ~/agent-runs
 # open http://localhost:8765 in the browser
 ```
 
@@ -218,6 +234,11 @@ docker run --rm -p 8765:8765 -v "$PWD/runs:/data/runs" web-team
 Production notes:
 - **Real backends** (claude-cli/codex/openai-agents/claude-sdk) need each CLI installed/logged-in or an API key.
   Inject keys into the container with `-e OPENAI_API_KEY=… -e ANTHROPIC_API_KEY=…`, or mount the CLI auth directories.
-- The web UI has no auth — expose it only on a trusted network, or put auth behind a reverse proxy and restrict the `--host` binding.
+- ⚠️ **No auth / 0.0.0.0 exposure (#106):** the documented container command (`--host 0.0.0.0`) exposes
+  an **unauthenticated** web UI (run controls + monitoring) on **every network interface** reachable via
+  the published port. The 0.0.0.0 binding is required inside a container, but operators MUST add external
+  protection — an authenticating reverse proxy, a firewall, or loopback-only publishing
+  (`-p 127.0.0.1:8765:8765`). Do not expose it directly on an untrusted network.
 - Outputs/run state are created under `/data/runs` (volume).
-- CI: `.github/workflows/ci.yml` runs lint (ruff) + test (pytest, 3.10–3.12).
+- CI: `.github/workflows/ci.yml` runs lint (`ruff check`) + format check (`ruff format --check`) +
+  tests (`pytest`, Python 3.10–3.12 matrix). (Format check included — the tree currently passes.)

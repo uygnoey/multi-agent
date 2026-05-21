@@ -13,6 +13,20 @@ import re
 from .base import Backend, RoleRequest, RoleResult
 
 
+def _ident(raw: str, *, prefix: str = "u") -> str:
+    """unit id 를 유효한 코드 식별자(JS 함수명/Python 함수명/SQL 테이블명)로 변환.
+
+    #126/#127/#128: 비단어 문자는 '_' 로 치환하고, 숫자로 시작하면 prefix 를 붙여
+    JS/Python/SQL 어디서나 유효한 식별자가 되게 한다. 빈 값은 prefix 로 대체.
+    """
+    s = re.sub(r"\W", "_", str(raw))
+    if not s:
+        s = prefix
+    if s[0].isdigit():
+        s = f"{prefix}_{s}"
+    return s
+
+
 class MockBackend(Backend):
     name = "mock"
 
@@ -51,31 +65,36 @@ class MockBackend(Backend):
         elif role == "testsheet-creator":
             write("docs/test/e2e-sheet.md", _mock_e2e(req.spec_text))
         elif role == "frontend-developer" and unit:
+            # #126: JSX 컴포넌트명은 PascalCase 식별자여야 한다 → 식별자 sanitize.
+            comp = _ident(unit["id"], prefix="Comp")
             write(
-                f"frontend/src/{unit['id']}.jsx",
+                f"frontend/src/{_ident(unit['id'])}.jsx",
                 f"// mock frontend for {unit['id']}: {unit.get('title', '')}\n"
-                f"export default function {unit['id']}() {{ return null; }}\n",
+                f"export default function {comp}() {{ return null; }}\n",
             )
             status = "dev_done"
         elif role == "backend-developer" and unit:
             write(
-                f"backend/app/{unit['id']}.py",
+                f"backend/app/{_ident(unit['id'])}.py",
                 f"# mock backend for {unit['id']}: {unit.get('title', '')}\n"
-                f"def handler():\n    return {{'unit': '{unit['id']}'}}\n",
+                f"def handler():\n    return {{'unit': {unit['id']!r}}}\n",
             )
             status = "dev_done"
         elif role == "dba" and unit:
+            # #128: SQL 테이블명도 유효 식별자로 sanitize (따옴표 없이도 안전).
+            table = _ident(unit["id"], prefix="t").lower()
             write(
-                f"db/migrations/{unit['id']}.sql",
+                f"db/migrations/{_ident(unit['id'])}.sql",
                 f"-- mock migration for {unit['id']}: {unit.get('title', '')}\n"
-                f"CREATE TABLE IF NOT EXISTS t_{unit['id'].lower()} (id INTEGER PRIMARY KEY);\n",
+                f"CREATE TABLE IF NOT EXISTS t_{table} (id INTEGER PRIMARY KEY);\n",
             )
             status = "dev_done"
         elif role == "test-engineer" and unit:
+            # #127: pytest 함수명도 유효 식별자로 sanitize.
+            tname = _ident(unit["id"], prefix="t").lower()
             write(
-                f"tests/test_{unit['id'].lower()}.py",
-                f"def test_{unit['id'].lower()}():\n"
-                f"    assert True  # mock test for {unit.get('title', '')}\n",
+                f"tests/test_{tname}.py",
+                f"def test_{tname}():\n    assert True  # mock test for {unit.get('title', '')}\n",
             )
             status = "tested"
         elif role == "qa" and unit:
@@ -198,10 +217,25 @@ def _mock_doc_set() -> dict[str, tuple[str, str]]:
 
 
 def _mock_e2e(spec_text: str) -> str:
-    return (
-        "# E2E Test Sheet (mock)\n\n"
-        "## 시나리오 1 — 스모크\n"
-        "- 전제: 앱이 기동되어 있다\n"
-        "- 단계: 메인 페이지에 접속한다\n"
-        "- 기대결과: HTTP 200 응답과 핵심 UI 노출\n"
-    )
+    # #129: 고정 시나리오만 내지 않고 spec 에서 파생한 기능 불릿을 포함해 입력을 반영한다.
+    # 결정적으로 유지하기 위해 spec 의 불릿/번호 항목을 순서대로 최대 3개만 사용한다.
+    feats: list[str] = []
+    for line in (spec_text or "").splitlines():
+        s = line.strip()
+        m = re.match(r"^(?:[-*]|\d+\.)\s+(.+)", s)
+        if m and len(feats) < 3:
+            feats.append(m.group(1).strip())
+    out = [
+        "# E2E Test Sheet (mock)\n",
+        "## 시나리오 1 — 스모크",
+        "- 전제: 앱이 기동되어 있다",
+        "- 단계: 메인 페이지에 접속한다",
+        "- 기대결과: HTTP 200 응답과 핵심 UI 노출\n",
+    ]
+    if feats:
+        out.append("## 시나리오 2 — spec 기반 기능 점검")
+        out.append("- 전제: 사용자가 로그인되어 있다")
+        for i, f in enumerate(feats, 1):
+            out.append(f"- 단계 {i}: {f}")
+        out.append("- 기대결과: 각 기능이 정상 동작한다\n")
+    return "\n".join(out)

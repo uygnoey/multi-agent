@@ -9,11 +9,26 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import uuid
 from pathlib import Path
 
 from .base import Backend, RoleRequest, RoleResult, run_subprocess
+
+
+def _sanitize_key(key: str) -> str:
+    """파일명 컴포넌트로 안전하게: 경로 구분자/.. 등을 제거하고 단어 문자만 남긴다.
+
+    transcript 출력이 .orchestrator/results 밖으로 탈출하지 못하도록 하는 방어층.
+    """
+    s = str(key).strip()
+    # 경로 구분자·상위참조 토큰 → 단어 문자 외 전부 '_' 치환
+    s = re.sub(r"[^\w.-]", "_", s)
+    # 선행 점/대시는 숨김파일·옵션 오인 방지 위해 제거, 빈 값은 'unit'
+    s = s.lstrip(".-")
+    return s or "unit"
+
 
 # 가격은 코드에 하드코딩하지 않고 설정 파일에서 로드한다(변동 대응). 파일이 없으면 아래 fallback.
 _PRICING_FILE = Path(__file__).resolve().parent.parent / "codex_pricing.json"
@@ -99,17 +114,21 @@ class CodexCLIBackend(Backend):
     def available(self) -> tuple[bool, str]:
         if not shutil.which("codex"):
             return False, "codex CLI 미설치 (npm i -g @openai/codex)"
-        return True, "ready (codex login 또는 CODEX_API_KEY)"
+        # #111: 바이너리 존재만 확인 — 로그인/인증은 검증하지 않는다(probe 회피).
+        return True, "binary present (auth NOT verified: codex login 또는 CODEX_API_KEY)"
 
     async def run_role(self, req: RoleRequest) -> RoleResult:
         prompt = f"[SYSTEM ROLE INSTRUCTIONS]\n{req.system_prompt}\n\n[TASK]\n{req.prompt}"
         key = req.unit["id"] if req.unit else "global"
+        # #108: unit id 는 board 에서 slug 처리되지만, 여기서도 방어적으로 경로 구분자를 제거해
+        # codex transcript 가 .orchestrator/results 밖으로 탈출하지 못하도록 한다.
+        safe_key = _sanitize_key(key)
         # 동시 codex 호출 간 충돌 방지: role+unit+고유 토큰으로 출력 파일 분리
         out_path = (
             req.cwd
             / ".orchestrator"
             / "results"
-            / f"{req.role}__{key}__{uuid.uuid4().hex}.codex.txt"
+            / f"{req.role}__{safe_key}__{uuid.uuid4().hex}.codex.txt"
         )
         out_path.parent.mkdir(parents=True, exist_ok=True)
         cmd = [
@@ -127,6 +146,8 @@ class CodexCLIBackend(Backend):
         ]
         if req.model:
             cmd += ["--model", req.model]
+        # #115/#119: codex exec 에는 per-call budget/turn-limit 플래그가 없다.
+        # req.budget / req.max_turns 강제는 이 백엔드에서 불가 — 누적 예산은 상위에서 처리한다.
         try:
             rc, out, err, timed_out = await run_subprocess(
                 cmd, str(req.cwd), req.timeout, req.live_log_path
@@ -137,7 +158,8 @@ class CodexCLIBackend(Backend):
         if timed_out:
             return RoleResult(ok=False, error=f"codex timed out after {req.timeout}s")
         if rc != 0:
-            return RoleResult(ok=False, error=err.decode(errors="replace")[:500] or f"exit {rc}")
+            # #43: sandbox/login/runtime 진단이 잘리지 않도록 stderr cap 을 크게(4000) 잡는다.
+            return RoleResult(ok=False, error=err.decode(errors="replace")[:4000] or f"exit {rc}")
 
         final = ""
         if out_path.exists():

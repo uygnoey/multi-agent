@@ -229,13 +229,15 @@ def test_add_units_handles_numeric_scalar_deps_roles(tmp_path):
     assert isinstance(u["roles"], list)
 
 
-def test_wait_for_deps_warns_on_unknown_dep(tmp_path, sample_spec_path):
+def test_wait_for_deps_blocks_on_unknown_dep(tmp_path, sample_spec_path):
+    # 감사 #6/#58: 존재하지 않는 dep(architect 오타 등)은 무시(=실행)하지 않고
+    # 의존 unit 을 BLOCKED 처리(False) + 경고로 표면화한다.
     cfg = RunConfig(spec_path=sample_spec_path, project_dir=tmp_path / "p", mock=True)
     sched = Scheduler(cfg)
     asyncio.run(sched.board.init("s", {}))
     asyncio.run(sched.board.add_units([{"id": "U2", "title": "b"}]))  # U1 은 board 에 없음
     ok = asyncio.run(sched._wait_for_deps({"id": "U2", "deps": ["U1"]}))
-    assert ok is True  # 알 수 없는 dep 은 무한 대기 X
+    assert ok is False  # 미지 dep → 의존자 차단
     assert any("U1" in w for w in sched.board.snapshot()["warnings"])  # 경고로 표면화
 
 
@@ -253,8 +255,10 @@ def test_add_units_normalizes_scalar_deps_and_roles(tmp_path):
 
 def test_warnings_recorded_and_reported(tmp_path):
     # 설계/CI/docs 실패는 경고로 기록되고 리포트에 'done with warnings' 로 표시돼야 함.
+    # (unit 이 있어야 함 — 빈 보드는 감사 #103 으로 'no units' 가 되므로 unit 하나 추가.)
     board = Board(tmp_path / "p")
     asyncio.run(board.init("s", {}))
+    asyncio.run(board.add_units([{"id": "U1", "title": "a"}]))
     asyncio.run(board.add_warning("cicd failed"))
     assert board.snapshot()["warnings"] == ["cicd failed"]
     text = board.write_report().read_text(encoding="utf-8")

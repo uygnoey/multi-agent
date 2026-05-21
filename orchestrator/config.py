@@ -6,6 +6,15 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+
+def _coerce_int(raw, default: int) -> int:
+    """정수로 변환하되 비-정수/None/이상값은 default 로 안전화 (raw ValueError 차단; #37)."""
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 # 프레임워크 저장소 루트 (이 파일 = orchestrator/config.py)
 FRAMEWORK_ROOT = Path(__file__).resolve().parent.parent
 AGENTS_DIR = FRAMEWORK_ROOT / ".claude" / "agents"
@@ -20,7 +29,8 @@ PHASE_CICD = "cicd"
 PHASE_DOCS = "docs"
 
 DEV_TOOLS = ("Read", "Write", "Edit", "Bash")
-RO_TOOLS = ("Read", "Bash")
+# 감독(PM/PL)은 코드/환경을 건드리지 않는 읽기 전용 역할 → Bash 제외, Read 만 허용 (#49/#50)
+RO_TOOLS = ("Read",)
 
 
 @dataclass(frozen=True)
@@ -167,12 +177,13 @@ class RunConfig:
 
     def __post_init__(self):
         # 숫자 옵션을 안전 범위로 정규화 (CLI/웹 어디서 와도 crash/hang/오작동 방지; 웹과 동작 일치)
-        self.concurrency = max(1, int(self.concurrency))
-        self.max_attempts = max(1, int(self.max_attempts))
-        self.retries = max(0, int(self.retries))
+        # 라이브러리 호출부가 잘못된 값을 줘도 raw ValueError 가 아니라 기본값으로 안전화 (#37)
+        self.concurrency = max(1, _coerce_int(self.concurrency, 3))
+        self.max_attempts = max(1, _coerce_int(self.max_attempts, 2))
+        self.retries = max(0, _coerce_int(self.retries, 1))
         if self.max_units is not None:
-            mu = int(self.max_units)
-            self.max_units = mu if mu > 0 else None  # 0/음수 → 제한 없음
+            mu = _coerce_int(self.max_units, 0)
+            self.max_units = mu if mu > 0 else None  # 0/음수/이상값 → 제한 없음
 
     def backends_for(self, role: str) -> list[str]:
         """역할에 대한 백엔드 후보를 우선순위 순서로 반환 (폴오버용)."""

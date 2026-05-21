@@ -59,7 +59,11 @@ def backend_status() -> list[dict]:
     """각 백엔드의 가용성 [{name, ok, reason}] (--check / web / TUI 공용)."""
     out = []
     for name, b in _REGISTRY.items():
-        ok, reason = b.available()
+        # #41: 한 백엔드의 available() 예외가 --check / /api/check / TUI 전체를 깨지 않도록 격리.
+        try:
+            ok, reason = b.available()
+        except Exception as e:  # noqa: BLE001
+            ok, reason = False, f"availability check failed: {e}"
         out.append({"name": name, "ok": ok, "reason": reason})
     return out
 

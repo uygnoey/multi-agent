@@ -44,8 +44,13 @@ def _read_events(orch_dir, n: int = 300) -> str:
         return ""
 
 
-def _read_agent_logs(orch_dir, roles, n: int = 600) -> dict:
-    """역할별 실시간 로그 tail {role: text} (활동 있는 역할만). 파일엔 전체가 저장됨."""
+def _read_agent_logs(orch_dir, roles, n: int = 120) -> dict:
+    """역할별 실시간 로그 tail {role: text} (활동 있는 역할만). 파일엔 전체가 저장됨.
+
+    #34/#35: 폴링마다 역할별 600줄을 보내면 /api/state 페이로드가 과도하다.
+    대시보드 카드 표시에 충분한 작은 tail(기본 120줄)만 보내고, 전체 로그는
+    역할별 /api/agent 엔드포인트에서 조회한다.
+    """
     out = {}
     ad = orch_dir / "agents"
     for role in roles:
@@ -59,6 +64,33 @@ def _read_agent_logs(orch_dir, roles, n: int = 600) -> dict:
         except Exception:
             pass
     return out
+
+
+def _is_zombie(pid: int) -> bool:
+    """pid 가 좀비(이미 종료, 부모가 reap 대기 중) 인지 best-effort 로 판별.
+
+    Linux 는 /proc, 그 외(macOS 등)는 `ps` 로 상태 코드를 본다. 판별 불가 시 False.
+    좀비 = 더 이상 실행 중이 아니므로 stop 입장에서는 종료로 취급한다.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat")
+        if stat.exists():
+            # 형식: pid (comm) STATE ... — comm 에 ')' 가 있을 수 있어 마지막 ')' 기준.
+            txt = stat.read_text(encoding="utf-8", errors="replace")
+            state = txt[txt.rfind(")") + 1 :].strip().split(" ", 1)[0]
+            return state == "Z"
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "state=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return out.stdout.strip().startswith("Z")
+    except Exception:
+        return False
 
 
 def _run_alive(orch_dir) -> bool:
@@ -88,6 +120,10 @@ def new_run_id(name: str) -> str:
 
 
 def build_command(py: str, spec_path: Path, project_dir: Path, opts: dict) -> list[str]:
+    # #61: poll-interval 은 opts 에서 읽되 웹 기본은 600(감독 주기를 길게). 없으면 600.
+    poll = opts.get("poll_interval")
+    if poll in (None, ""):
+        poll = 600
     cmd = [
         py,
         "-m",
@@ -101,14 +137,19 @@ def build_command(py: str, spec_path: Path, project_dir: Path, opts: dict) -> li
         "--concurrency",
         str(int(opts.get("concurrency", 3))),
         "--poll-interval",
-        "600",
+        str(poll),
     ]
     backends = opts.get("backends")
     if backends:
         cmd += ["--backends", ",".join(backends) if isinstance(backends, list) else str(backends)]
     for role, prov in (opts.get("role_backends") or {}).items():
-        if prov:
-            cmd += ["--role-backend", f"{role}={prov}"]
+        if not prov:
+            continue
+        # #100/#101: prov 가 우선순위 리스트면 콤마로 합쳐 CLI 의 ROLE=B1,B2 형식으로.
+        #            (리스트 repr 이 그대로 한 백엔드 문자열로 넘어가는 버그 방지)
+        prov_str = ",".join(str(p) for p in prov if p) if isinstance(prov, list) else str(prov)
+        if prov_str:
+            cmd += ["--role-backend", f"{role}={prov_str}"]
     if opts.get("distribute"):
         cmd.append("--distribute")
     if opts.get("cross_check"):
@@ -121,15 +162,33 @@ def build_command(py: str, spec_path: Path, project_dir: Path, opts: dict) -> li
         cmd += ["--max-units", str(int(opts["max_units"]))]
     if opts.get("max_attempts"):
         cmd += ["--max-attempts", str(int(opts["max_attempts"]))]
+    # #62: timeout/retries/budget/model 도 있으면 CLI 로 전달 (웹 실행에서도 사용 가능).
+    if opts.get("timeout") not in (None, ""):
+        cmd += ["--timeout", str(float(opts["timeout"]))]
+    if opts.get("retries") not in (None, ""):
+        cmd += ["--retries", str(int(opts["retries"]))]
+    if opts.get("budget") not in (None, ""):
+        cmd += ["--budget", str(float(opts["budget"]))]
+    if opts.get("model"):
+        cmd += ["--model", str(opts["model"])]
     return cmd
 
 
 def list_runs(base_dir: Path) -> list[dict]:
     out = []
     if base_dir.exists():
+        base = base_dir.resolve()
         for d in sorted(base_dir.iterdir(), reverse=True):
-            if (d / ".orchestrator" / "board.json").exists():
-                out.append({"id": d.name, "project_dir": str(d)})
+            if not (d / ".orchestrator" / "board.json").exists():
+                continue
+            # project_dir() 가 거부할 항목(심볼릭/외부 경로)은 목록에서 제외 (#81)
+            try:
+                resolved = (base / d.name).resolve()
+            except Exception:
+                continue
+            if resolved == base or base not in resolved.parents:
+                continue
+            out.append({"id": d.name, "project_dir": str(d)})
     return out
 
 
@@ -155,9 +214,13 @@ class RunManager:
 
     def project_dir(self, run_id: str) -> Path:
         """run_id 를 base_dir 안으로 한정 (경로 traversal 차단)."""
+        # 빈/공백 run_id 는 base 자체로 resolve 되므로 명시적으로 거부 (#67)
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError(f"invalid run id: {run_id!r}")
         base = self.base_dir.resolve()
-        p = (base / str(run_id)).resolve()
-        if p != base and base not in p.parents:
+        p = (base / run_id).resolve()
+        # base 자체로 resolve 되면(예: ".") 거부, base 하위만 허용 (#67/#81)
+        if p == base or base not in p.parents:
             raise ValueError(f"invalid run id: {run_id!r}")
         return p
 
@@ -213,12 +276,50 @@ class RunManager:
             except Exception:
                 pass
 
+        def _alive() -> bool:
+            # 우리가 띄운 자식이면 poll() 로 좀비를 reap (os.kill(pid,0) 은 좀비도 살아있다고 봄).
+            if proc is not None and hasattr(proc, "poll"):
+                try:
+                    return proc.poll() is None
+                except Exception:
+                    pass
+            try:
+                os.kill(pid, 0)  # signal 0 = 존재 확인 (죽었으면 OSError)
+            except OSError:
+                return False
+            # 외부(우리가 reap 못하는) 프로세스가 종료되면 좀비로 남아 os.kill(pid,0) 은
+            # 계속 성공한다. 좀비는 더 이상 run 상태를 쓰지 않으므로 종료로 간주한다.
+            return not _is_zombie(pid)
+
+        def _remove_pidfile():
+            try:
+                pf.unlink()
+            except Exception:
+                pass
+
+        # #13: pidfile 을 즉시 지우면 프로세스가 아직 살아 run 상태를 쓰는 중인데도
+        #      UI/monitor 가 stopped 로 보인다. SIGTERM 후 실제 종료를 "확인"한 뒤에만
+        #      pidfile 을 제거한다. 요청 스레드를 길게 막지 않도록 짧게(≈0.5초)만 동기 확인하고,
+        #      그래도 살아있으면 백그라운드 supervisor 가 SIGKILL 폴백 후 제거한다.
         _kill(signal.SIGTERM)
-        threading.Timer(4.0, lambda: _kill(signal.SIGKILL)).start()  # 트랩 대비 강제 종료
-        try:
-            pf.unlink()  # 상태를 즉시 stopped 로 반영
-        except Exception:
-            pass
+        for _ in range(10):  # ≈0.5초: 대부분의 프로세스는 SIGTERM 으로 즉시 종료
+            if not _alive():
+                _remove_pidfile()
+                return True
+            time.sleep(0.05)
+
+        def _supervise():
+            # 남은 시간(최대 ≈3.5초) graceful 종료를 더 기다린다(0.1초 간격 폴링).
+            for _ in range(35):
+                if not _alive():
+                    _remove_pidfile()
+                    return
+                time.sleep(0.1)
+            # 트랩 대비 강제 종료 후 pidfile 제거
+            _kill(signal.SIGKILL)
+            _remove_pidfile()
+
+        threading.Thread(target=_supervise, daemon=True).start()
         return True
 
     def rerun(self, run_id: str) -> str:
@@ -255,6 +356,10 @@ class RunManager:
                     fh.close()
                 except Exception:
                     pass
+            # #15: reap 한 프로세스는 _procs 에서 제거 (장기 실행 서버에서 누적 방지)
+            with self._lock:
+                if self._procs.get(run_id) is proc:
+                    self._procs.pop(run_id, None)
         # 이 서버가 띄우지 않은(고아/외부) run 도 PID 파일로 생존 확인
         try:
             return _run_alive(self.project_dir(run_id) / ".orchestrator")
@@ -271,12 +376,16 @@ def _make_handler(manager: RunManager):
             pass
 
         def _send(self, code: int, body: bytes, ctype: str):
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")  # 실시간: 캐시 금지
-            self.end_headers()
-            self.wfile.write(body)
+            # #88: 클라이언트 연결 끊김(소켓 쓰기 실패)은 조용히 무시 — 트레이스백 방지
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")  # 실시간: 캐시 금지
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionError):
+                pass
 
         def _json(self, obj, code: int = 200):
             self._send(
@@ -304,6 +413,7 @@ def _make_handler(manager: RunManager):
                 board = {}
                 events = ""
                 agent_logs = {}
+                exists = False  # #69: board.json 존재 여부(미초기화 vs 미존재 구분)
                 if run:
                     try:
                         proj = manager.project_dir(run)
@@ -311,9 +421,13 @@ def _make_handler(manager: RunManager):
                         self._json({"error": "invalid run id"}, 400)
                         return
                     orch = proj / ".orchestrator"
+                    exists = (orch / "board.json").exists()
                     board = _read_board(orch)
                     events = _read_events(orch)
-                    agent_logs = _read_agent_logs(orch, list(ROLES))
+                    # #34/#35: 폴링마다 모든 역할 로그를 보내지 않고, board 에 기록된
+                    # (= 한 번이라도 활동한) 역할의 로그만 보낸다. 전체 로그는 /api/agent.
+                    active_roles = [r for r in ROLES if r in board.get("agents", {})]
+                    agent_logs = _read_agent_logs(orch, active_roles)
                 running = manager.is_running(run) if run else False
                 # 런이 죽었는데 board 에 "running" 으로 남은 에이전트는 stopped 로 표시
                 # (정상 종료 중 취소되거나 강제 종료된 경우 — 실제로는 안 돌고 있음)
@@ -326,6 +440,7 @@ def _make_handler(manager: RunManager):
                         "roles": list(ROLES),
                         "board": board,
                         "running": running,
+                        "exists": exists,
                         "project_dir": str(proj) if proj else "",
                         "events": events,
                         "agent_logs": agent_logs if run else {},
@@ -334,7 +449,11 @@ def _make_handler(manager: RunManager):
             elif u.path == "/api/agent":
                 run = (q.get("run") or [""])[0]
                 role = (q.get("role") or [""])[0]
-                if role and role not in ROLES:  # 경로 traversal/임의 파일 읽기 차단
+                # #68: run/role 둘 다 비어있으면 안 됨 — 빈 성공 응답 대신 400
+                if not run or not role:
+                    self._json({"error": "run and role are required"}, 400)
+                    return
+                if role not in ROLES:  # 경로 traversal/임의 파일 읽기 차단
                     self._json({"error": "invalid role"}, 400)
                     return
                 try:
@@ -346,7 +465,7 @@ def _make_handler(manager: RunManager):
                 self._json(
                     {
                         "agent": board.get("agents", {}).get(role, {}),
-                        "log": _read_agent_log(orch, role) if role else "",
+                        "log": _read_agent_log(orch, role),
                     }
                 )
             else:
@@ -372,6 +491,11 @@ def _make_handler(manager: RunManager):
                 data = json.loads(self.rfile.read(length) or b"{}")
             except Exception:
                 self._json({"error": "invalid json"}, 400)
+                return
+            # #78: json.loads 는 list/str/number/null 도 반환할 수 있다 — 이후 data.get(...)
+            #      이 AttributeError 를 내고 연결이 끊기는 대신 400 으로 거부.
+            if not isinstance(data, dict):
+                self._json({"error": "request body must be a JSON object"}, 400)
                 return
 
             if u.path == "/api/stop":
@@ -405,26 +529,48 @@ def _make_handler(manager: RunManager):
                 return
 
             # /api/run
-            if len(data.get("spec_text", "") or "") > MAX_SPEC_BYTES:
-                self._json({"error": f"spec too large (> {MAX_SPEC_BYTES} chars)"}, 413)
+            # #89: spec_text 는 반드시 문자열 — list/object 면 write_text 에서 깨지므로 400.
+            spec_text = data.get("spec_text", "")
+            if spec_text is None:
+                spec_text = ""
+            if not isinstance(spec_text, str):
+                self._json({"error": "spec_text must be a string"}, 400)
+                return
+            # #60: 글자 수가 아니라 인코딩 바이트 길이로 검사 (MAX_SPEC_BYTES 의 의미에 맞춤).
+            if len(spec_text.encode("utf-8")) > MAX_SPEC_BYTES:
+                self._json({"error": f"spec too large (> {MAX_SPEC_BYTES} bytes)"}, 413)
                 return
             backend = data.get("backend", "mock")
             if resolve(backend) not in VALID_BACKENDS:  # CLI 와 동일하게 alias 허용
                 self._json({"error": f"invalid backend: {backend}"}, 400)
                 return
-            for b in data.get("backends") or []:
+            # #79: backends 는 list(또는 null)여야 함 — 문자열이면 글자 단위로 순회되므로 거부.
+            backends = data.get("backends")
+            if backends is not None and not isinstance(backends, list):
+                self._json({"error": "backends must be a list"}, 400)
+                return
+            for b in backends or []:
                 if resolve(b) not in VALID_BACKENDS:
                     self._json({"error": f"invalid backend in priority list: {b}"}, 400)
                     return
-            for role, prov in (data.get("role_backends") or {}).items():
+            # #80: role_backends 는 dict(또는 null)여야 함 — .items() 전에 타입 검증.
+            role_backends = data.get("role_backends")
+            if role_backends is not None and not isinstance(role_backends, dict):
+                self._json({"error": "role_backends must be an object"}, 400)
+                return
+            for role, prov in (role_backends or {}).items():
                 if role not in ROLES:
                     self._json({"error": f"invalid role: {role}"}, 400)
                     return
-                if prov and resolve(prov) not in VALID_BACKENDS:
-                    self._json({"error": f"invalid backend for {role}: {prov}"}, 400)
-                    return
-            # 숫자 옵션 검증: int 변환 + 범위(>=1). 음수/0/비정상값은 400 으로 거부.
-            for fld in ("concurrency", "max_units", "max_attempts"):
+                # #100/#101: prov 는 단일 백엔드(str) 또는 우선순위 리스트(list) 가능.
+                provs = prov if isinstance(prov, list) else ([prov] if prov else [])
+                for p in provs:
+                    if p and resolve(p) not in VALID_BACKENDS:
+                        self._json({"error": f"invalid backend for {role}: {p}"}, 400)
+                        return
+            # 숫자 옵션 검증: int 변환 + 범위. 음수/0/비정상값은 400 으로 거부.
+            # poll_interval 은 0 허용(>=0), 나머지는 >=1.
+            for fld in ("concurrency", "max_units", "max_attempts", "retries", "poll_interval"):
                 v = data.get(fld)
                 if v in (None, ""):
                     continue
@@ -433,10 +579,24 @@ def _make_handler(manager: RunManager):
                 except (TypeError, ValueError):
                     self._json({"error": f"invalid {fld}: {v!r}"}, 400)
                     return
-                if iv < 1:
-                    self._json({"error": f"{fld} must be >= 1 (got {iv})"}, 400)
+                lo = 0 if fld in ("retries", "poll_interval") else 1
+                if iv < lo:
+                    self._json({"error": f"{fld} must be >= {lo} (got {iv})"}, 400)
                     return
-            run_id = manager.start(data.get("spec_text", ""), data)
+            # timeout/budget 은 실수 허용(>=0). budget 0 은 의미 없으나 음수만 거부.
+            for fld in ("timeout", "budget"):
+                v = data.get(fld)
+                if v in (None, ""):
+                    continue
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    self._json({"error": f"invalid {fld}: {v!r}"}, 400)
+                    return
+                if fv < 0:
+                    self._json({"error": f"{fld} must be >= 0 (got {fv})"}, 400)
+                    return
+            run_id = manager.start(spec_text, data)
             self._json({"run_id": run_id})
 
     return Handler
@@ -537,13 +697,20 @@ INDEX_HTML = r"""<!doctype html>
       <div><label>max-units (선택)</label><input type="text" id="maxUnits" placeholder="전체"/></div>
       <div><label>max-attempts</label><input type="text" id="maxAttempts" value="2"/></div>
     </div>
+    <div class="row">
+      <div><label>poll-interval (초, 선택)</label><input type="text" id="pollInterval" placeholder="600"/></div>
+      <div><label>timeout (초, 선택)</label><input type="text" id="timeout" placeholder="기본"/></div>
+      <div><label>retries (선택)</label><input type="text" id="retries" placeholder="1"/></div>
+      <div><label>budget (USD, 선택)</label><input type="text" id="budget" placeholder="없음"/></div>
+      <div><label>model (선택)</label><input type="text" id="model" placeholder="백엔드 기본값"/></div>
+    </div>
     <div id="backendStatus" class="muted" style="margin-top:8px;font-size:12px">백엔드 상태 확인 중…</div>
     <details style="margin-top:8px">
       <summary class="muted" style="cursor:pointer">역할별 프로바이더 직접 지정 (auto = 미지정 → cross-check 시 교차 배치)</summary>
       <div id="roleGrid" class="row" style="flex-wrap:wrap;margin-top:8px"></div>
     </details>
     <div class="row" style="margin-top:10px;align-items:center">
-      <label style="margin:0"><input type="checkbox" id="mock" checked/> mock (무비용)</label>
+      <label style="margin:0"><input type="checkbox" id="mock"/> mock (무비용 · 선택한 실제 백엔드 무시)</label>
       <label style="margin:0"><input type="checkbox" id="delegate"/> delegate (팀 위임)</label>
       <label style="margin:0"><input type="checkbox" id="distribute"/> distribute (풀 분산)</label>
       <label style="margin:0"><input type="checkbox" id="crossCheck"/> cross-check (교차 검증)</label>
@@ -591,8 +758,9 @@ async function loadChecks(){
   try{data=await (await fetch("/api/check")).json()}catch(e){}
   const rows=data.backends||[];
   const bad=rows.filter(r=>!r.ok);
-  $("backendStatus").innerHTML="백엔드: "+rows.map(r=>(r.ok?"✅":"❌")+" "+r.name).join("&nbsp;&nbsp;")+
-    (bad.length?"<br>미가용 — "+bad.map(r=>r.name+": "+r.reason).join(" · "):"");
+  // #65: 백엔드 이름/사유를 esc() 로 이스케이프 — HTML/스크립트 주입 방지
+  $("backendStatus").innerHTML="백엔드: "+rows.map(r=>(r.ok?"✅":"❌")+" "+esc(r.name)).join("&nbsp;&nbsp;")+
+    (bad.length?"<br>미가용 — "+bad.map(r=>esc(r.name)+": "+esc(r.reason)).join(" · "):"");
   // 백엔드 입력칸이 비어있으면 가용한 첫 백엔드를 기본값으로 채움
   const okOnes=rows.filter(r=>r.ok).map(r=>r.name);
   if(!$("backends").value && okOnes.length) $("backends").value=okOnes[0];
@@ -614,19 +782,32 @@ async function startRun(){
   if(!f){$("launchMsg").textContent="기획서 파일을 선택하세요.";return}
   const spec_text=await f.text();
   $("runBtn").disabled=true;$("launchMsg").textContent="실행 시작 중…";
-  const blist=$("backends").value.split(",").map(s=>s.trim()).filter(Boolean);
-  const role_backends={};
-  document.querySelectorAll("#roleGrid select").forEach(s=>{if(s.value)role_backends[s.dataset.role]=s.value});
-  const body={spec_text,name:$("name").value||f.name.replace(/\.[^.]+$/,""),
-    backend:blist[0]||"mock",backends:blist.length>1?blist:null,role_backends,
-    distribute:$("distribute").checked,cross_check:$("crossCheck").checked,
-    concurrency:+$("concurrency").value||3,
-    max_units:$("maxUnits").value?+$("maxUnits").value:null,
-    max_attempts:+$("maxAttempts").value||2,mock:$("mock").checked,delegate:$("delegate").checked};
-  const r=await fetch("/api/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-  const j=await r.json();$("runBtn").disabled=false;
-  if(j.error){$("launchMsg").textContent="오류: "+j.error;return}
-  await refreshRuns(); selectRun(j.run_id);
+  // #63: fetch/json 에서 예외가 나도 runBtn 이 영구 비활성화되지 않도록 try/finally.
+  try{
+    const blist=$("backends").value.split(",").map(s=>s.trim()).filter(Boolean);
+    const role_backends={};
+    document.querySelectorAll("#roleGrid select").forEach(s=>{if(s.value)role_backends[s.dataset.role]=s.value});
+    // #99: +field||default 로 0/NaN 을 가리지 않고 원본 문자열을 그대로 보낸다.
+    //      비어있는 선택 필드는 null 로 보내 서버가 무시하게 한다.
+    const raw=id=>{const v=$(id).value.trim();return v===""?null:v};
+    const body={spec_text,name:$("name").value||f.name.replace(/\.[^.]+$/,""),
+      backend:blist[0]||"mock",backends:blist.length>1?blist:null,role_backends,
+      distribute:$("distribute").checked,cross_check:$("crossCheck").checked,
+      concurrency:raw("concurrency"),
+      max_units:raw("maxUnits"),
+      max_attempts:raw("maxAttempts"),
+      poll_interval:raw("pollInterval"),timeout:raw("timeout"),
+      retries:raw("retries"),budget:raw("budget"),model:raw("model"),
+      mock:$("mock").checked,delegate:$("delegate").checked};
+    const r=await fetch("/api/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    const j=await r.json();
+    if(j.error){$("launchMsg").textContent="오류: "+j.error;return}
+    await refreshRuns(); selectRun(j.run_id);
+  }catch(e){
+    $("launchMsg").textContent="오류: "+e;
+  }finally{
+    $("runBtn").disabled=false;
+  }
 }
 async function refreshRuns(){
   let runs=[];
@@ -643,9 +824,16 @@ function showPicker(){CUR=null;$("picker").classList.remove("hide");$("launch").
 function selectRun(id){if(!id)return;CUR=id;$("runSel").value=id;
   $("launch").classList.add("hide");$("picker").classList.add("hide");$("dash").classList.remove("hide");tick();}
 function renderPicker(runs){
-  $("runList").innerHTML=runs.length
-    ? runs.map(r=>'<div style="padding:7px 0;cursor:pointer;border-bottom:1px solid #21262d" onclick="selectRun(\''+r.id+'\')">'+(r.running?"🟢 ":"⚪️ ")+esc(r.id)+'</div>').join("")
-    : "(실행 없음 — 새 실행을 시작하세요)";
+  const el=$("runList");
+  // #66: run id 를 onclick 문자열에 직접 끼우면 따옴표/스크립트 주입 가능.
+  //      data-run 속성(esc)으로 담고 addEventListener 로 처리한다.
+  if(!runs.length){el.textContent="(실행 없음 — 새 실행을 시작하세요)";return}
+  el.innerHTML=runs.map(r=>'<div class="run-item" data-run="'+esc(r.id)+
+    '" style="padding:7px 0;cursor:pointer;border-bottom:1px solid #21262d">'+
+    (r.running?"🟢 ":"⚪️ ")+esc(r.id)+'</div>').join("");
+  el.querySelectorAll(".run-item").forEach(d=>{
+    d.addEventListener("click",()=>selectRun(d.dataset.run));
+  });
 }
 async function stopRun(){
   if(!CUR)return;
@@ -660,7 +848,7 @@ async function rerunRun(){
 }
 
 function statusDot(s){return '<span class="dot'+(s==="running"?" run":"")+'"></span>'}
-function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 async function tick(){
   if(!CUR)return;
   try{
@@ -708,9 +896,18 @@ async function tick(){
   }catch(e){}
 }
 let _tk=0;
+let _looping=false;
 async function loop(){
-  if(_tk++%3===0){const runs=await refreshRuns();if(!CUR)renderPicker(runs);}  // 목록/picker 갱신
-  if(CUR)tick();                                                                // 매 초 실시간 갱신
+  // #64: 이전 loop(tick 포함)가 끝나기 전에 다음 틱이 겹치면 stale 렌더가 날 수 있다.
+  //      플래그로 중첩을 막고, tick() 을 반드시 await 한다.
+  if(_looping)return;
+  _looping=true;
+  try{
+    if(_tk++%3===0){const runs=await refreshRuns();if(!CUR)renderPicker(runs);}  // 목록/picker 갱신
+    if(CUR)await tick();                                                          // 매 초 실시간 갱신
+  }finally{
+    _looping=false;
+  }
 }
 async function init(){
   await loadChecks();

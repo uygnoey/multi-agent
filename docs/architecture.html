@@ -34,19 +34,28 @@
     <p class="sub">기획서 → 공유 보드 기반 협업 · 상시 감독 + 3단계 병렬 워크플로우</p>
   </header>
 
+  <!--
+    NOTE: 이 다이어그램은 Mermaid 를 원격 CDN(cdn.jsdelivr.net)에서 ESM 으로 가져온다.
+    따라서 오프라인/네트워크 제한 환경에서는 다이어그램이 렌더링되지 않는다(#74).
+    설계 흐름은 docs/PLAN.md 의 mermaid 블록(텍스트)으로도 확인할 수 있다.
+
+    런타임 정합(#75): 역할 세션은 result-file 계약(.orchestrator/results/<role>__<key>.json)으로
+    조정하며 보드의 단일 writer 는 오케스트레이터다. PM/PL 감독은 영속 ClaudeSDKClient 세션이 아니라
+    asyncio 태스크에서 매 tick 마다 1-shot run_role 을 호출해 디렉티브를 산출한다. (board MCP 툴 미사용)
+  -->
   <div class="diagram-wrap">
     <pre class="mermaid">
 flowchart TB
-    SPEC["기획서<br/>docs/planning/spec.md"] --> BOARD[("공유 보드<br/>.orchestrator/board.json<br/>+ board MCP 툴")]
+    SPEC["기획서<br/>.orchestrator/spec.md"] --> BOARD[("공유 보드<br/>.orchestrator/board.json<br/>(오케스트레이터 단일 writer)")]
 
-    subgraph SUP["상시 감독 (persistent asyncio tasks)"]
-        PM["1. Project Manager<br/>ClaudeSDKClient 루프"]
-        PL["2. Project Leader<br/>ClaudeSDKClient 루프"]
+    subgraph SUP["상시 감독 (persistent asyncio tasks · 매 tick 1-shot run_role)"]
+        PM["1. Project Manager<br/>주기적 보드 리뷰 → 디렉티브"]
+        PL["2. Project Leader<br/>주기적 보드 리뷰 → 디렉티브"]
     end
-    PM <--> BOARD
-    PL <--> BOARD
+    PM -->|"읽기 → 디렉티브"| BOARD
+    PL -->|"읽기 → 디렉티브"| BOARD
 
-    subgraph A["Phase A — 병렬"]
+    subgraph A["Phase A — 병렬 (result-file 계약)"]
         ARCH["3. Architecture Engineer<br/>설계 + 작업단위 분해"]
         TS["7. Testsheet Creator<br/>기획서 기반 E2E 시트"]
     end

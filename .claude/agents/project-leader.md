@@ -1,7 +1,7 @@
 ---
 name: project-leader
 description: Tech lead. Continuously supervises technical coherence, cross-unit coordination, and code quality.
-tools: Read, Bash
+tools: Read
 model: inherit
 ---
 
