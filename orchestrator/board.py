@@ -33,10 +33,11 @@ class Board:
         self.orch_dir = self.project_dir / ".orchestrator"
         self.path = self.orch_dir / "board.json"
         self.results_dir = self.orch_dir / "results"
+        self.agents_dir = self.orch_dir / "agents"
         self.events_path = self.orch_dir / "events.log"
         self.directives_path = self.orch_dir / "directives.md"
         self._lock = asyncio.Lock()
-        self._data: dict[str, Any] = {"units": []}
+        self._data: dict[str, Any] = {"units": [], "agents": {}}
         self.spec_text: str = ""
 
     # ---- persistence ----
@@ -49,12 +50,14 @@ class Board:
         async with self._lock:
             self.orch_dir.mkdir(parents=True, exist_ok=True)
             self.results_dir.mkdir(parents=True, exist_ok=True)
+            self.agents_dir.mkdir(parents=True, exist_ok=True)
             self._data = {
                 "created_at": time.time(),
                 "spec_excerpt": spec_text[:2000],
                 "stack": stack,
                 "phase": "init",
                 "total_cost_usd": 0.0,
+                "agents": {},
                 "units": [],
             }
             self._flush()
@@ -125,6 +128,64 @@ class Board:
                 self._data.get("total_cost_usd", 0.0) + float(amount), 6
             )
             self._flush()
+
+    # ---- per-agent live state (for the monitor TUI) ----
+    async def agent_update(
+        self,
+        role: str,
+        *,
+        status: str | None = None,
+        unit: str | None = None,
+        backend: str | None = None,
+        cost_add: float | None = None,
+        message: str | None = None,
+        call: bool = False,
+        activity: str | None = None,
+    ) -> None:
+        async with self._lock:
+            agents = self._data.setdefault("agents", {})
+            a = agents.setdefault(
+                role,
+                {
+                    "status": "idle",
+                    "calls": 0,
+                    "cost_usd": 0.0,
+                    "current_unit": None,
+                    "backend": None,
+                    "last_message": "",
+                    "updated_at": 0.0,
+                },
+            )
+            if status is not None:
+                a["status"] = status
+            if unit is not None or status == "running":
+                a["current_unit"] = unit
+            if backend is not None:
+                a["backend"] = backend
+            if cost_add:
+                a["cost_usd"] = round(a["cost_usd"] + float(cost_add), 6)
+            if message is not None:
+                a["last_message"] = message[:500]
+            if call:
+                a["calls"] += 1
+            a["updated_at"] = time.time()
+            self._flush()
+        if activity:
+            self._append_agent_log(role, activity)
+
+    def _append_agent_log(self, role: str, text: str) -> None:
+        self.agents_dir.mkdir(parents=True, exist_ok=True)
+        with (self.agents_dir / f"{role}.log").open("a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {text}\n")
+
+    def agents(self) -> dict:
+        return json.loads(json.dumps(self._data.get("agents", {})))
+
+    def agent_log_tail(self, role: str, n: int = 200) -> str:
+        p = self.agents_dir / f"{role}.log"
+        if not p.exists():
+            return ""
+        return "\n".join(p.read_text(encoding="utf-8").splitlines()[-n:])
 
     def write_report(self) -> Path:
         """Write a human-readable run report to .orchestrator/report.md."""

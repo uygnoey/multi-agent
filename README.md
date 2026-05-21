@@ -88,6 +88,27 @@ python -m orchestrator --spec examples/specs/sample-spec.md --project-dir /tmp/d
 | `--model NAME` | 모델 override |
 | `--poll-interval SEC` | PM/PL 감독 주기 (기본 20초) |
 | `--check` | 백엔드 가용성만 진단 후 종료 |
+| `--watch` | 실행 대신 `--project-dir` 진행을 실시간 모니터 TUI 로 본다 |
+
+## 실시간 모니터 (TUI)
+
+멀티에이전트가 도는 걸 실시간으로 본다 (의존성 0, stdlib `curses`). 보통 **터미널 2개**로 쓴다 —
+하나는 빌드 실행, 다른 하나는 모니터:
+
+```bash
+# 터미널 A: 빌드 실행
+python -m orchestrator --spec examples/specs/sample-spec.md --project-dir /tmp/demo-web --mock
+
+# 터미널 B: 같은 project-dir 를 실시간 감시
+python -m orchestrator --watch --project-dir /tmp/demo-web
+#  또는:  python -m orchestrator.monitor --project-dir /tmp/demo-web
+#  또는(설치 후):  web-team-monitor --project-dir /tmp/demo-web
+```
+
+- **리스트 뷰**: 10개 역할의 상태(● 실행중 / ○ 대기)·누적 비용·호출수·현재 unit
+- **↑/↓**(또는 j/k) 이동, **Enter** 로 해당 에이전트 상세 진입
+- **상세 뷰**: 그 에이전트가 실시간으로 무엇을 하는지(활동 로그)·비용·백엔드. **b/Esc** 로 리스트 복귀, **q** 종료
+- 헤드리스/CI: `python -m orchestrator.monitor --project-dir <dir> --once` 로 1회 텍스트 스냅샷
 
 ## 산출물 위치 (타깃)
 

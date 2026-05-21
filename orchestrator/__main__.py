@@ -43,6 +43,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--retries", type=int, default=1, help="역할 호출 전이성 실패 재시도 횟수")
     p.add_argument("--mock", action="store_true", help="무비용 mock 백엔드로 전체 실행")
     p.add_argument("--check", action="store_true", help="백엔드 가용성 진단 후 종료")
+    p.add_argument(
+        "--watch",
+        action="store_true",
+        help="실행 대신 --project-dir 의 진행을 실시간 모니터 TUI 로 본다",
+    )
     return p.parse_args(argv)
 
 
@@ -100,6 +105,13 @@ def main(argv=None) -> int:
     a = parse_args(argv)
     if a.check:
         return cmd_check()
+    if a.watch:
+        if not a.project_dir:
+            raise SystemExit("--watch 에는 --project-dir 가 필요합니다.")
+        from .monitor import run_tui
+
+        run_tui(a.project_dir.resolve())
+        return 0
     if not a.spec or not a.project_dir:
         raise SystemExit("--spec 와 --project-dir 는 필수입니다 (또는 --check 만 사용).")
     if not a.spec.exists():
