@@ -169,6 +169,7 @@ class Runner:
             role,
             status="idle",
             backend=chosen,
+            model=res.model or self.cfg.model_for(chosen),
             message=res.final_message or (res.error or ""),
             activity=f"✓ done [{chosen}]{cost} → {summary}"
             if res.ok

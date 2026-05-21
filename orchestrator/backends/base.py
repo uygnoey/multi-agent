@@ -12,11 +12,12 @@ from pathlib import Path
 from typing import Any
 
 
-async def run_subprocess(cmd: list[str], cwd: str, timeout: float | None, log_path=None):
+async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None):
     """서브프로세스를 타임아웃과 함께 실행. (returncode, stdout, stderr, timed_out) 반환.
 
     log_path 가 주어지면 stdout/stderr 를 라인 단위로 그 파일에 실시간 append(tee)한다 →
-    긴 CLI 호출 중에도 로그가 실시간으로 쌓인다. 타임아웃 시 자식을 kill 하고 timed_out=True.
+    긴 CLI 호출 중에도 로그가 실시간으로 쌓인다. line_render(line_bytes)->str|None 가 주어지면
+    stdout 각 라인을 그 함수로 가독 변환해 기록(예: stream-json → 텍스트). 타임아웃 시 kill.
     """
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -34,25 +35,34 @@ async def run_subprocess(cmd: list[str], cwd: str, timeout: float | None, log_pa
         except Exception:
             f = None
 
-    async def _pump(stream, chunks):
+    async def _pump(stream, chunks, render):
         while True:
             try:
                 line = await stream.readline()
-            except (ValueError, Exception):
+            except Exception:
                 break
             if not line:
                 break
             chunks.append(line)
             if f is not None:
                 try:
-                    f.write(line.decode(errors="replace"))
-                    f.flush()
+                    if render is not None:
+                        rendered = render(line)
+                        if rendered:
+                            f.write(rendered if rendered.endswith("\n") else rendered + "\n")
+                            f.flush()
+                    else:
+                        f.write(line.decode(errors="replace"))
+                        f.flush()
                 except Exception:
                     pass
 
     try:
         await asyncio.wait_for(
-            asyncio.gather(_pump(proc.stdout, out_chunks), _pump(proc.stderr, err_chunks)),
+            asyncio.gather(
+                _pump(proc.stdout, out_chunks, line_render),
+                _pump(proc.stderr, err_chunks, None),
+            ),
             timeout=timeout,
         )
         await proc.wait()
@@ -101,6 +111,7 @@ class RoleResult:
     cost_usd: float | None = None
     raw: Any = None
     error: str | None = None
+    model: str | None = None  # 실제 사용된 모델 (캡처 가능 시)
 
 
 class Backend:

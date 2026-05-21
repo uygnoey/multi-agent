@@ -7,10 +7,10 @@ subagent via the Task tool. The role definition is loaded from the target's
 
 from __future__ import annotations
 
-import json
 import shutil
 
 from .base import Backend, RoleRequest, RoleResult, run_subprocess
+from .claude_cli import claude_stream_line, parse_stream_result
 
 
 class ClaudeTeamBackend(Backend):
@@ -33,7 +33,8 @@ class ClaudeTeamBackend(Backend):
             "-p",
             lead_prompt,
             "--output-format",
-            "json",
+            "stream-json",
+            "--verbose",
             "--allowedTools",
             "Task,Read,Write,Edit,Bash",
             "--permission-mode",
@@ -43,7 +44,7 @@ class ClaudeTeamBackend(Backend):
             cmd += ["--model", req.model]
         try:
             rc, out, err, timed_out = await run_subprocess(
-                cmd, str(req.cwd), req.timeout, req.live_log_path
+                cmd, str(req.cwd), req.timeout, req.live_log_path, line_render=claude_stream_line
             )
         except Exception as e:
             return RoleResult(ok=False, error=str(e))
@@ -53,12 +54,7 @@ class ClaudeTeamBackend(Backend):
         if rc != 0:
             return RoleResult(ok=False, error=err.decode(errors="replace")[:500] or f"exit {rc}")
 
-        text = out.decode(errors="replace")
-        final, cost = text, None
-        try:
-            data = json.loads(text)
-            final = data.get("result", text)
-            cost = data.get("total_cost_usd")
-        except Exception:
-            pass
-        return RoleResult(ok=True, final_message=final, cost_usd=cost, raw=text[:2000])
+        final, cost, model = parse_stream_result(out)
+        return RoleResult(
+            ok=True, final_message=final or "(done)", cost_usd=cost, model=model or req.model
+        )

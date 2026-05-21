@@ -56,6 +56,33 @@ def test_run_manager_start_with_fake_spawn(tmp_path):
     assert "orchestrator" in captured["cmd"]
 
 
+def test_rerun_creates_new_run_from_saved_opts(tmp_path):
+    def fake_spawn(cmd, log_path):
+        class _P:
+            pid = 4321
+
+            def poll(self):
+                return 0
+
+        return _P()
+
+    m = webui.RunManager(tmp_path / "runs", spawn=fake_spawn)
+    rid = m.start("# spec\n- a", {"name": "demo", "backend": "mock", "mock": True})
+    assert (m.project_dir(rid) / "_run_opts.json").exists()  # opts 저장됨
+    rid2 = m.rerun(rid)
+    assert rid2 != rid and rid2.startswith("demo-")  # 새 run
+
+
+def test_stop_without_pid_returns_false(tmp_path):
+    m = webui.RunManager(tmp_path / "runs")
+    (m.project_dir("x-1") / ".orchestrator").mkdir(parents=True)
+    assert m.stop("x-1") is False  # pid 없음 → False (예외 없이)
+
+
+def test_new_run_id_is_unique():
+    assert webui.new_run_id("x") != webui.new_run_id("x")  # 같은 초에도 유일
+
+
 def test_read_events_tail(tmp_path):
     orch = tmp_path / ".orchestrator"
     orch.mkdir()
