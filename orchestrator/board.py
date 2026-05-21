@@ -61,6 +61,7 @@ class Board:
                 "total_cost_usd": 0.0,
                 "total_tokens": 0,
                 "cost_estimated": False,
+                "warnings": [],
                 "agents": {},
                 "artifacts": [],  # 설계/공통 산출물 (특정 unit 에 속하지 않는)
                 "units": [],
@@ -77,14 +78,19 @@ class Board:
                 if not uid or uid in existing:
                     continue
                 existing.add(uid)
+                # 스칼라(문자열) deps/roles 도 안전하게 정규화 ("U1" → ["U1"], 문자단위 분해 방지)
+                deps = u.get("deps") or []
+                deps = [str(deps)] if isinstance(deps, str) else [str(d) for d in deps]
+                roles_raw = u.get("roles") or []
+                roles_raw = [roles_raw] if isinstance(roles_raw, str) else list(roles_raw)
                 self._data["units"].append(
                     {
                         "id": uid,
                         "title": u.get("title", uid),
                         "description": u.get("description", ""),
                         "status": DESIGNED,
-                        "deps": list(u.get("deps", [])),
-                        "roles": [normalize_role(r) for r in u.get("roles", [])]
+                        "deps": deps,
+                        "roles": [normalize_role(r) for r in roles_raw]
                         or ["frontend-developer", "backend-developer", "dba"],
                         "artifacts": [],
                         "test_status": None,
@@ -93,6 +99,13 @@ class Board:
                 )
             self._flush()
         await self.log_event("board", f"added {len(units)} unit(s)")
+
+    async def add_warning(self, msg: str) -> None:
+        """치명적이지 않지만 최종 성공으로 오해되면 안 되는 실패(설계/CI/문서 등)를 기록."""
+        async with self._lock:
+            self._data.setdefault("warnings", []).append(msg)
+            self._flush()
+        await self.log_event("scheduler", f"WARNING: {msg}")
 
     async def set_status(self, unit_id: str, status: str, note: str | None = None) -> None:
         async with self._lock:
@@ -229,13 +242,19 @@ class Board:
         d = self._data
         units = d.get("units", [])
         done = sum(1 for u in units if u["status"] == "done")
+        warnings = d.get("warnings") or []
         lines = [
             "# Run Report",
             "",
             f"- phase: **{d.get('phase')}**",
+            f"- result: **{'⚠ done with warnings' if warnings else 'ok'}**",
             f"- units done: **{done}/{len(units)}**",
             f"- total cost: **${d.get('total_cost_usd', 0.0):.4f}**",
             f"- stack: {d.get('stack')}",
+        ]
+        if warnings:
+            lines += ["", "## ⚠ Warnings", ""] + [f"- {w}" for w in warnings]
+        lines += [
             "",
             "## Units",
             "",

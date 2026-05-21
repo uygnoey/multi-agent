@@ -78,6 +78,11 @@ class Scheduler:
             arch_outcome = by_role.get("architecture-engineer", design_outcomes[0])
             for o in design_outcomes:  # 설계/테스트시트 산출물 → 전역 노출
                 await self.board.add_global_artifacts(o.get("artifacts", []))
+            if not arch_outcome.get("_ok", True):
+                # 설계 실패는 '성공한 빌드'로 오탐되면 안 됨 → 경고로 명시 기록
+                await self.board.add_warning(
+                    f"design(architecture-engineer) failed: {arch_outcome.get('blockers') or '?'}"
+                )
             units = arch_outcome.get("units") or []
             if units:
                 await self.board.add_units(units)
@@ -90,7 +95,7 @@ class Scheduler:
 
             # Phase B/C — unit별 동시 개발 + 완료 시 테스트 트리거
             unit_list = self.board.units()
-            if self.cfg.max_units:
+            if self.cfg.max_units and self.cfg.max_units > 0:  # 음수면 슬라이싱 오작동 → 무시
                 unit_list = unit_list[: self.cfg.max_units]
             await self.board.set_phase("build")
             await self.board.log_event(
@@ -119,12 +124,16 @@ class Scheduler:
             await self.board.log_event("scheduler", "Phase D: CI/CD")
             cicd_out = await self.runner.run_role("cicd")
             await self.board.add_global_artifacts(cicd_out.get("artifacts", []))
+            if not cicd_out.get("_ok", True):
+                await self.board.add_warning("cicd failed (배포 파이프라인 산출물 미완)")
 
             # Phase E — 문서화: 실행 가이드(EN/KO) + 개발 산출물(EN/KO)
             await self.board.set_phase("docs")
             await self.board.log_event("scheduler", "Phase E: docs (EN/KO)")
             docs_out = await self.runner.run_role("docs-writer")
             await self.board.add_global_artifacts(docs_out.get("artifacts", []))
+            if not docs_out.get("_ok", True):
+                await self.board.add_warning("docs-writer failed (산출물 문서 미완)")
             # 보드 기반 산출물 문서는 백엔드와 무관하게 항상 EN/KO 생성
             await self.board.add_global_artifacts(self.board.write_deliverables())
 

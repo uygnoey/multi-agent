@@ -147,7 +147,7 @@ class RunConfig:
     role_priority: dict[str, list[str]] = field(default_factory=dict)
     # True 면 역할들을 우선순위 목록에 라운드로빈으로 분산(모든 백엔드 동시 가동).
     distribute: bool = False
-    # True 면 생산자/검증자를 서로 다른 프로바이더에 배치(교차 검증). distribute 보다 우선.
+    # True 면 미핀 역할을 풀에 번갈아(교차) 배정 → 두 모델이 섞여 상호 검증. distribute 보다 우선.
     cross_check: bool = False
 
     def backends_for(self, role: str) -> list[str]:

@@ -416,15 +416,18 @@ def _make_handler(manager: RunManager):
                 if prov and resolve(prov) not in VALID_BACKENDS:
                     self._json({"error": f"invalid backend for {role}: {prov}"}, 400)
                     return
-            # 숫자 옵션 검증 (잘못된 값이 build_command 의 int() 에서 크래시하지 않도록)
+            # 숫자 옵션 검증: int 변환 + 범위(>=1). 음수/0/비정상값은 400 으로 거부.
             for fld in ("concurrency", "max_units", "max_attempts"):
                 v = data.get(fld)
                 if v in (None, ""):
                     continue
                 try:
-                    int(v)
+                    iv = int(v)
                 except (TypeError, ValueError):
                     self._json({"error": f"invalid {fld}: {v!r}"}, 400)
+                    return
+                if iv < 1:
+                    self._json({"error": f"{fld} must be >= 1 (got {iv})"}, 400)
                     return
             run_id = manager.start(data.get("spec_text", ""), data)
             self._json({"run_id": run_id})
@@ -664,8 +667,10 @@ async function tick(){
     $("units").textContent=done+"/"+((b.units||[]).length);
     const runN=(s.roles||[]).filter(r=>(ag[r]||{}).status==="running").length;
     $("runCount").textContent=runN+"개";
-    // 3-state: 실행중 / 완료(done) / 중단(stopped)
-    $("running").textContent=s.running?"running":(b.phase==="done"?"✅ done":"⏹ stopped");
+    // 3-state: 실행중 / 완료(done, 경고 있으면 ⚠) / 중단(stopped)
+    const warns=b.warnings||[];
+    $("running").textContent=s.running?"running"
+      :(b.phase==="done"?(warns.length?("⚠ done ("+warns.length+" 경고)"):"✅ done"):"⏹ stopped");
     $("stopBtn").style.display=s.running?"":"none";       // 실행 중에만 정지
     $("rerunBtn").style.display=s.running?"none":"";      // 정지/완료 상태에서만 재실행
     // 에이전트 카드 — 각 카드에 모델·비용·유닛 + 실시간 로그(프롬프트·스트리밍·결과)
@@ -683,8 +688,10 @@ async function tick(){
     const log=$("liveLog");const atBottom=log.scrollTop+log.clientHeight>=log.scrollHeight-30;
     log.textContent=s.events||"(로그 대기 중…)";
     if(atBottom)log.scrollTop=log.scrollHeight;
-    // 산출물 — 설계·공통 + unit별 (저장 경로)
-    let html="<div>보드/런상태: <b style='user-select:all'>"+esc(proj)+"/.orchestrator/</b></div>";
+    // 산출물 — 경고(있으면) + 설계·공통 + unit별 (저장 경로)
+    let html="";
+    if(warns.length)html+="<div style='color:#f85149;margin-bottom:6px'>⚠ "+warns.map(esc).join("<br>⚠ ")+"</div>";
+    html+="<div>보드/런상태: <b style='user-select:all'>"+esc(proj)+"/.orchestrator/</b></div>";
     const g=b.artifacts||[];
     if(g.length)html+="<div style='margin-top:6px'><b>설계·공통</b><br>"+g.map(a=>"&nbsp;&nbsp;"+esc(proj)+"/"+esc(a)).join("<br>")+"</div>";
     (b.units||[]).forEach(u=>{const arts=u.artifacts||[];if(arts.length){

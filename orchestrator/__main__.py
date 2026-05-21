@@ -46,7 +46,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument(
         "--cross-check",
         action="store_true",
-        help="생산자(개발)·검증자(test/QA)를 서로 다른 프로바이더에 배치 (교차 검증, 풀 2개+)",
+        help="역할을 풀에 번갈아 교차 배정(핀 유지) — 두 모델이 섞여 검증 (풀 2개+)",
     )
     p.add_argument(
         "--role-backend",

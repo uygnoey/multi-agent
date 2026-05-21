@@ -64,7 +64,7 @@ class OpenAIAgentsBackend(Backend):
 
         @function_tool
         def run_bash(command: str) -> str:
-            """타깃 cwd 에서 셸 명령을 실행한다 (120s 타임아웃)."""
+            """셸 명령 실행 (cwd=타깃, 120s). 주의: 셸 자체는 FS 경계를 강제하지 않는다."""
             try:
                 r = subprocess.run(
                     command,
@@ -78,11 +78,22 @@ class OpenAIAgentsBackend(Backend):
             except Exception as e:
                 return f"<bash error: {e}>"
 
-        kwargs = dict(
-            name=req.role,
-            instructions=req.system_prompt,
-            tools=[read_file, write_file, list_dir, run_bash],
-        )
+        # 역할의 allowed_tools 만 노출 (다른 백엔드의 --allowedTools 와 동일한 격리).
+        tool_map = {
+            "Read": [read_file, list_dir],
+            "Write": [write_file],
+            "Edit": [write_file],
+            "Bash": [run_bash],
+        }
+        tools: list = []
+        for t in req.allowed_tools or []:
+            for fn in tool_map.get(t, []):
+                if fn not in tools:
+                    tools.append(fn)
+        if not tools:  # 안전 폴백: 읽기/목록만 (bash 제외)
+            tools = [read_file, list_dir]
+
+        kwargs = dict(name=req.role, instructions=req.system_prompt, tools=tools)
         if req.model:
             kwargs["model"] = req.model
         agent = Agent(**kwargs)
