@@ -6,32 +6,37 @@ import 는 lazy — 패키지가 없어도 모듈 로드/--check 는 동작한�
 
 from __future__ import annotations
 
+import asyncio
 import os
 
 from .base import Backend, RoleRequest, RoleResult
 
 
 def _make_options(cls, **kwargs):
-    """버전에 따라 지원 안 되는 kwarg 를 점진적으로 제거하며 옵션 생성."""
-    optional = ["max_budget_usd", "model", "setting_sources", "max_turns", "permission_mode"]
-    while True:
-        try:
-            return cls(**kwargs)
-        except TypeError as e:
-            removed = False
-            for k in list(kwargs):
-                if k in str(e):
-                    kwargs.pop(k)
-                    removed = True
-                    break
-            if not removed:
-                for k in optional:
-                    if k in kwargs:
-                        kwargs.pop(k)
-                        removed = True
-                        break
-            if not removed:
-                raise
+    """SDK 버전에 따라 지원되는 인자만 골라 옵션 생성 (시그니처 기반).
+
+    예전의 에러문자열 부분매칭 방식은 지원되는 인자를 잘못 제거할 수 있어 폐기.
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(cls).parameters
+        accepts_kwargs = any(p.kind == p.VAR_KEYWORD for p in params.values())
+        if not accepts_kwargs:
+            kwargs = {k: v for k, v in kwargs.items() if k in params}
+    except (ValueError, TypeError):
+        pass
+    try:
+        return cls(**kwargs)
+    except TypeError:
+        # 최후 방어: 선택 인자를 제거하며 재시도
+        for k in ("agents", "max_budget_usd", "setting_sources", "model", "max_turns"):
+            kwargs.pop(k, None)
+            try:
+                return cls(**kwargs)
+            except TypeError:
+                continue
+        raise
 
 
 def _build_agents(teammates: list[dict]):
@@ -114,15 +119,28 @@ class ClaudeSDKBackend(Backend):
                     kwargs["allowed_tools"].append("Task")
         options = _make_options(ClaudeAgentOptions, **kwargs)
 
-        final, cost = "", None
-        try:
+        state = {"final": "", "cost": None}
+
+        async def _consume():
             async for msg in query(prompt=req.prompt, options=options):
                 text = _extract_text(msg)
                 if text:
-                    final = text
+                    state["final"] = text
                 c = getattr(msg, "total_cost_usd", None)
                 if c is not None:
-                    cost = c
+                    state["cost"] = c
+
+        try:
+            await asyncio.wait_for(_consume(), timeout=req.timeout)
+        except asyncio.TimeoutError:
+            return RoleResult(
+                ok=False,
+                error=f"claude-sdk timed out after {req.timeout}s",
+                final_message=state["final"],
+                cost_usd=state["cost"],
+            )
         except Exception as e:
-            return RoleResult(ok=False, error=str(e), final_message=final, cost_usd=cost)
-        return RoleResult(ok=True, final_message=final, cost_usd=cost)
+            return RoleResult(
+                ok=False, error=str(e), final_message=state["final"], cost_usd=state["cost"]
+            )
+        return RoleResult(ok=True, final_message=state["final"], cost_usd=state["cost"])

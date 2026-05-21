@@ -6,6 +6,7 @@ pip install openai-agents / 인증 OPENAI_API_KEY.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 from pathlib import Path
@@ -86,7 +87,11 @@ class OpenAIAgentsBackend(Backend):
             kwargs["model"] = req.model
         agent = Agent(**kwargs)
         try:
-            result = await Runner.run(agent, req.prompt, max_turns=req.max_turns)
+            result = await asyncio.wait_for(
+                Runner.run(agent, req.prompt, max_turns=req.max_turns), timeout=req.timeout
+            )
+        except asyncio.TimeoutError:
+            return RoleResult(ok=False, error=f"openai-agents timed out after {req.timeout}s")
         except Exception as e:
             return RoleResult(ok=False, error=str(e))
         return RoleResult(ok=True, final_message=str(getattr(result, "final_output", "")))

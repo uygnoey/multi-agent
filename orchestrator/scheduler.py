@@ -56,11 +56,17 @@ class Scheduler:
             await self.board.set_phase("design")
             await self.board.log_event("scheduler", "Phase A: design ‖ testsheet")
             design_outcomes = await asyncio.gather(*[self.runner.run_role(r) for r in DESIGN_ROLES])
-            arch_outcome = design_outcomes[0]  # DESIGN_ROLES[0] == architecture-engineer
+            # 아키텍트 결과를 역할명으로 선택 (DESIGN_ROLES 순서가 바뀌어도 안전)
+            by_role = dict(zip(DESIGN_ROLES, design_outcomes, strict=False))
+            arch_outcome = by_role.get("architecture-engineer", design_outcomes[0])
             units = arch_outcome.get("units") or []
             if units:
                 await self.board.add_units(units)
             if not self.board.units():
+                # 아키텍트가 units 를 못 만든 경우 — 명시적으로 기록 후 폴백
+                await self.board.log_event(
+                    "scheduler", "architect produced no units; falling back to single core unit"
+                )
                 await self.board.add_units([{"id": "U1", "title": "core", "roles": DEV_ROLES}])
 
             # Phase B/C — unit별 동시 개발 + 완료 시 테스트 트리거
@@ -91,7 +97,9 @@ class Scheduler:
 
     async def _process_unit(self, unit: dict, sem: asyncio.Semaphore) -> None:
         uid = unit["id"]
-        await self._wait_for_deps(unit)
+        if not await self._wait_for_deps(unit):
+            await self.board.set_status(uid, BLOCKED, "deps unmet or failed")
+            return
         async with sem:
             dev_roles = [r for r in unit.get("roles", DEV_ROLES) if r in DEV_ROLES] or DEV_ROLES
             passed = False
@@ -132,28 +140,48 @@ class Scheduler:
             if not passed:
                 await self.board.set_status(uid, FAILED, "QA failed after retries")
 
-    async def _wait_for_deps(self, unit: dict, timeout: float = 1800.0) -> None:
+    async def _wait_for_deps(self, unit: dict, timeout: float = 1800.0) -> bool:
+        """deps 가 모두 완료되면 True. 실패/blocked dep 이 있으면 즉시 False(패스트페일).
+
+        존재하지 않는 dep id 는 무시한다. 타임아웃 시 False.
+        """
         deps = unit.get("deps", [])
         if not deps:
-            return
+            return True
+        uid = unit["id"]
         waited = 0.0
         while waited < timeout:
-            done = {u["id"] for u in self.board.units() if u["status"] in TERMINAL_OK}
-            if all(d in done for d in deps):
-                return
+            status = {u["id"]: u["status"] for u in self.board.units()}
+            pending = [d for d in deps if d in status]  # 미지 dep 은 스킵
+            if any(status.get(d) in (FAILED, BLOCKED) for d in pending):
+                await self.board.log_event(uid, f"deps failed/blocked → fast-fail: {pending}")
+                return False
+            if all(status.get(d) in TERMINAL_OK for d in pending):
+                return True
             await asyncio.sleep(1.0)
             waited += 1.0
-        await self.board.log_event(unit["id"], f"deps timeout: {deps}")
+        await self.board.log_event(uid, f"deps timeout after {timeout:.0f}s: {deps}")
+        return False
 
     async def _supervise(self, role: str) -> None:
-        """PM/PL 상시 감독: 매 tick 마다 1-shot 리뷰 → 디렉티브 기록."""
+        """PM/PL 상시 감독: 매 tick 마다 1-shot 리뷰 → 디렉티브 기록.
+
+        루프 내 예외는 삼켜서 감독이 조용히 죽지 않게 한다(다음 tick 에 재시도).
+        """
         try:
             while not self._stop.is_set():
-                outcome = await self.runner.run_role(role)
-                notes = outcome.get("notes") or []
-                await self.board.append_directive(
-                    role, "; ".join(notes) if notes else f"{role} review tick"
-                )
+                try:
+                    outcome = await self.runner.run_role(role)
+                    if self._stop.is_set():
+                        break  # stop 이후 디렉티브를 쓰지 않음
+                    notes = outcome.get("notes") or []
+                    await self.board.append_directive(
+                        role, "; ".join(notes) if notes else f"{role} review tick"
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    await self.board.log_event(role, f"supervisor error: {e}")
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=self.cfg.poll_interval)
                 except asyncio.TimeoutError:

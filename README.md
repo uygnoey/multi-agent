@@ -161,7 +161,29 @@ python -m orchestrator --web --port 8765          # 또는: web-team-web --port 
   .orchestrator/                # 런 상태 (board.json, events.log, results/, directives.md, report.md)
 ```
 
-## 안전장치
+## 안전장치 (프로덕션 하드닝)
 
-세션별 `max_turns`·예산, 전역 동시성 세마포어, `--max-units`,
-경로 스코프(타깃 cwd 한정), 결과파일 단일 writer(보드는 오케스트레이터만 갱신).
+- **세션 타임아웃** `--timeout`(기본 1200초): 멈춘 백엔드 호출을 끊고 폴오버 (모든 백엔드 적용)
+- **폴오버/재시도**: 가용 백엔드만 선택, 전이성 실패 재시도, 다음 우선순위로 폴오버
+- **deps 패스트페일**: 실패/blocked 의존 unit 은 대기 없이 즉시 차단
+- **예외 격리**: 한 역할 실패가 다른 동시 역할을 취소시키지 않음 (run_role 비전파)
+- **결과 무결성**: 백엔드 실패 시 남은 결과파일을 성공으로 오탐하지 않음, 보드는 단일 writer
+- **웹 보안**: 경로 traversal 차단(run id 를 base_dir 로 한정·role 검증), 요청 바디 크기 상한
+- 세션별 `max_turns`·예산, 전역 동시성 세마포어, `--max-units`, 경로 스코프(타깃 cwd 한정)
+
+## 배포 (Docker)
+
+웹 UI를 컨테이너로 띄운다 (mock 은 키 없이 즉시 동작):
+
+```bash
+docker build -t web-team .
+docker run --rm -p 8765:8765 -v "$PWD/runs:/data/runs" web-team
+# 브라우저: http://localhost:8765
+```
+
+프로덕션 주의:
+- **실 백엔드**(claude-cli/codex/openai-agents/claude-sdk)는 각 CLI 설치·로그인 또는 API 키가 필요하다.
+  컨테이너에 키를 `-e OPENAI_API_KEY=… -e ANTHROPIC_API_KEY=…` 로 주입하거나, CLI 인증 디렉터리를 마운트한다.
+- 웹 UI는 인증이 없다 — 신뢰된 네트워크에서만 노출하거나 리버스 프록시 뒤에 인증을 두고, `--host` 바인딩을 제한한다.
+- 산출물·런 상태는 `/data/runs`(볼륨)에 생성된다.
+- CI: `.github/workflows/ci.yml` 가 lint(ruff)+test(pytest, 3.10–3.12)를 실행한다.

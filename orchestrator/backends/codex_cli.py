@@ -7,10 +7,10 @@ codex exec ... --cd <타깃> --sandbox workspace-write --json -o <out> --skip-gi
 
 from __future__ import annotations
 
-import asyncio
 import shutil
+import uuid
 
-from .base import Backend, RoleRequest, RoleResult
+from .base import Backend, RoleRequest, RoleResult, run_subprocess
 
 
 class CodexCLIBackend(Backend):
@@ -23,7 +23,14 @@ class CodexCLIBackend(Backend):
 
     async def run_role(self, req: RoleRequest) -> RoleResult:
         prompt = f"[SYSTEM ROLE INSTRUCTIONS]\n{req.system_prompt}\n\n[TASK]\n{req.prompt}"
-        out_path = req.cwd / ".orchestrator" / "results" / f"{req.role}__codex_last.txt"
+        key = req.unit["id"] if req.unit else "global"
+        # 동시 codex 호출 간 충돌 방지: role+unit+고유 토큰으로 출력 파일 분리
+        out_path = (
+            req.cwd
+            / ".orchestrator"
+            / "results"
+            / f"{req.role}__{key}__{uuid.uuid4().hex}.codex.txt"
+        )
         out_path.parent.mkdir(parents=True, exist_ok=True)
         cmd = [
             "codex",
@@ -41,20 +48,14 @@ class CodexCLIBackend(Backend):
         if req.model:
             cmd += ["--model", req.model]
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=str(req.cwd),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _out, err = await proc.communicate()
+            rc, _out, err, timed_out = await run_subprocess(cmd, str(req.cwd), req.timeout)
         except Exception as e:
             return RoleResult(ok=False, error=str(e))
 
-        if proc.returncode != 0:
-            return RoleResult(
-                ok=False, error=err.decode(errors="replace")[:500] or f"exit {proc.returncode}"
-            )
+        if timed_out:
+            return RoleResult(ok=False, error=f"codex timed out after {req.timeout}s")
+        if rc != 0:
+            return RoleResult(ok=False, error=err.decode(errors="replace")[:500] or f"exit {rc}")
 
         final = ""
         if out_path.exists():

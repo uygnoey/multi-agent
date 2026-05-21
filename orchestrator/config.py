@@ -153,6 +153,7 @@ class RunConfig:
     max_attempts: int = 2  # dev→test→qa rework attempts per unit
     retries: int = 1  # transient backend-failure retries per role call
     retry_backoff: float = 2.0  # seconds, exponential
+    session_timeout: float | None = 1200.0  # 역할 호출 1회 최대 시간(초); None=무제한
     # 우선순위 풀: 앞에서부터 가용한 백엔드를 쓰고, 실패 시 다음 백엔드로 폴오버.
     backend_priority: list[str] = field(default_factory=list)
     # 역할별 우선순위 override (role -> [backend, ...]).
