@@ -28,6 +28,9 @@
   --backends claude-cli,codex,claude-sdk,openai-agents
   # 분산: 역할마다 다른 백엔드를 1순위로 라운드로빈 → 4종 동시 가동(+폴오버 유지)
   --backends claude-cli,codex,claude-sdk,openai-agents --distribute
+  # 교차 검증: 개발(architect/FE/BE/DBA)은 풀[0], 검증(testsheet/test/QA)은 풀[1] → 서로 검증
+  #   PM↔PL 도 반대 프로바이더. 한쪽이 만든 코드를 다른 모델이 테스트.
+  --backends codex,claude-cli --cross-check
   # 역할별 우선순위 지정도 가능
   --role-backend frontend-developer=codex,claude-cli --role-backend dba=claude-sdk
   ```
@@ -92,6 +95,7 @@ python -m orchestrator --spec examples/specs/sample-spec.md --project-dir /tmp/d
 | `--backend NAME` | 전역 기본 백엔드 (단일). `--backends` 미지정 시 사용 |
 | `--backends B1,B2,...` | **우선순위 풀**: 앞에서부터 가용 백엔드 사용, 실패 시 다음으로 폴오버 |
 | `--distribute` | 역할들을 풀에 라운드로빈 **분산**(4종 동시 가동) |
+| `--cross-check` | 생산자(개발)와 검증자(test/QA)를 **서로 다른 프로바이더**에 배치(교차 검증) |
 | `--role-backend ROLE=B1[,B2,...]` | 역할별 백엔드(우선순위 리스트) override (반복 가능) |
 | `--delegate` | 역할 세션이 팀원을 네이티브 서브에이전트로 위임 호출 (Claude 백엔드) |
 | `--mock` | 모든 역할을 mock 으로 (무비용) |
