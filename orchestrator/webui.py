@@ -167,6 +167,7 @@ def _make_handler(manager: RunManager):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")  # 실시간: 캐시 금지
             self.end_headers()
             self.wfile.write(body)
 
@@ -181,7 +182,10 @@ def _make_handler(manager: RunManager):
             if u.path == "/":
                 self._send(200, INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
             elif u.path == "/api/runs":
-                self._json({"runs": list_runs(manager.base_dir)})
+                runs = list_runs(manager.base_dir)
+                for r in runs:
+                    r["running"] = manager.is_running(r["id"])
+                self._json({"runs": runs})
             elif u.path == "/api/check":
                 rows = backend_status()
                 for r in rows:
@@ -438,14 +442,19 @@ async function startRun(){
   await refreshRuns(); selectRun(j.run_id);
 }
 async function refreshRuns(){
-  const j=await (await fetch("/api/runs")).json();
-  const sel=$("runSel");sel.innerHTML="";
-  j.runs.forEach(r=>{const o=document.createElement("option");o.value=r.id;o.text=r.id;sel.appendChild(o)});
-  if(CUR)sel.value=CUR;
+  let runs=[];
+  try{runs=((await (await fetch("/api/runs")).json()).runs)||[]}catch(e){}
+  const sel=$("runSel");const prev=CUR;sel.innerHTML="";
+  if(!runs.length){const o=document.createElement("option");o.value="";o.text="(실행 없음)";sel.appendChild(o)}
+  runs.forEach(r=>{const o=document.createElement("option");o.value=r.id;
+    o.text=r.id+(r.running?" ● running":"");sel.appendChild(o)});
+  if(prev&&runs.some(r=>r.id===prev))sel.value=prev;
+  return runs;
 }
 function showLaunch(){CUR=null;$("launch").classList.remove("hide");$("dash").classList.add("hide")}
-function selectRun(id){if(!id)return;CUR=id;$("runSel").value=id;
-  $("launch").classList.add("hide");$("dash").classList.remove("hide")}
+function selectRun(id){if(!id)return;CUR=id;
+  try{localStorage.setItem("cur_run",id)}catch(e){}
+  $("runSel").value=id;$("launch").classList.add("hide");$("dash").classList.remove("hide");tick();}
 
 function statusDot(s){return '<span class="dot'+(s==="running"?" run":"")+'"></span>'}
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
@@ -479,7 +488,21 @@ async function tick(){
     $("artifacts").innerHTML=html;
   }catch(e){}
 }
-loadChecks();refreshRuns();setInterval(tick,1000);
+let _tk=0;
+async function loop(){
+  if(_tk++%5===0)await refreshRuns();   // 5초마다 run 목록 갱신(running 표시 포함)
+  if(CUR)tick();                          // 매 초 상태/로그 실시간 갱신
+}
+async function init(){
+  await loadChecks();
+  const runs=await refreshRuns();
+  let saved=null;try{saved=localStorage.getItem("cur_run")}catch(e){}
+  // 저장된 선택 우선, 없으면 최신 run 자동 선택 → 대시보드. 아무 run 없으면 새 실행.
+  const pick=(saved&&runs.some(r=>r.id===saved))?saved:(runs[0]&&runs[0].id);
+  if(pick)selectRun(pick);else showLaunch();
+  setInterval(loop,1000);
+}
+init();
 </script>
 </body></html>
 """
