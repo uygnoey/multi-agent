@@ -78,11 +78,16 @@ class Board:
                 if not uid or uid in existing:
                     continue
                 existing.add(uid)
-                # 스칼라(문자열) deps/roles 도 안전하게 정규화 ("U1" → ["U1"], 문자단위 분해 방지)
+                # 스칼라(문자열/숫자 등) deps/roles 도 안전하게 정규화
+                # ("U1" → ["U1"], 1 → ["1"]; 문자단위 분해나 TypeError 방지)
                 deps = u.get("deps") or []
-                deps = [str(deps)] if isinstance(deps, str) else [str(d) for d in deps]
+                deps = [str(d) for d in deps] if isinstance(deps, (list, tuple)) else [str(deps)]
                 roles_raw = u.get("roles") or []
-                roles_raw = [roles_raw] if isinstance(roles_raw, str) else list(roles_raw)
+                roles_raw = (
+                    [str(r) for r in roles_raw]
+                    if isinstance(roles_raw, (list, tuple))
+                    else [str(roles_raw)]
+                )
                 self._data["units"].append(
                     {
                         "id": uid,

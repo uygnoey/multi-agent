@@ -210,8 +210,16 @@ class Runner:
                 data = json.loads(result_path.read_text(encoding="utf-8"))
                 return _coerce_result(data, res)
             except Exception:
-                pass
-        # 결과파일을 안 남긴 경우: 백엔드 결과로 합성
+                # 결과파일이 있는데 깨졌으면 계약 위반 → 성공으로 오탐하지 않는다
+                return {
+                    "status": "failed",
+                    "artifacts": [],
+                    "notes": [],
+                    "blockers": ["result file unparseable (contract violation)"],
+                    "units": [],
+                    "_ok": False,
+                }
+        # 결과파일을 안 남긴 경우: 백엔드 결과로 합성 (파일을 안 쓰는 역할 등)
         return {
             "status": "done" if res.ok else "failed",
             "artifacts": [],
@@ -231,14 +239,21 @@ def _as_list(v) -> list:
 
 
 def _coerce_result(data: dict, res) -> dict:
-    """Normalize an agent-written result file to the expected schema."""
+    """Normalize an agent-written result file to the expected schema.
+
+    status 를 소문자 정규화하고, 에이전트가 status=failed/blocked/error 또는 blockers 를 보고하면
+    (백엔드 호출이 성공했더라도) _ok=False 로 내린다. 그래야 스케줄러 판정이 제대로 잡힌다.
+    """
     if not isinstance(data, dict):
         data = {}
+    status = str(data.get("status") or ("done" if res.ok else "failed")).strip().lower()
+    blockers = [str(b) for b in _as_list(data.get("blockers"))]
+    ok = res.ok and status not in ("failed", "blocked", "error") and not blockers
     return {
-        "status": str(data.get("status") or ("done" if res.ok else "failed")),
+        "status": status,
         "artifacts": [str(a) for a in _as_list(data.get("artifacts"))],
         "notes": [str(n) for n in _as_list(data.get("notes"))],
-        "blockers": [str(b) for b in _as_list(data.get("blockers"))],
+        "blockers": blockers,
         "units": [u for u in _as_list(data.get("units")) if isinstance(u, dict)],
-        "_ok": res.ok,
+        "_ok": ok,
     }

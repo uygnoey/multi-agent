@@ -357,7 +357,14 @@ def _make_handler(manager: RunManager):
             if u.path not in ("/api/run", "/api/stop", "/api/rerun"):
                 self._json({"error": "not found"}, 404)
                 return
-            length = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+            except (TypeError, ValueError):  # malformed 헤더 → 핸들러가 죽지 않게 400
+                self._json({"error": "invalid Content-Length"}, 400)
+                return
+            if length < 0:
+                self._json({"error": "invalid Content-Length"}, 400)
+                return
             if length > MAX_BODY_BYTES:
                 self._json({"error": f"body too large (> {MAX_BODY_BYTES} bytes)"}, 413)
                 return
