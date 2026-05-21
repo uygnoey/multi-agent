@@ -78,6 +78,7 @@ class Runner:
             result_rel=result_rel,
             spec_text=self.board.spec_text,
             timeout=self.cfg.session_timeout,
+            live_log_path=self.board.agents_dir / f"{role}.log",
             delegate=delegate,
             teammates=teammates,
         )
@@ -125,7 +126,19 @@ class Runner:
                 if result_path.exists():
                     result_path.unlink()  # 후보마다 직전 결과 제거 → 신선도 보장
 
+                # 상세 로그: 보낸 프롬프트 (시스템 + 작업)
+                self.board.write_agent_block(
+                    role,
+                    f"PROMPT → [{name}]" + (f" unit={key}" if unit else ""),
+                    "[SYSTEM]\n" + agent.system_prompt + "\n\n[TASK]\n" + prompt,
+                )
                 res = await self._run_with_retries(get_backend(name), req, role, key)
+                # 상세 로그: 받은 결과 (CLI 의 경우 위에 원시 스트리밍 출력도 기록됨)
+                self.board.write_agent_block(
+                    role,
+                    f"RESULT ← [{name}] ok={res.ok}",
+                    (res.final_message or res.error or "(no output)")[:8000],
+                )
                 if res.cost_usd:
                     role_cost += res.cost_usd
                     await self.board.add_cost(res.cost_usd)

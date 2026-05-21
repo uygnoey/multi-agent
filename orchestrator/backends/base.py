@@ -12,27 +12,64 @@ from pathlib import Path
 from typing import Any
 
 
-async def run_subprocess(cmd: list[str], cwd: str, timeout: float | None):
+async def run_subprocess(cmd: list[str], cwd: str, timeout: float | None, log_path=None):
     """서브프로세스를 타임아웃과 함께 실행. (returncode, stdout, stderr, timed_out) 반환.
 
-    타임아웃 시 자식을 kill 하고 timed_out=True. 멈춘 CLI 백엔드가 런을 무한 정지시키지 않게 한다.
+    log_path 가 주어지면 stdout/stderr 를 라인 단위로 그 파일에 실시간 append(tee)한다 →
+    긴 CLI 호출 중에도 로그가 실시간으로 쌓인다. 타임아웃 시 자식을 kill 하고 timed_out=True.
     """
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=2**20,  # 큰 JSON 라인 대응 (기본 64KB 초과 방지)
     )
+    out_chunks: list[bytes] = []
+    err_chunks: list[bytes] = []
+    f = None
+    if log_path is not None:
+        try:
+            f = open(log_path, "a", encoding="utf-8")  # noqa: SIM115 (수동 close)
+        except Exception:
+            f = None
+
+    async def _pump(stream, chunks):
+        while True:
+            try:
+                line = await stream.readline()
+            except (ValueError, Exception):
+                break
+            if not line:
+                break
+            chunks.append(line)
+            if f is not None:
+                try:
+                    f.write(line.decode(errors="replace"))
+                    f.flush()
+                except Exception:
+                    pass
+
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        await asyncio.wait_for(
+            asyncio.gather(_pump(proc.stdout, out_chunks), _pump(proc.stderr, err_chunks)),
+            timeout=timeout,
+        )
+        await proc.wait()
+        return proc.returncode, b"".join(out_chunks), b"".join(err_chunks), False
     except asyncio.TimeoutError:
         try:
             proc.kill()
             await proc.wait()
         except Exception:
             pass
-        return None, b"", b"", True
-    return proc.returncode, out, err, False
+        return None, b"".join(out_chunks), b"".join(err_chunks), True
+    finally:
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
 
 
 @dataclass
@@ -51,6 +88,7 @@ class RoleRequest:
     result_rel: str  # cwd 기준 상대경로
     spec_text: str
     timeout: float | None = None  # 백엔드 호출(서브프로세스/세션) 최대 시간(초)
+    live_log_path: Path | None = None  # 실시간 스트리밍 로그 파일 (per-agent)
     delegate: bool = False
     # 위임 가능 팀원 정의: [{name, description, prompt, tools, model}]
     teammates: list[dict] = field(default_factory=list)

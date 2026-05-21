@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -31,7 +32,7 @@ MAX_SPEC_BYTES = 1024 * 1024  # 기획서 텍스트 상한
 
 
 def _read_events(orch_dir, n: int = 300) -> str:
-    """events.log 의 최근 n 줄 (실시간 로그 패널용)."""
+    """events.log 의 최근 n 줄 (통합 로그 패널용)."""
     p = orch_dir / "events.log"
     if not p.exists():
         return ""
@@ -39,6 +40,39 @@ def _read_events(orch_dir, n: int = 300) -> str:
         return "\n".join(p.read_text(encoding="utf-8", errors="replace").splitlines()[-n:])
     except Exception:
         return ""
+
+
+def _read_agent_logs(orch_dir, roles, n: int = 40) -> dict:
+    """역할별 실시간 로그 tail {role: text} (활동 있는 역할만)."""
+    out = {}
+    ad = orch_dir / "agents"
+    for role in roles:
+        p = ad / f"{role}.log"
+        if not p.exists():
+            continue
+        try:
+            lines = p.read_text(encoding="utf-8", errors="replace").splitlines()[-n:]
+            if lines:
+                out[role] = "\n".join(lines)
+        except Exception:
+            pass
+    return out
+
+
+def _run_alive(orch_dir) -> bool:
+    """run.pid 의 프로세스가 살아있는지 (웹 서버 재시작/외부 실행에도 정확)."""
+    pf = orch_dir / "run.pid"
+    if not pf.exists():
+        return False
+    try:
+        pid = int(pf.read_text(encoding="utf-8").strip())
+    except Exception:
+        return False
+    try:
+        os.kill(pid, 0)  # signal 0 = 존재/권한 확인 (죽었으면 OSError)
+    except OSError:
+        return False
+    return True
 
 
 def slugify(name: str) -> str:
@@ -136,23 +170,26 @@ class RunManager:
     def is_running(self, run_id: str) -> bool:
         with self._lock:
             proc = self._procs.get(run_id)
-        if proc is None:
-            return False
-        if getattr(proc, "poll", lambda: 0)() is None:
-            return True
-        # 종료됨 → 좀비 reap + 로그 핸들 close
-        try:
-            if hasattr(proc, "wait"):
-                proc.wait()
-        except Exception:
-            pass
-        fh = getattr(proc, "_logfile", None)
-        if fh is not None:
+        if proc is not None:
+            if getattr(proc, "poll", lambda: 0)() is None:
+                return True
+            # 종료됨 → 좀비 reap + 로그 핸들 close
             try:
-                fh.close()
+                if hasattr(proc, "wait"):
+                    proc.wait()
             except Exception:
                 pass
-        return False
+            fh = getattr(proc, "_logfile", None)
+            if fh is not None:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+        # 이 서버가 띄우지 않은(고아/외부) run 도 PID 파일로 생존 확인
+        try:
+            return _run_alive(self.project_dir(run_id) / ".orchestrator")
+        except ValueError:
+            return False
 
 
 # ----------------- HTTP -----------------
@@ -196,6 +233,7 @@ def _make_handler(manager: RunManager):
                 proj = None
                 board = {}
                 events = ""
+                agent_logs = {}
                 if run:
                     try:
                         proj = manager.project_dir(run)
@@ -205,6 +243,7 @@ def _make_handler(manager: RunManager):
                     orch = proj / ".orchestrator"
                     board = _read_board(orch)
                     events = _read_events(orch)
+                    agent_logs = _read_agent_logs(orch, list(ROLES))
                 self._json(
                     {
                         "roles": list(ROLES),
@@ -212,6 +251,7 @@ def _make_handler(manager: RunManager):
                         "running": manager.is_running(run),
                         "project_dir": str(proj) if proj else "",
                         "events": events,
+                        "agent_logs": agent_logs if run else {},
                     }
                 )
             elif u.path == "/api/agent":
@@ -340,6 +380,13 @@ INDEX_HTML = r"""<!doctype html>
   <button class="secondary" onclick="showLaunch()">+ 새 실행</button>
 </header>
 <main>
+  <!-- Run picker (자동선택 안 함 — 사용자가 선택) -->
+  <section id="picker" class="card hide">
+    <h3 style="margin-top:0">실행(run) 선택</h3>
+    <div id="runList" class="muted">불러오는 중…</div>
+    <button class="secondary" style="margin-top:10px" onclick="showLaunch()">+ 새 실행</button>
+  </section>
+
   <!-- Launch -->
   <section id="launch" class="card">
     <h3 style="margin-top:0">새 실행 — 기획서 업로드</h3>
@@ -375,6 +422,7 @@ INDEX_HTML = r"""<!doctype html>
 
   <!-- Monitor: 단일 대시보드 (클릭 불필요, 모두 항상 표시) -->
   <section id="dash" class="card hide">
+    <button class="secondary" onclick="showPicker()" style="margin-bottom:8px">← run 목록</button>
     <div class="muted" style="margin-bottom:6px">
       📁 결과물 저장 위치: <b id="projDir" style="user-select:all">—</b>
     </div>
@@ -389,8 +437,11 @@ INDEX_HTML = r"""<!doctype html>
     <table><thead><tr><th>agent</th><th>state</th><th>$cost</th><th>calls</th><th>unit</th><th>최근 활동</th></tr></thead>
       <tbody id="agentRows"></tbody></table>
 
-    <h4 style="margin:14px 0 6px">실시간 로그</h4>
-    <pre id="liveLog" style="max-height:38vh">(로그 대기 중…)</pre>
+    <h4 style="margin:14px 0 6px">에이전트별 실시간 로그 (프롬프트·출력·결과)</h4>
+    <div id="agentLogs">(아직 활동 없음)</div>
+
+    <h4 style="margin:14px 0 6px">통합 로그 (이벤트)</h4>
+    <pre id="liveLog" style="max-height:30vh">(로그 대기 중…)</pre>
 
     <h4 style="margin:14px 0 6px">산출물 (생성된 파일)</h4>
     <div id="artifacts" class="muted" style="font-size:12px">(아직 없음)</div>
@@ -451,10 +502,15 @@ async function refreshRuns(){
   if(prev&&runs.some(r=>r.id===prev))sel.value=prev;
   return runs;
 }
-function showLaunch(){CUR=null;$("launch").classList.remove("hide");$("dash").classList.add("hide")}
-function selectRun(id){if(!id)return;CUR=id;
-  try{localStorage.setItem("cur_run",id)}catch(e){}
-  $("runSel").value=id;$("launch").classList.add("hide");$("dash").classList.remove("hide");tick();}
+function showLaunch(){CUR=null;$("launch").classList.remove("hide");$("dash").classList.add("hide");$("picker").classList.add("hide")}
+function showPicker(){CUR=null;$("picker").classList.remove("hide");$("launch").classList.add("hide");$("dash").classList.add("hide")}
+function selectRun(id){if(!id)return;CUR=id;$("runSel").value=id;
+  $("launch").classList.add("hide");$("picker").classList.add("hide");$("dash").classList.remove("hide");tick();}
+function renderPicker(runs){
+  $("runList").innerHTML=runs.length
+    ? runs.map(r=>'<div style="padding:7px 0;cursor:pointer;border-bottom:1px solid #21262d" onclick="selectRun(\''+r.id+'\')">'+(r.running?"🟢 ":"⚪️ ")+esc(r.id)+'</div>').join("")
+    : "(실행 없음 — 새 실행을 시작하세요)";
+}
 
 function statusDot(s){return '<span class="dot'+(s==="running"?" run":"")+'"></span>'}
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
@@ -476,12 +532,24 @@ async function tick(){
         '</td><td class="cost">$'+(+(a.cost_usd||0)).toFixed(4)+'</td><td>'+(a.calls||0)+
         '</td><td>'+(a.current_unit||"-")+'</td><td class="muted" title="'+esc(a.last_message||"")+
         '">'+esc(act)+'</td></tr>'}).join("");
-    // 실시간 로그 — 항상 표시 + 자동 스크롤
+    // 에이전트별 실시간 로그 패널 (프롬프트·스트리밍 출력·결과, 클릭 불필요)
+    const logs=s.agent_logs||{};
+    const active=(s.roles||[]).filter(r=>logs[r]||((ag[r]||{}).calls));
+    $("agentLogs").innerHTML=active.length?active.map(r=>{const a=ag[r]||{};
+      return '<div style="margin-bottom:8px"><div class="muted" style="margin-bottom:2px">'+statusDot(a.status)+
+        '<b>'+r+'</b> '+(a.status||"idle")+' · $'+(+(a.cost_usd||0)).toFixed(4)+
+        (a.current_unit&&a.current_unit!=="global"?' · '+esc(a.current_unit):"")+
+        '</div><pre style="max-height:24vh">'+esc(logs[r]||"(대기 중)")+'</pre></div>'}).join("")
+      :"(아직 활동 없음)";
+    document.querySelectorAll("#agentLogs pre").forEach(p=>{p.scrollTop=p.scrollHeight});
+    // 통합 로그 — 자동 스크롤
     const log=$("liveLog");const atBottom=log.scrollTop+log.clientHeight>=log.scrollHeight-30;
     log.textContent=s.events||"(로그 대기 중…)";
     if(atBottom)log.scrollTop=log.scrollHeight;
-    // 산출물 — 어디 저장됐는지 파일 경로로
+    // 산출물 — 설계·공통 + unit별 (저장 경로)
     let html="<div>보드/런상태: <b style='user-select:all'>"+esc(proj)+"/.orchestrator/</b></div>";
+    const g=b.artifacts||[];
+    if(g.length)html+="<div style='margin-top:6px'><b>설계·공통</b><br>"+g.map(a=>"&nbsp;&nbsp;"+esc(proj)+"/"+esc(a)).join("<br>")+"</div>";
     (b.units||[]).forEach(u=>{const arts=u.artifacts||[];if(arts.length){
       html+="<div style='margin-top:6px'><b>"+esc(u.id)+"</b> ("+esc(u.status)+", "+arts.length+" files)<br>"+
         arts.map(a=>"&nbsp;&nbsp;"+esc(proj)+"/"+esc(a)).join("<br>")+"</div>"}});
@@ -490,16 +558,14 @@ async function tick(){
 }
 let _tk=0;
 async function loop(){
-  if(_tk++%5===0)await refreshRuns();   // 5초마다 run 목록 갱신(running 표시 포함)
-  if(CUR)tick();                          // 매 초 상태/로그 실시간 갱신
+  if(_tk++%3===0){const runs=await refreshRuns();if(!CUR)renderPicker(runs);}  // 목록/picker 갱신
+  if(CUR)tick();                                                                // 매 초 실시간 갱신
 }
 async function init(){
   await loadChecks();
   const runs=await refreshRuns();
-  let saved=null;try{saved=localStorage.getItem("cur_run")}catch(e){}
-  // 저장된 선택 우선, 없으면 최신 run 자동 선택 → 대시보드. 아무 run 없으면 새 실행.
-  const pick=(saved&&runs.some(r=>r.id===saved))?saved:(runs[0]&&runs[0].id);
-  if(pick)selectRun(pick);else showLaunch();
+  renderPicker(runs);
+  showPicker();   // 자동선택 안 함 — 사용자가 run 을 선택해야 보인다
   setInterval(loop,1000);
 }
 init();

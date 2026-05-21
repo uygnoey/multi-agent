@@ -60,6 +60,7 @@ class Board:
                 "phase": "init",
                 "total_cost_usd": 0.0,
                 "agents": {},
+                "artifacts": [],  # 설계/공통 산출물 (특정 unit 에 속하지 않는)
                 "units": [],
             }
             self._flush()
@@ -124,6 +125,17 @@ class Board:
             self._data["phase"] = phase
             self._flush()
 
+    async def add_global_artifacts(self, artifacts: list[str]) -> None:
+        """특정 unit 에 속하지 않는 설계/공통 산출물 (architect docs, cicd 등)."""
+        if not artifacts:
+            return
+        async with self._lock:
+            g = self._data.setdefault("artifacts", [])
+            for a in artifacts:
+                if a not in g:
+                    g.append(a)
+            self._flush()
+
     async def add_cost(self, amount: float) -> None:
         async with self._lock:
             self._data["total_cost_usd"] = round(
@@ -179,6 +191,13 @@ class Board:
         self.agents_dir.mkdir(parents=True, exist_ok=True)
         with (self.agents_dir / f"{role}.log").open("a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%H:%M:%S')} {text}\n")
+
+    def write_agent_block(self, role: str, title: str, body: str) -> None:
+        """프롬프트/결과 같은 상세 블록을 per-agent 로그에 기록 (실시간 상세 로그용)."""
+        self.agents_dir.mkdir(parents=True, exist_ok=True)
+        bar = "─" * 56
+        with (self.agents_dir / f"{role}.log").open("a", encoding="utf-8") as f:
+            f.write(f"\n{bar}\n{time.strftime('%H:%M:%S')} {title}\n{bar}\n{body}\n")
 
     def agents(self) -> dict:
         return json.loads(json.dumps(self._data.get("agents", {})))
