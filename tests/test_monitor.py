@@ -57,7 +57,8 @@ def test_tui_stop_and_rerun_helpers(tmp_path):
     assert _stop_run(orch) is False  # run.pid 없음 → False (예외 없이)
     ok, msg = _rerun(orch)
     assert ok is False and ("재실행" in msg or "rerun" in msg.lower())  # rerun.json 없음
-    (orch / "rerun.json").write_text('{"argv":["--help"]}', encoding="utf-8")
+    # #11(round-6): --help 는 rerun argv 로 거부되므로, 유효한 store-true 플래그로 launch 경로 검증.
+    (orch / "rerun.json").write_text('{"argv":["--mock"]}', encoding="utf-8")
     # rerun.json 있으면 launch 시도 (argv 파싱 성공 경로)
     ok2, _ = _rerun(orch)
     assert ok2 is True

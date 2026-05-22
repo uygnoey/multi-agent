@@ -31,6 +31,11 @@ from .prompts import compose_prompt
 # 자리를 미리 점유한다. 정확한 값이 아니어도 시작 시점 동시 통과를 막는 것이 목적이다.
 _INFLIGHT_RESERVE_USD = 0.50
 
+# #22: 역할 세션이 쓰는 결과 JSON 의 최대 크기. 폭주/악성 에이전트가 거대한 결과 파일을 쓰면
+# orchestrator 가 read_text() 로 통째 메모리에 올리다 죽을 수 있다. 5MB 초과는 읽지 않고 계약
+# 위반(실패)으로 처리한다 — 정상 결과(아티팩트/노트/units 목록)는 이 한참 아래다.
+_MAX_RESULT_BYTES = 5 * 1024 * 1024
+
 
 def _truthy_env(name: str, default: bool) -> bool:
     """ORCH_* 불리언 환경변수 파싱. 미설정이면 default. 0/false/no/off → False, 그 외 → True."""
@@ -307,6 +312,24 @@ class Runner:
         # 부분/이전 결과파일을 성공으로 오탐하지 않도록 합성 실패 결과를 쓴다.
         # phase/role 을 _coerce_result 로 전달해 페이즈별 계약(아키텍트=units 필수 등)을 반영 (#97).
         if res.ok and result_path.exists():
+            # #22: read_text() 로 통째 올리기 전에 크기를 검사 — 거대 결과 파일은 메모리를
+            #      폭주시키므로 읽지 않고 계약 위반(실패)으로 처리한다.
+            try:
+                rsize = result_path.stat().st_size
+            except OSError:
+                rsize = 0
+            if rsize > _MAX_RESULT_BYTES:
+                return {
+                    "status": "failed",
+                    "artifacts": [],
+                    "notes": [],
+                    "blockers": [
+                        f"result file too large ({rsize} > {_MAX_RESULT_BYTES} bytes; "
+                        "contract violation)"
+                    ],
+                    "units": [],
+                    "_ok": False,
+                }
             try:
                 data = json.loads(result_path.read_text(encoding="utf-8"))
                 return _coerce_result(data, res, phase=phase, role=role)

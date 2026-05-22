@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import math
 import sys
 from pathlib import Path
 
@@ -22,7 +23,7 @@ from .scheduler import Scheduler
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="orchestrator",
-        description="멀티에이전트 · 멀티백엔드 웹서비스 빌드 오케스트레이터",
+        description="멀티에이전트 · 멀티백엔드 소프트웨어 빌드 오케스트레이터 (웹·앱·서비스·CLI)",
     )
     p.add_argument("--spec", type=Path, help="기획서 마크다운 경로")
     p.add_argument("--project-dir", type=Path, help="산출물을 생성할 타깃 디렉터리")
@@ -79,6 +80,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--watch",
         action="store_true",
         help="실행 대신 --project-dir 의 진행을 실시간 모니터 TUI 로 본다",
+    )
+    p.add_argument(
+        "--interval",
+        type=float,
+        default=1.0,
+        help="--watch 모니터 TUI 의 갱신 주기(초). 기본 1.0",  # #16
     )
     p.add_argument(
         "--web",
@@ -170,9 +177,13 @@ def _print_summary(snap: dict, cfg: RunConfig) -> None:
     done = sum(1 for u in units if u["status"] == "done")
     print(f"units       : {done}/{len(units)} done")
     # 손상된 스냅샷(문자열/None/리스트 cost)이라도 보드/리포트 경로는 출력되도록 안전 변환 (#29)
+    # (#10) NaN/Inf 도 방어: float("nan")/float("inf") 은 float() 를 통과하지만 그대로
+    #       :.4f 로 찍으면 "$nan"/"$inf"/"$-inf" 가 출력된다. 비유한값은 0.0 으로 강제한다.
     try:
         cost = float(snap.get("total_cost_usd", 0.0))
     except (TypeError, ValueError):
+        cost = 0.0
+    if not math.isfinite(cost):
         cost = 0.0
     print(f"cost        : ${cost:.4f}")
     warnings = snap.get("warnings") or []
@@ -199,7 +210,7 @@ def main(argv=None) -> int:
             raise SystemExit("--watch 에는 --project-dir 가 필요합니다.")
         from .monitor import run_tui
 
-        run_tui(a.project_dir.resolve())
+        run_tui(a.project_dir.resolve(), a.interval)  # #16: --interval 을 TUI 갱신 주기로 전달
         return 0
     if not a.spec or not a.project_dir:
         raise SystemExit("--spec 와 --project-dir 는 필수입니다 (또는 --check 만 사용).")

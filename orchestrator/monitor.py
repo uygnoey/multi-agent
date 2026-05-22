@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import signal
 import subprocess
@@ -25,6 +26,7 @@ import unicodedata
 from pathlib import Path
 
 from .backends import backend_status
+from .board import _tail_lines
 from .config import BACKEND_INFO, ROLES
 
 
@@ -123,6 +125,11 @@ def _stop_run(orch_dir: Path) -> bool:
         # SIGTERM 후 graceful 종료를 최대 ≈4초 기다린다(0.1초 간격 폴링). 죽으면 즉시 제거.
         for _ in range(40):
             if not _alive():
+                # #3: 부모(run.pid) 가 graceful 종료해도 SIGTERM 을 무시한 채 그룹에 남은
+                #     자식(부모만 먼저 죽은 child-only 잔존)이 있을 수 있다. pid 생존만 보면
+                #     놓치므로, 마지막에 그룹 SIGKILL 로 한 번 더 쓸어 잔존 자식을 일소한다
+                #     (그룹이 이미 비었으면 무해 — _kill 은 try/except).
+                _kill(signal.SIGKILL)
                 _remove_pidfile()
                 return
             time.sleep(0.1)
@@ -172,30 +179,37 @@ def _rerun(orch_dir: Path) -> tuple[bool, str]:
 
 # 재실행에 허용되는 오케스트레이터 플래그 화이트리스트 (#15).
 # rerun.json 이 조작돼도 알려진 플래그만 통과시켜 예상치 못한 플래그 주입을 막는다.
-# argparse 가 자동 추가하는 --help/-h 도 정상 토큰이므로 포함한다.
-_ALLOWED_RERUN_FLAGS = frozenset(
+# #11: 실제 저장된 run 의 argv 에는 --help/-h 가 절대 없다. 이를 허용하면 손상/조작된
+#      rerun.json 으로 `python -m orchestrator --help` 가 실행돼 help 만 출력하고 exit 0 이
+#      되는데도 _rerun() 은 "재실행 시작됨" 으로 거짓 보고한다. 따라서 화이트리스트에서 제외.
+# 값(value)을 요구하는 플래그 — 다음 토큰(또는 '--flag=value' 의 '=' 뒷부분)이 값이어야 한다 (#12).
+_VALUE_RERUN_FLAGS = frozenset(
     {
         "--spec",
         "--project-dir",
         "--backend",
         "--backends",
-        "--distribute",
-        "--cross-check",
         "--role-backend",
         "--max-units",
         "--concurrency",
         "--budget",
         "--model",
         "--poll-interval",
-        "--delegate",
         "--max-attempts",
         "--retries",
         "--timeout",
-        "--mock",
-        "--help",
-        "-h",
     }
 )
+# 값 없는 store-true 플래그 (#12).
+_STORE_TRUE_RERUN_FLAGS = frozenset(
+    {
+        "--distribute",
+        "--cross-check",
+        "--delegate",
+        "--mock",
+    }
+)
+_ALLOWED_RERUN_FLAGS = _VALUE_RERUN_FLAGS | _STORE_TRUE_RERUN_FLAGS
 
 
 def _validate_rerun_argv(argv) -> tuple[bool, str]:
@@ -208,6 +222,9 @@ def _validate_rerun_argv(argv) -> tuple[bool, str]:
     - '-' 로 시작하는 토큰은 모두 화이트리스트(_ALLOWED_RERUN_FLAGS)에 있어야 함.
       플래그가 아닌 토큰은 값(value)으로 보고 통과시킨다 (실용성: 로컬 신뢰 데이터).
       단, '--flag=value' 형태는 '=' 앞부분만 떼어 화이트리스트와 대조한다.
+    - #12: 값(value)을 요구하는 플래그는 arity 도 검증한다. '--flag=value' 형태가 아니면
+      바로 다음 토큰이 존재해야 하고, 그 토큰이 '-' 로 시작하지 않는 값이어야 한다.
+      (그렇지 않으면 spawn 된 오케스트레이터가 즉시 실패하는데 UI 는 "시작됨" 으로 보고됨.)
     """
     if not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
         return False, "재실행 인자 형식 오류 (list[str] 아님)"
@@ -218,13 +235,21 @@ def _validate_rerun_argv(argv) -> tuple[bool, str]:
         return False, "재실행 인자 거부 (첫 토큰이 절대경로)"
     if not first.startswith("-"):
         return False, "재실행 인자 거부 (첫 토큰이 오케스트레이터 플래그가 아님)"
-    # 화이트리스트 검사: '-' 로 시작하는 모든 토큰(=플래그)을 허용 목록과 대조한다 (#15).
-    for tok in argv:
+    # 화이트리스트 + arity 검사: '-' 로 시작하는 토큰(=플래그)을 허용 목록과 대조 (#15/#12).
+    n = len(argv)
+    for i, tok in enumerate(argv):
         if not tok.startswith("-"):
             continue  # 비플래그 토큰은 직전 플래그의 값으로 본다
         name = tok.split("=", 1)[0]  # '--flag=value' → '--flag'
         if name not in _ALLOWED_RERUN_FLAGS:
             return False, f"재실행 인자 거부 (허용되지 않은 플래그: {name})"
+        # #12: 값이 필요한 플래그의 arity 검증.
+        if name in _VALUE_RERUN_FLAGS and "=" not in tok:
+            if i + 1 >= n:
+                return False, f"재실행 인자 거부 ({name} 에 값이 없음)"
+            nxt = argv[i + 1]
+            if nxt.startswith("-"):
+                return False, f"재실행 인자 거부 ({name} 에 값 대신 플래그 {nxt} 가 옴)"
     return True, ""
 
 
@@ -233,13 +258,20 @@ def _num(value, fallback: float = 0.0) -> float:
 
     수동 편집/부분 손상으로 비숫자(null/문자열/list 등)가 들어와도 포매팅(:.4f / :,)이
     터지지 않도록 try float() 후 실패 시 fallback 으로 떨어진다.
+
+    #14: NaN/Inf 도 방어한다. "inf"/"nan"/float("inf") 등은 float() 를 통과하지만,
+         int(_num(...)) 가 OverflowError 를 던지거나 :.4f 가 "inf" 로 찍히므로 비유한값은
+         fallback 으로 강제한다.
     """
     try:
         if isinstance(value, bool):  # bool 은 int 의 서브클래스 → 비용/토큰으로 취급하지 않음
             return fallback
-        return float(value)
+        result = float(value)
     except (TypeError, ValueError):
         return fallback
+    if not math.isfinite(result):  # #14: NaN/Inf → fallback
+        return fallback
+    return result
 
 
 def _read_board(orch_dir: Path) -> dict:
@@ -259,13 +291,11 @@ def _read_board(orch_dir: Path) -> dict:
 
 
 def _read_agent_log(orch_dir: Path, role: str, n: int = 500) -> str:
+    # #20: 전체 파일을 읽지 않고 끝 청크만 seek-read 해 마지막 n 줄만 반환(대용량 로그 방어).
     p = orch_dir / "agents" / f"{role}.log"
     if not p.exists():
         return ""
-    try:
-        return "\n".join(p.read_text(encoding="utf-8").splitlines()[-n:])
-    except Exception:
-        return ""
+    return "\n".join(_tail_lines(p, n))
 
 
 # 상세 뷰 로그 mtime 캐시: 같은 파일이 안 바뀌었으면 매 refresh 마다 다시 읽지 않는다 (#36).
@@ -297,7 +327,9 @@ def render_snapshot(board: dict, roles: list[str], alive: bool | None = None) ->
     """
     phase = board.get("phase", "?")
     cost = _num(board.get("total_cost_usd", 0.0))  # 비숫자 손상값에도 :.4f 안 터지게 (#142)
-    units = board.get("units", [])
+    # #15: units 가 list 가 아니거나 원소가 dict 가 아닌 손상 board 에도 u.get() 가 안 터지게.
+    raw = board.get("units")
+    units = [u for u in raw if isinstance(u, dict)] if isinstance(raw, list) else []
     done = sum(1 for u in units if u.get("status") == "done")
     agents = board.get("agents", {})
 
@@ -395,7 +427,9 @@ def _draw_list(stdscr, board, roles, sel, orch_dir, alive) -> None:
     h, w = stdscr.getmaxyx()
     phase = board.get("phase", "—")
     cost = _num(board.get("total_cost_usd", 0.0))  # 손상값 가드 (#142)
-    units = board.get("units", [])
+    # #15: 손상 schema(units 가 list 아님 / 원소가 dict 아님) 에도 TUI 가 안 터지게.
+    raw = board.get("units")
+    units = [u for u in raw if isinstance(u, dict)] if isinstance(raw, list) else []
     done = sum(1 for u in units if u.get("status") == "done")
     agents = board.get("agents", {})
 
@@ -463,7 +497,10 @@ def _draw_artifacts(stdscr, board: dict, orch_dir: Path, scroll: int) -> int:
         body.append("[ 설계·공통 / design & shared ]")
         body += [f"  {proj}/{a}" for a in glob]
         body.append("")
-    for u in board.get("units", []):
+    # #15: units 가 list 아님 / 원소가 dict 아님인 손상 board 에도 안 터지게 방어 coerce.
+    raw = board.get("units")
+    units = [u for u in raw if isinstance(u, dict)] if isinstance(raw, list) else []
+    for u in units:
         arts = u.get("artifacts", [])
         if arts:
             body.append(f"[ {u['id']} — {u.get('title', '')} ]  ({u.get('status')})")
@@ -557,9 +594,27 @@ def _draw_detail(stdscr, board: dict, orch_dir: Path, role: str, scroll: int, fo
     return scroll, max_scroll
 
 
+def _clamp_interval(raw) -> float:
+    """TUI refresh 주기를 안전한 값으로 정규화한다 (#17, curses 없이 단위 테스트 가능한 순수 함수).
+
+    interval=0 이면 busy redraw, 음수면 blocking getch, NaN/Inf 면 int() 가 깨진다.
+    - float 변환 실패(TypeError/ValueError) → 1.0
+    - 비유한값(NaN/Inf) 또는 <= 0 → 1.0
+    - 그 외 → max(0.1, value) (너무 잦은 redraw 방지 하한 0.1초)
+    """
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(value) or value <= 0:
+        return 1.0
+    return max(0.1, value)
+
+
 def run_tui(project_dir: Path, interval: float = 1.0) -> None:
     import curses
 
+    interval = _clamp_interval(interval)  # #17: 0/음수/NaN/Inf 방어
     orch = Path(project_dir) / ".orchestrator"
     roles = list(ROLES)
 

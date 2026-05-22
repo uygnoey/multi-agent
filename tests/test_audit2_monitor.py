@@ -212,7 +212,9 @@ def test_corrupt_board_sentinel(tmp_path: Path):
 
 def test_rerun_argv_validation_present():
     # #90: list[str] 아니거나 첫 토큰이 절대경로/비플래그면 거부.
-    assert _validate_rerun_argv(["--help"])[0] is True
+    # #11(round-6): --help 는 rerun argv 로 거부(거짓 "재실행 시작" 방지). 정상 store-true 는 허용.
+    assert _validate_rerun_argv(["--mock"])[0] is True
+    assert _validate_rerun_argv(["--help"])[0] is False
     assert _validate_rerun_argv("not-a-list")[0] is False
     assert _validate_rerun_argv([1, 2])[0] is False
     assert _validate_rerun_argv(["/bin/sh"])[0] is False

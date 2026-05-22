@@ -12,7 +12,9 @@ TUI(monitor.py)와 동일한 데이터 소스(`<project-dir>/.orchestrator/board
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
+import math
 import os
 import re
 import signal
@@ -26,6 +28,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .backends import backend_status, resolve
+from .board import _tail_lines
 from .config import BACKEND_INFO, FRAMEWORK_ROOT, ROLES, VALID_BACKENDS
 from .monitor import _read_agent_log, _read_board
 
@@ -34,14 +37,14 @@ MAX_SPEC_BYTES = 1024 * 1024  # 기획서 텍스트 상한
 
 
 def _read_events(orch_dir, n: int = 300) -> str:
-    """events.log 의 최근 n 줄 (통합 로그 패널용)."""
+    """events.log 의 최근 n 줄 (통합 로그 패널용).
+
+    #20: 전체 파일을 읽지 않고 끝 청크만 seek-read 해 마지막 n 줄만 반환(대용량 로그 방어).
+    """
     p = orch_dir / "events.log"
     if not p.exists():
         return ""
-    try:
-        return "\n".join(p.read_text(encoding="utf-8", errors="replace").splitlines()[-n:])
-    except Exception:
-        return ""
+    return "\n".join(_tail_lines(p, n))
 
 
 def _read_agent_logs(orch_dir, roles, n: int = 120) -> dict:
@@ -57,12 +60,10 @@ def _read_agent_logs(orch_dir, roles, n: int = 120) -> dict:
         p = ad / f"{role}.log"
         if not p.exists():
             continue
-        try:
-            lines = p.read_text(encoding="utf-8", errors="replace").splitlines()[-n:]
-            if lines:
-                out[role] = "\n".join(lines)
-        except Exception:
-            pass
+        # #20: 전체 파일을 읽지 않고 끝 청크만 seek-read 해 마지막 n 줄만 보낸다(대용량 방어).
+        lines = _tail_lines(p, n)
+        if lines:
+            out[role] = "\n".join(lines)
     return out
 
 
@@ -361,6 +362,10 @@ class RunManager:
         _kill(signal.SIGTERM)
         for _ in range(10):  # ≈0.5초: 대부분의 프로세스는 SIGTERM 으로 즉시 종료
             if not _alive():
+                # #3: 부모가 graceful 종료해도 SIGTERM 을 무시한 채 그룹에 남은 자식(부모만
+                #     먼저 죽은 child-only 잔존)이 있을 수 있다. pid 생존만 보면 놓치므로 마지막에
+                #     그룹 SIGKILL 로 한 번 더 쓸어 잔존 자식을 일소한다(그룹 비면 무해).
+                _kill(signal.SIGKILL)
                 _remove_pidfile()
                 return True
             time.sleep(0.05)
@@ -369,6 +374,7 @@ class RunManager:
             # 남은 시간(최대 ≈3.5초) graceful 종료를 더 기다린다(0.1초 간격 폴링).
             for _ in range(35):
                 if not _alive():
+                    _kill(signal.SIGKILL)  # #3: 잔존 자식 일소(그룹 SIGKILL 스윕)
                     _remove_pidfile()
                     return
                 time.sleep(0.1)
@@ -433,18 +439,25 @@ class RunManager:
 # ----------------- HTTP -----------------
 
 
-def _make_handler(manager: RunManager):
+def _make_handler(manager: RunManager, token: str | None = None):
+    # #17: WEB_UI_TOKEN 이 설정되면(빈 문자열 아님) 모든 /api/* 요청에 토큰을 요구한다.
+    #      미설정이면 인증 비활성(하위호환). serve() 가 env 에서 읽어 주입하지만, 테스트가
+    #      직접 토큰을 넘길 수 있도록 인자도 받는다(인자 우선).
+    auth_token = (token if token is not None else os.environ.get("WEB_UI_TOKEN", "")).strip()
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):  # quiet
             pass
 
-        def _send(self, code: int, body: bytes, ctype: str):
+        def _send(self, code: int, body: bytes, ctype: str, extra_headers=None):
             # #88: 클라이언트 연결 끊김(소켓 쓰기 실패)은 조용히 무시 — 트레이스백 방지
             try:
                 self.send_response(code)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")  # 실시간: 캐시 금지
+                for k, v in extra_headers or []:
+                    self.send_header(k, v)
                 self.end_headers()
                 self.wfile.write(body)
             except (BrokenPipeError, ConnectionError):
@@ -455,11 +468,86 @@ def _make_handler(manager: RunManager):
                 code, json.dumps(obj, ensure_ascii=False).encode("utf-8"), "application/json"
             )
 
+        # ---- #17: 토큰 인증 (WEB_UI_TOKEN 설정 시에만 활성) ----
+        def _provided_token(self) -> str:
+            """요청에서 토큰을 추출: Authorization: Bearer → X-Auth-Token → ?token= → 쿠키."""
+            auth = self.headers.get("Authorization", "") or ""
+            if auth.startswith("Bearer "):
+                t = auth[len("Bearer ") :].strip()
+                if t:
+                    return t
+            x = (self.headers.get("X-Auth-Token") or "").strip()
+            if x:
+                return x
+            qtok = (parse_qs(urlparse(self.path).query).get("token") or [""])[0]
+            if qtok:
+                return qtok
+            for part in (self.headers.get("Cookie", "") or "").split(";"):
+                k, _, val = part.strip().partition("=")
+                if k == "token" and val:
+                    return val
+            return ""
+
+        def _authed(self) -> bool:
+            if not auth_token:
+                return True  # 토큰 미설정 → 인증 비활성(하위호환)
+            provided = self._provided_token()
+            # 타이밍 공격 방지를 위해 상수시간 비교.
+            return bool(provided) and hmac.compare_digest(provided, auth_token)
+
+        def _require_auth(self) -> bool:
+            """인증 실패면 401 을 보내고 True 를 반환(호출부는 곧장 return)."""
+            if self._authed():
+                return False
+            self._json({"error": "unauthorized"}, 401)
+            return True
+
+        # ---- #9: CSRF/Origin 방어 ----
+        def _origin_ok(self) -> bool:
+            """상태변경 POST 의 cross-origin 요청 차단(쿠키 인증을 켜도 CSRF 막기).
+
+            Origin 헤더가 없으면(curl 등 비-브라우저) 허용하고, 있으면 host 가 요청 Host 와
+            일치할 때만 허용한다(same-origin). 브라우저 SPA 는 same-origin 이라 통과한다.
+            """
+            origin = self.headers.get("Origin")
+            if not origin:
+                return True  # 비-브라우저(Origin 없음) — CSRF 대상 아님
+            try:
+                origin_host = urlparse(origin).netloc
+            except Exception:
+                return False
+            return bool(origin_host) and origin_host == (self.headers.get("Host") or "")
+
+        def _require_same_origin(self) -> bool:
+            """cross-origin 이면 403 을 보내고 True 를 반환(호출부는 곧장 return)."""
+            if self._origin_ok():
+                return False
+            self._json({"error": "cross-origin request blocked"}, 403)
+            return True
+
         def do_GET(self):
             u = urlparse(self.path)
             q = parse_qs(u.query)
+            # #17: 모든 데이터/제어는 /api/* 뒤에 있으므로 거기서 인증을 강제한다. index(/)
+            #      자체는 비밀이 없는 정적 셸이라 인증 없이 제공하되, 유효한 ?token= 으로 접속하면
+            #      쿠키를 심어 이후 fetch 가 자동 인증되게 한다(브라우저 사용성).
+            if u.path.startswith("/api/") and self._require_auth():
+                return
             if u.path == "/":
-                self._send(200, INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                extra = None
+                if auth_token:
+                    qt = (q.get("token") or [""])[0]
+                    if qt and hmac.compare_digest(qt, auth_token):
+                        # #10: HttpOnly 로 JS/XSS 의 쿠키 탈취를 막는다(쿠키는 서버만 읽으면 됨).
+                        #      SameSite=Strict 로 cross-site 전송 차단. (http 에선 Secure 불가 —
+                        #      https 종단 프록시 뒤라면 프록시에서 Secure 를 부여하라.)
+                        extra = [("Set-Cookie", f"token={qt}; Path=/; HttpOnly; SameSite=Strict")]
+                self._send(
+                    200,
+                    INDEX_HTML.encode("utf-8"),
+                    "text/html; charset=utf-8",
+                    extra_headers=extra,
+                )
             elif u.path == "/api/runs":
                 runs = list_runs(manager.base_dir)
                 for r in runs:
@@ -538,6 +626,12 @@ def _make_handler(manager: RunManager):
             u = urlparse(self.path)
             if u.path not in ("/api/run", "/api/stop", "/api/rerun"):
                 self._json({"error": "not found"}, 404)
+                return
+            # #9: 상태변경 POST 는 cross-origin 요청을 먼저 차단한다(쿠키 인증 CSRF 방어).
+            if self._require_same_origin():
+                return
+            # #17: 모든 POST 는 run 제어(/api/run·stop·rerun)이므로 토큰 인증을 강제한다.
+            if self._require_auth():
                 return
             try:
                 length = int(self.headers.get("Content-Length", 0) or 0)
@@ -688,6 +782,12 @@ def _make_handler(manager: RunManager):
                 except (TypeError, ValueError):
                     self._json({"error": f"invalid {fld}: {v!r}"}, 400)
                     return
+                # #8/#9: NaN/Inf 는 float() 를 통과하지만 비교를 무력화한다(budget=nan 이면
+                #        예산 enforcement 가 꺼지고, inf poll/timeout 은 supervisor 를 멈춘다).
+                #        fv<0 검사보다 먼저 비유한값을 거부한다(nan<0 은 False 라 통과하므로).
+                if not math.isfinite(fv):
+                    self._json({"error": f"{fld} must be a finite number (got {fv})"}, 400)
+                    return
                 if fv < 0:
                     self._json({"error": f"{fld} must be >= 0 (got {fv})"}, 400)
                     return
@@ -706,9 +806,22 @@ def _make_handler(manager: RunManager):
 
 def serve(port: int = 8765, base_dir: Path | None = None, host: str = "127.0.0.1") -> None:
     base = Path(base_dir) if base_dir else (Path.home() / "agent-runs")
+    # #17: WEB_UI_TOKEN 이 설정되면 토큰 인증을 켠다(없으면 하위호환으로 인증 없음).
+    token = os.environ.get("WEB_UI_TOKEN", "").strip()
+    loopback = host in ("127.0.0.1", "localhost", "::1")
+    # #8: 인증 없이 비-루프백(예: 0.0.0.0)에 바인딩하는 것은 fail-closed 로 거부한다 —
+    #     run 제어 UI 가 무인증으로 네트워크에 노출되는 배포 사고를 막는다. Docker 기본은
+    #     0.0.0.0 이므로 WEB_UI_TOKEN 을 반드시 설정해야 웹 UI 가 기동한다.
+    if not loopback and not token:
+        raise SystemExit(
+            f"거부: 인증 없이 비-루프백 호스트({host})에 바인딩할 수 없습니다. "
+            "WEB_UI_TOKEN 을 설정(예: -e WEB_UI_TOKEN=…)하거나 127.0.0.1 에 바인딩하세요."
+        )
     manager = RunManager(base)
-    httpd = ThreadingHTTPServer((host, port), _make_handler(manager))
+    httpd = ThreadingHTTPServer((host, port), _make_handler(manager, token))
     print(f"web ui: http://{host}:{port}   (runs → {base})")
+    if token:
+        print(f"  [auth] WEB_UI_TOKEN 필요 — 최초 접속: http://{host}:{port}/?token=…")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -841,6 +954,9 @@ INDEX_HTML = r"""<!doctype html>
       <div class="muted">동시 실행 <b id="runCount">0</b></div>
       <div class="muted">상태 <span class="pill" id="running">—</span></div>
     </div>
+    <!-- #23: /api/state fetch/렌더 오류를 조용히 삼키지 않고 사용자에게 표시 -->
+    <div id="err" style="display:none;color:#f85149;background:#2d1214;border:1px solid #6e2329;
+      border-radius:6px;padding:8px 10px;margin-bottom:8px;font-size:13px"></div>
 
     <h4 style="margin:6px 0">에이전트 (카드 · 실시간 로그)</h4>
     <div id="agentCards" class="cards"></div>
@@ -955,10 +1071,17 @@ function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;',
 //       toLocaleString 이 throw 해 tick() 의 catch 가 이를 삼키고 대시보드가 조용히
 //       멈추는 것을 막는다. Number(...) 가 NaN 이면 0 으로 강제한다.
 function num(v){const n=Number(v);return Number.isFinite(n)?n:0}
+// #23: 오류 배너 토글 — 빈 메시지면 숨긴다.
+function showErr(msg){const e=$("err");if(!e)return;
+  if(msg){e.textContent="⚠ "+msg;e.style.display=""}else{e.textContent="";e.style.display="none"}}
 async function tick(){
   if(!CUR)return;
   try{
-    const s=await (await fetch("/api/state?run="+encodeURIComponent(CUR))).json();
+    // #23: 응답 객체를 보존해 status/에러 본문을 검사한다(조용히 삼키지 않음).
+    const r=await fetch("/api/state?run="+encodeURIComponent(CUR));
+    const s=await r.json();
+    if(s&&s.error){showErr("상태 조회 오류: "+s.error+(r.status===401?" — URL 에 ?token=… 를 추가하세요":""));return}
+    showErr("");  // 성공 시 이전 오류 제거
     const b=s.board||{};const ag=b.agents||{};const proj=s.project_dir||"";
     const done=(b.units||[]).filter(u=>u.status==="done").length;
     $("projDir").textContent=proj||"—";
@@ -999,7 +1122,7 @@ async function tick(){
       html+="<div style='margin-top:6px'><b>"+esc(u.id)+"</b> ("+esc(u.status)+", "+arts.length+" files)<br>"+
         arts.map(a=>"&nbsp;&nbsp;"+esc(proj)+"/"+esc(a)).join("<br>")+"</div>"}});
     $("artifacts").innerHTML=html;
-  }catch(e){}
+  }catch(e){showErr("상태 조회/표시 실패: "+e)}  // #23: 네트워크/파싱 오류도 표시
 }
 let _tk=0;
 let _looping=false;

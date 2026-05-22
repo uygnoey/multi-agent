@@ -23,7 +23,9 @@ jobs:
           cache: pip
       - run: python -m pip install -U pip
       - run: pip install -e .
-      - run: pip install ruff pytest
+      # tomli only on Python <3.11 (3.11+ has stdlib tomllib): lets the pyproject-validation
+      # tests run on the 3.10 matrix job instead of skipping (#19).
+      - run: pip install ruff pytest 'tomli; python_version < "3.11"'
       - run: ruff check .
       - run: ruff format --check .
       # Use `python -m pytest` (not bare `pytest`) so the repo root is on sys.path and the

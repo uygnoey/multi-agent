@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 
 import orchestrator.backends.codex_cli as codex_cli
+from orchestrator.backends.base import RoleRequest
 from orchestrator.backends.codex_cli import (
     CodexCLIBackend,
     _codex_default_model,
@@ -142,11 +144,49 @@ def test_already_fixed_111_available_missing_binary(monkeypatch):
     assert "codex" in reason.lower()
 
 
-def test_already_fixed_43_115_119_documented_in_source():
+def test_already_fixed_43_stderr_keeps_tail_not_head(tmp_path, monkeypatch):
+    # #43/#24: 실패한 codex 의 stderr 는 진단의 '끝부분'이 중요하므로 head 가 아니라 tail(마지막
+    # 4000자, err[-4000:])을 보존해야 한다. head≠tail 인 입력으로 실제 동작을 검증한다.
+    head = "HEAD_MARKER_" + ("h" * 5000)  # 앞쪽 5000자 영역
+    tail = ("t" * 5000) + "_TAIL_MARKER"  # 뒤쪽 5000자 영역
+    long_err = (head + tail).encode()
+    assert len(long_err) > 4000
+
+    async def fake_run_subprocess(cmd, cwd, timeout, live_log_path):
+        return 1, b"", long_err, False  # rc!=0, timed_out=False
+
+    monkeypatch.setattr(codex_cli, "run_subprocess", fake_run_subprocess)
+
+    req = RoleRequest(
+        role="backend-developer",
+        phase="dev",
+        unit={"id": "u1"},
+        system_prompt="role",
+        prompt="task",
+        cwd=tmp_path,
+        allowed_tools=["Read", "Write", "Edit", "Bash"],
+        model=None,
+        max_turns=8,
+        budget=None,
+        result_path=tmp_path / ".orchestrator" / "results" / "r.json",
+        result_rel=".orchestrator/results/r.json",
+        spec_text="spec",
+    )
+    res = asyncio.run(CodexCLIBackend().run_role(req))
+
+    assert res.ok is False
+    expected_tail = long_err.decode(errors="replace")[-4000:]
+    # tail 절단이어야 한다: 결과는 마지막 4000자와 정확히 일치한다.
+    assert res.error == expected_tail
+    # 끝부분 마커는 살아남고, 앞부분 마커는 잘려나가야 한다(head 절단이 아님을 보장).
+    assert res.error.endswith("_TAIL_MARKER")
+    assert "HEAD_MARKER_" not in res.error
+    assert len(res.error) == 4000
+
+
+def test_already_fixed_115_119_documented_in_source():
     import inspect
 
     src = inspect.getsource(codex_cli)
-    # #43: stderr cap 을 크게(4000) — 진단 손실 방지
-    assert "[:4000]" in src
     # #115 / #119: codex 백엔드는 budget/turn-limit 플래그가 없음을 주석으로 명시
     assert "budget" in src and "max_turns" in src

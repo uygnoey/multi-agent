@@ -24,7 +24,7 @@ COPY examples ./examples
 #               가린 채 성공하지 않게 한다.
 #   1         — hard 모드. `pip install -e ".[all]"` 가 실패하면 `||` 폴백 없이 빌드를 즉시
 #               실패시킨다. claude-sdk/openai-agents 백엔드가 반드시 필요한 운영 이미지용.
-#   사용 예:   docker build --build-arg REQUIRE_ALL_BACKENDS=1 -t web-team .
+#   사용 예:   docker build --build-arg REQUIRE_ALL_BACKENDS=1 -t dev-crew .
 ARG REQUIRE_ALL_BACKENDS=0
 RUN pip install -e . \
     && if [ "$REQUIRE_ALL_BACKENDS" = "1" ]; then \
@@ -47,9 +47,12 @@ EXPOSE 8765
 VOLUME ["/data"]
 
 # 산출물은 /data/runs 에 생성. 컨테이너 안이라 0.0.0.0 바인딩(컨테이너는 외부에서 접근하려면 필요).
-# ⚠️ 보안 경고(#106): 이 웹 UI 에는 인증이 없다. 0.0.0.0 바인딩은 published port 로 노출되면
-#   접근 가능한 모든 네트워크 인터페이스에서 run 제어/모니터링이 가능해진다. 운영 시에는
-#   반드시 외부 보호(리버스 프록시 인증 / 방화벽 / -p 127.0.0.1:8765:8765 처럼 루프백 한정 publish)를
-#   추가하라. 신뢰되지 않은 네트워크에 그대로 노출하지 말 것. (README 배포 섹션 참고)
+# 🔒 인증(#8/#17): 이 웹 UI 는 run 을 제어하므로, 0.0.0.0 처럼 비-루프백에 바인딩하면 인증을
+#   요구한다. WEB_UI_TOKEN 이 설정되지 않으면 서버는 fail-closed 로 기동을 거부한다(무인증
+#   노출 사고 방지). 따라서 컨테이너 실행 시 반드시 강한 난수 토큰을 주입하라:
+#     docker run -e WEB_UI_TOKEN=<강한 난수> -p 8765:8765 ...
+#   접속은 http://<host>:8765/?token=<토큰> (토큰은 HttpOnly 쿠키로 저장된다). 추가 권장:
+#   리버스 프록시 TLS · 방화벽 · 루프백 한정 publish(-p 127.0.0.1:8765:8765). 또한 상태변경
+#   POST 는 same-origin(Origin 검사)만 허용된다. 신뢰되지 않은 네트워크에 무방비 노출 말 것.
 CMD ["python", "-m", "orchestrator", "--web", "--host", "0.0.0.0", "--port", "8765", \
      "--base-dir", "/data/runs"]

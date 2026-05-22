@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import sys
 from dataclasses import dataclass, field
@@ -21,7 +22,7 @@ def _coerce_int(raw, default: int) -> int:
 FRAMEWORK_ROOT = Path(__file__).resolve().parent.parent
 
 # 휠(wheel) 설치 시 .claude/agents 와 templates 는 data-files 로
-# <prefix>/share/web-team-orchestrator/ 아래에 깔린다(#5). 저장소 루트만 보던
+# <prefix>/share/dev-crew-orchestrator/ 아래에 깔린다(#5). 저장소 루트만 보던
 # 기존 로더는 휠 설치에서 이를 못 찾아 역할 로딩/스캐폴딩이 깨졌다. 그래서
 # "저장소 루트 우선 → 설치 data 위치 폴백" 순서로 첫 존재 디렉터리를 고르는
 # 리졸버를 둔다. 어디서도 못 찾으면 저장소 루트 경로를 기본값으로 돌려주어
@@ -29,8 +30,8 @@ FRAMEWORK_ROOT = Path(__file__).resolve().parent.parent
 
 # data-files 가 깔리는 상대 경로(설치 prefix 기준). pyproject 의
 # [tool.setuptools.data-files] 키와 1:1 로 맞춘다.
-_DATA_AGENTS_REL = Path("share") / "web-team-orchestrator" / ".claude" / "agents"
-_DATA_TEMPLATES_REL = Path("share") / "web-team-orchestrator" / "templates"
+_DATA_AGENTS_REL = Path("share") / "dev-crew-orchestrator" / ".claude" / "agents"
+_DATA_TEMPLATES_REL = Path("share") / "dev-crew-orchestrator" / "templates"
 
 
 def _site_packages_roots() -> list[Path]:
@@ -251,12 +252,39 @@ class RunConfig:
         # 0/음수/비-숫자/이상값이 그대로 _supervise 의 asyncio.wait_for 로 들어가면 PM/PL 감독이
         # tight busy-loop 를 돌며 CPU 를 태우고 비싼 LLM 호출을 반복한다. 0/음수는 안전 바닥(5초)
         # 으로, 그 외 유효값은 최소 1초로 둔다(정상 큰 값은 그대로 유지).
+        # (#9) NaN/Inf 방어: Inf 가 그대로 asyncio.wait_for(timeout=) 로 가면 감독 폴링이
+        # 사실상 멈추므로(영원히 대기) 비유한값은 기본 20초로 되돌린다.
         try:
             pi = float(self.poll_interval)
         except (TypeError, ValueError):
             pi = 20.0
+        if not math.isfinite(pi):
+            pi = 20.0
         self.poll_interval = pi if pi > 0 else 5.0
         self.poll_interval = max(1.0, self.poll_interval)
+        # (#8) budget: NaN/Inf 는 비교를 무력화한다(예: committed >= nan 은 항상 False 라 예산
+        # enforcement 가 조용히 꺼진다). 비유한/비-숫자 예산은 None(예산 없음)으로 정규화해
+        # "깨진 예산 = 예산 없음" 을 명시적으로 만든다. 웹 검증과 더불어 방어적 2중 가드.
+        if self.budget is not None:
+            try:
+                bv = float(self.budget)
+            except (TypeError, ValueError):
+                bv = None
+            else:
+                if not math.isfinite(bv):
+                    bv = None
+            self.budget = bv
+        # (#9) session_timeout: NaN/Inf/0/음수는 asyncio.wait_for 를 오작동시키거나 의미가 없다.
+        # 비유한/비-숫자/≤0 은 None(역할 호출 무제한)으로 정규화한다(CLI 의 0=무제한 정책과 일치).
+        if self.session_timeout is not None:
+            try:
+                tv = float(self.session_timeout)
+            except (TypeError, ValueError):
+                tv = None
+            else:
+                if not math.isfinite(tv) or tv <= 0:
+                    tv = None
+            self.session_timeout = tv
 
     def backends_for(self, role: str) -> list[str]:
         """역할에 대한 백엔드 후보를 우선순위 순서로 반환 (폴오버용)."""
