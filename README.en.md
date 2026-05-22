@@ -79,9 +79,15 @@ pip install -e ".[all]"          # both
 ```
 
 > **Install from a source checkout (`pip install -e .`) is recommended.** The runtime reads the
-> repo-root `.claude/agents/*.md` and `templates/*` directly, so a plain wheel install may miss
-> those files (#18). Use an editable install from the source checkout, or the Docker image (which
-> COPYs both dirs).
+> repo-root `.claude/agents/*.md` and `templates/*` from `FRAMEWORK_ROOT` (one level above the
+> `orchestrator/` package) directly (#18). Packaging behavior (current):
+> - **editable install (`pip install -e .`)** — works fully. `FRAMEWORK_ROOT` == repo root, so both dirs are read in place. **(recommended / supported)**
+> - **Docker image** — works fully. `.claude` and `templates` are COPYed to `/app`. **(supported)**
+> - **sdist** — `MANIFEST.in` includes both dirs in the archive (an install from it follows the wheel layout).
+> - **plain wheel (`pip install web-team-orchestrator`)** — both dirs' bytes are bundled (`[tool.setuptools.data-files]`)
+>   but land under `<prefix>/share/web-team-orchestrator/`, which the current `FRAMEWORK_ROOT` (= site-packages) does not
+>   auto-scan. Fully automatic discovery would require moving the dirs into the package + switching the loader to
+>   `importlib.resources` (a code change), so **for runtime use an editable install or Docker.**
 > **OpenAI backend note (#51):** the `openai-agents` extra (`[openai]`/`[all]`) must install for the
 > OpenAI Agents backend to work. That package can fail to install in some environments — verify real
 > availability with `--check`. mock and the CLI backends (claude-cli/codex) work without this extra.
@@ -220,6 +226,10 @@ python -m orchestrator --web --port 8765 --base-dir ~/agent-runs
 - Per-session `max_turns`/budget, global concurrency semaphore, `--max-units`, path scoping (confined to target cwd)
 - ⚠️ The `openai-agents` backend's `run_bash` (shell) only sets cwd to the target — it does not enforce an FS
   boundary (gated by allowed_tools so only Bash-capable roles get it). For strong isolation, run in **Docker**
+- ⚠️ **No-dependency-install policy is prompt-only (#48)**: the templates (`CLAUDE.md`/`AGENTS.md`) instruct roles
+  not to install dependencies or build bundles, but for CLI/SDK backends this is **enforced by the model prompt
+  only** — a Bash-capable role can ignore it and run `pip`/`npm`/build. For real enforcement (true isolation), rely
+  on the backend sandbox (`codex --sandbox`) or run inside Docker.
 
 ## Deploy (Docker)
 
@@ -229,9 +239,17 @@ Run the web UI in a container (mock works instantly without keys):
 docker build -t web-team .
 docker run --rm -p 8765:8765 -v "$PWD/runs:/data/runs" web-team
 # browser: http://localhost:8765
+
+# If the optional SDK backends ([all]: claude-agent-sdk/openai-agents) are mandatory, build in
+# hard mode — the build fails if [all] does not install (default soft mode only warns and continues):
+docker build --build-arg REQUIRE_ALL_BACKENDS=1 -t web-team .
 ```
 
 Production notes:
+- **Optional SDK install policy (#52):** the default (`REQUIRE_ALL_BACKENDS=0`, soft) continues the build
+  even if `[all]` fails to install, leaving a prominent warning banner in the log (the image then has mock + CLI
+  backends only). If the real SDK backends are required, build with `--build-arg REQUIRE_ALL_BACKENDS=1` to turn
+  an install failure into a **build failure**.
 - **Real backends** (claude-cli/codex/openai-agents/claude-sdk) need each CLI installed/logged-in or an API key.
   Inject keys into the container with `-e OPENAI_API_KEY=… -e ANTHROPIC_API_KEY=…`, or mount the CLI auth directories.
 - ⚠️ **No auth / 0.0.0.0 exposure (#106):** the documented container command (`--host 0.0.0.0`) exposes
@@ -240,5 +258,6 @@ Production notes:
   protection — an authenticating reverse proxy, a firewall, or loopback-only publishing
   (`-p 127.0.0.1:8765:8765`). Do not expose it directly on an untrusted network.
 - Outputs/run state are created under `/data/runs` (volume).
-- CI: `.github/workflows/ci.yml` runs lint (`ruff check`) + format check (`ruff format --check`) +
-  tests (`pytest`, Python 3.10–3.12 matrix). (Format check included — the tree currently passes.)
+- CI: `.github/workflows/ci.yml` runs lint (`ruff check .`) + format check (`ruff format --check .`) +
+  tests (`python -m pytest -q`, Python 3.10–3.12 matrix). It uses `python -m pytest` (not bare `pytest`) so the
+  `orchestrator` import path is correct even without an install on PATH (#134).

@@ -113,7 +113,10 @@ def _run_alive(orch_dir) -> bool:
 
 
 def slugify(name: str) -> str:
-    s = re.sub(r"[^a-zA-Z0-9_-]+", "-", (name or "").strip()).strip("-").lower()
+    # #137: name 이 str 이 아니면(예: 손상된 _run_opts.json 의 숫자/None) .strip() 이
+    #       raise 하므로, 비문자열은 빈 문자열로 취급해 기본 "run" 으로 폴백한다.
+    base = name.strip() if isinstance(name, str) else ""
+    s = re.sub(r"[^a-zA-Z0-9_-]+", "-", base).strip("-").lower()
     return s or "run"
 
 
@@ -148,7 +151,10 @@ def _coerce_float(value, default):
 
 
 def build_command(py: str, spec_path: Path, project_dir: Path, opts: dict) -> list[str]:
-    # #61: poll-interval 은 opts 에서 읽되 웹 기본은 600(감독 주기를 길게). 없으면 600.
+    # #61/#136: poll-interval 은 opts 에서 읽되 웹 기본은 600(장기 감독 주기). 미지정 시 600.
+    #   CLI RunConfig 기본(20초)과 의도적으로 다르다 — 웹 dogfood 는 감독 주기를 길게 둔다.
+    #   이 divergence 가 조용하지 않도록 UI 폼에 poll-interval 입력칸과 라벨(웹 600/CLI 20)을
+    #   노출했다. 사용자는 폼에서 직접 짧은 주기를 지정할 수 있다.
     # #38: 손상된 _run_opts.json(예: poll_interval="abc")이 와도 int() 가 raise 하지 않도록 관대하게 변환.
     poll = _coerce_int(opts.get("poll_interval"), 600)
     cmd = [
@@ -584,7 +590,13 @@ def _make_handler(manager: RunManager):
             if len(spec_text.encode("utf-8")) > MAX_SPEC_BYTES:
                 self._json({"error": f"spec too large (> {MAX_SPEC_BYTES} bytes)"}, 413)
                 return
+            # #136: backend 는 resolve() 에 넘기기 전에 반드시 str 이어야 한다.
+            #       JSON 배열/객체는 unhashable → ALIASES.get() 이 TypeError 를 내고
+            #       400 대신 핸들러가 죽는다. 타입을 먼저 검증한다.
             backend = data.get("backend", "mock")
+            if not isinstance(backend, str):
+                self._json({"error": "backend must be a string"}, 400)
+                return
             if resolve(backend) not in VALID_BACKENDS:  # CLI 와 동일하게 alias 허용
                 self._json({"error": f"invalid backend: {backend}"}, 400)
                 return
@@ -594,6 +606,10 @@ def _make_handler(manager: RunManager):
                 self._json({"error": "backends must be a list"}, 400)
                 return
             for b in backends or []:
+                # #136: 각 엔트리도 str 이어야 resolve() 에 안전하게 넘길 수 있다.
+                if not isinstance(b, str):
+                    self._json({"error": f"backend in priority list must be a string: {b!r}"}, 400)
+                    return
                 if resolve(b) not in VALID_BACKENDS:
                     self._json({"error": f"invalid backend in priority list: {b}"}, 400)
                     return
@@ -606,9 +622,19 @@ def _make_handler(manager: RunManager):
                 if role not in ROLES:
                     self._json({"error": f"invalid role: {role}"}, 400)
                     return
+                # #136: prov 는 str 또는 list-of-str 만 허용. dict/숫자/중첩 리스트는
+                #       resolve() 에서 unhashable TypeError 를 내므로 먼저 거부한다.
+                if not (isinstance(prov, (str, list)) or prov is None):
+                    self._json(
+                        {"error": f"role_backends value must be a string or list: {role}"}, 400
+                    )
+                    return
                 # #100/#101: prov 는 단일 백엔드(str) 또는 우선순위 리스트(list) 가능.
                 provs = prov if isinstance(prov, list) else ([prov] if prov else [])
                 for p in provs:
+                    if not isinstance(p, str):
+                        self._json({"error": f"backend for {role} must be a string: {p!r}"}, 400)
+                        return
                     if p and resolve(p) not in VALID_BACKENDS:
                         self._json({"error": f"invalid backend for {role}: {p}"}, 400)
                         return
@@ -640,6 +666,13 @@ def _make_handler(manager: RunManager):
                 if fv < 0:
                     self._json({"error": f"{fld} must be >= 0 (got {fv})"}, 400)
                     return
+            # #137: name 은 slugify().strip() 으로 흘러가므로 str 이 아니면 .strip() 에서
+            #       raise 한다. None(미지정)은 start() 가 기본값 "run" 으로 처리하므로 허용,
+            #       그 외 비문자열(숫자/list/object)은 400 으로 거부한다.
+            name = data.get("name")
+            if name is not None and not isinstance(name, str):
+                self._json({"error": "name must be a string"}, 400)
+                return
             run_id = manager.start(spec_text, data)
             self._json({"run_id": run_id})
 
@@ -742,7 +775,7 @@ INDEX_HTML = r"""<!doctype html>
       <div><label>max-attempts</label><input type="text" id="maxAttempts" value="2"/></div>
     </div>
     <div class="row">
-      <div><label>poll-interval (초, 선택)</label><input type="text" id="pollInterval" placeholder="600"/></div>
+      <div><label title="감독(PM/PL) 주기. 웹 기본 600초 — CLI 기본(20초)보다 길게 설정됨. 짧게 하려면 직접 입력.">poll-interval (초, 선택 · 웹 기본 600 / CLI 20)</label><input type="text" id="pollInterval" placeholder="600 (웹 기본)"/></div>
       <div><label>timeout (초, 선택)</label><input type="text" id="timeout" placeholder="기본"/></div>
       <div><label>retries (선택)</label><input type="text" id="retries" placeholder="1"/></div>
       <div><label>budget (USD, 선택)</label><input type="text" id="budget" placeholder="없음"/></div>
@@ -893,6 +926,10 @@ async function rerunRun(){
 
 function statusDot(s){return '<span class="dot'+(s==="running"?" run":"")+'"></span>'}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+// #136: 손상된 board.json 의 비숫자 cost/tokens(문자열/null/객체)가 와도 toFixed/
+//       toLocaleString 이 throw 해 tick() 의 catch 가 이를 삼키고 대시보드가 조용히
+//       멈추는 것을 막는다. Number(...) 가 NaN 이면 0 으로 강제한다.
+function num(v){const n=Number(v);return Number.isFinite(n)?n:0}
 async function tick(){
   if(!CUR)return;
   try{
@@ -901,8 +938,8 @@ async function tick(){
     const done=(b.units||[]).filter(u=>u.status==="done").length;
     $("projDir").textContent=proj||"—";
     $("phase").textContent=b.phase||"—";
-    $("cost").textContent="$"+(b.total_cost_usd||0).toFixed(4)+(b.cost_estimated?" est.":"");
-    $("tok").textContent=(b.total_tokens||0).toLocaleString();
+    $("cost").textContent="$"+num(b.total_cost_usd).toFixed(4)+(b.cost_estimated?" est.":"");
+    $("tok").textContent=num(b.total_tokens).toLocaleString();
     $("units").textContent=done+"/"+((b.units||[]).length);
     const runN=(s.roles||[]).filter(r=>(ag[r]||{}).status==="running").length;
     $("runCount").textContent=runN+"개";
@@ -916,8 +953,8 @@ async function tick(){
     const logs=s.agent_logs||{};
     $("agentCards").innerHTML=(s.roles||[]).map(r=>{const a=ag[r]||{};
       const run=a.status==="running";
-      const meta=[(a.model||a.backend||"—"),"$"+(+(a.cost_usd||0)).toFixed(4)+(a.cost_est?" est.":""),
-        (a.tokens?(+a.tokens).toLocaleString()+" tok":null),"calls "+(a.calls||0),
+      const meta=[(a.model||a.backend||"—"),"$"+num(a.cost_usd).toFixed(4)+(a.cost_est?" est.":""),
+        (a.tokens?num(a.tokens).toLocaleString()+" tok":null),"calls "+(a.calls||0),
         (a.current_unit&&a.current_unit!=="global")?("unit "+a.current_unit):null].filter(Boolean).join(" · ");
       return '<div class="agent-card'+(run?" run":"")+'"><h5>'+statusDot(a.status)+esc(r)+
         '<span class="badge">'+(a.status||"idle")+'</span></h5><div class="meta">'+esc(meta)+

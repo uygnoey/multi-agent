@@ -21,3 +21,7 @@ dist/
 # Local run outputs / demo targets
 runs/
 /tmp-demo/
+
+# codex audit snapshots (local only)
+issue.json
+issue.*.json

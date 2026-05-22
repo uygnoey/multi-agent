@@ -89,13 +89,28 @@ def test_stop_kills_running_process(tmp_path):
     proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
     (orch / "run.pid").write_text(str(proc.pid), encoding="utf-8")
 
-    assert m.stop("r-1") is True
-    for _ in range(30):  # SIGTERM 으로 곧 종료
-        if proc.poll() is not None:
-            break
-        time.sleep(0.1)
-    assert proc.poll() is not None  # 실제로 종료됨
-    assert not (orch / "run.pid").exists()  # 상태 즉시 stopped
+    try:
+        assert m.stop("r-1") is True
+        # #42/#135: 결정적이게 — 부하/스케줄 지터에서도 견디도록 충분히 넉넉한
+        #   상한(여기선 ~6초)까지 폴링한다. SIGTERM 이 곧 죽이지만, 백그라운드
+        #   supervisor 의 SIGKILL 폴백/커널 teardown 까지 여유 있게 기다린다.
+        for _ in range(120):  # ≈6초: 프로세스 종료 대기 (sleep 차단 금지 위해 짧은 간격)
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        assert proc.poll() is not None  # 실제로 종료됨
+        # pidfile 제거는 종료 "확인" 후 동기(0.5초) 또는 supervisor 스레드에서 일어나므로
+        # 프로세스 종료 직후가 아니라 별도로 폴링해 확인한다(즉시 단정 시 flaky).
+        for _ in range(120):  # ≈6초: pidfile 제거 대기
+            if not (orch / "run.pid").exists():
+                break
+            time.sleep(0.05)
+        assert not (orch / "run.pid").exists()  # 종료 확인 후 stopped (pidfile 제거)
+    finally:
+        try:
+            proc.kill()  # 테스트 누수 방지 (이미 죽었으면 무해)
+        except Exception:
+            pass
 
 
 def test_new_run_id_is_unique():

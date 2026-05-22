@@ -1,0 +1,13 @@
+# Source-distribution (sdist) manifest.
+#
+# The runtime resolves config.FRAMEWORK_ROOT to the *repo root* (one level above the
+# orchestrator package) and loads role definitions from .claude/agents/*.md and shared
+# instruction templates from templates/*. Those directories live OUTSIDE the orchestrator
+# package, so they are not picked up automatically. Ship them in the sdist explicitly here,
+# and in the wheel via [tool.setuptools.force-include] in pyproject.toml (#18 / #2).
+recursive-include .claude/agents *.md
+recursive-include templates *
+include examples/specs/*.md
+include README.md README.en.md
+include docs/PLAN.md docs/architecture.html
+include orchestrator/codex_pricing.json
