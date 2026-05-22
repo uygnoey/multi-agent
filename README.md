@@ -53,7 +53,8 @@
   → Phase A:  architect ‖ testsheet-creator              (병렬)
   → Phase B:  frontend ‖ backend ‖ dba   (unit별 동시) → dev_done
               dev 끝나면 test/qa 는 별도 태스크로 즉시(개발 슬롯 반납 → 다음 unit 진행)
-  → Phase C:  test-engineer → qa   (QA 실패 시 max_attempts 내 재작업) → tested/done
+  → Phase C:  test-engineer → qa
+              test-engineer 실패 시 QA 스킵 후 재작업, QA 실패 시 max_attempts 내 재작업
   → Phase D:  cicd
   → Phase E:  docs-writer — 산출물 문서(ERD·시퀀스·DB·API·매뉴얼·배포·실행·아키텍처, EN/KO)
   → 감독(PM/PL) graceful 종료 후 done   (done = 모든 에이전트 종료 시점)
@@ -75,9 +76,8 @@ pip install -e ".[all]"          # 둘 다
 > - **editable 설치(`pip install -e .`)** — 완전 동작. `FRAMEWORK_ROOT` = 저장소 루트이므로 두 디렉터리를 그대로 읽는다. **(권장/지원 경로)**
 > - **Docker 이미지** — 완전 동작. `.claude` 와 `templates` 를 `/app` 으로 COPY 한다. **(지원 경로)**
 > - **sdist(소스 배포본)** — `MANIFEST.in` 으로 두 디렉터리를 아카이브에 포함한다(설치 시 wheel 레이아웃을 따름).
-> - **일반 wheel(`pip install dev-crew-orchestrator`)** — 두 디렉터리의 내용은 wheel 에 번들되지만(`[tool.setuptools.data-files]`)
->   설치 위치가 `<prefix>/share/dev-crew-orchestrator/` 라 현재 `FRAMEWORK_ROOT`(= site-packages)가 자동 탐색하지 않는다.
->   완전 자동 탐색은 디렉터리를 패키지 내부로 옮기고 로더를 `importlib.resources` 로 바꾸는 코드 변경이 필요하므로, **런타임은 editable 설치나 Docker 를 사용한다.**
+> - **일반 wheel(`pip install dev-crew-orchestrator`)** — 두 디렉터리의 내용은 wheel 에 번들되고
+>   `<prefix>/share/dev-crew-orchestrator/` 위치를 런타임 로더가 폴백 탐색하므로 지원 경로다.
 > **OpenAI 백엔드 주의(#51):** `openai-agents` extra(`[openai]`/`[all]`)가 설치되어야 OpenAI Agents
 > 백엔드가 동작한다. 이 패키지는 환경에 따라 설치가 실패할 수 있으니, `--check` 로 실제 가용성을 확인할 것.
 > mock 및 CLI 백엔드(claude-cli/codex)는 이 extra 없이도 동작한다.
@@ -175,11 +175,11 @@ python -m orchestrator --web --port 8765 --base-dir ~/agent-runs
 - **run picker**: 자동선택 없이 사용자가 run 을 골라야 대시보드 표시
 - **대시보드(클릭 불필요)**: phase·비용(구독은 `est.`)·**토큰**·units·**동시 실행 수**·
   상태(**running / done / stopped**)
-- **에이전트 카드**: 역할별 카드에 모델·비용·토큰·현재 unit + **실시간 로그(프롬프트·생각·응답 스트리밍)** 내장
+- **에이전트 카드**: 역할별 카드에 모델·비용·토큰·현재 unit + **실시간 로그(프롬프트·응답 스트리밍, thinking 은 redacted)** 내장
 - **정지/재실행**: 실행 중 ■ 정지(프로세스 그룹 종료), **정지/완료 후에만** ↻ 재실행
 - 실행 결과물은 `--base-dir`(기본 `~/agent-runs`)/`<run-id>/` 에 생성됨
 - 같은 데이터(`board.json` + `agents/<role>.log`)를 읽으므로 TUI와 표시가 일치
-- ⚠️ 실 백엔드 선택 시 비용 발생(구독은 토큰 환산 `est.`) — 기본값은 `mock`. 외부 노출 시 인증/방화벽 직접 구성
+- ⚠️ 실 백엔드 선택 시 비용 발생(구독은 토큰 환산 `est.`) — 기본값은 `mock`. 외부 노출 시 `WEB_UI_TOKEN` 과 방화벽/TLS 를 함께 사용
 
 ## 산출물 위치 (타깃)
 
@@ -219,8 +219,8 @@ python -m orchestrator --web --port 8765 --base-dir ~/agent-runs
 
 ```bash
 docker build -t dev-crew .
-docker run --rm -p 8765:8765 -v "$PWD/runs:/data/runs" dev-crew
-# 브라우저: http://localhost:8765
+docker run --rm -e WEB_UI_TOKEN="$(openssl rand -hex 24)" -p 8765:8765 -v "$PWD/runs:/data/runs" dev-crew
+# 브라우저: http://localhost:8765/?token=<위 토큰>
 
 # 선택 SDK 백엔드([all]: claude-agent-sdk/openai-agents)가 반드시 필요하면 hard 모드로 빌드:
 #   설치 실패 시 빌드를 즉시 실패시킨다(기본 soft 모드는 경고만 남기고 빌드를 계속).
@@ -233,10 +233,11 @@ docker build --build-arg REQUIRE_ALL_BACKENDS=1 -t dev-crew .
   꼭 필요하면 `--build-arg REQUIRE_ALL_BACKENDS=1` 로 빌드해 설치 실패를 **빌드 실패**로 만든다.
 - **실 백엔드**(claude-cli/codex/openai-agents/claude-sdk)는 각 CLI 설치·로그인 또는 API 키가 필요하다.
   컨테이너에 키를 `-e OPENAI_API_KEY=… -e ANTHROPIC_API_KEY=…` 로 주입하거나, CLI 인증 디렉터리를 마운트한다.
-- ⚠️ **인증 없음 / 0.0.0.0 노출 주의(#106):** 위 문서화된 컨테이너 실행(`--host 0.0.0.0`)은 **인증 없는**
-  웹 UI(= run 제어/모니터링)를 게시된 포트로 접근 가능한 **모든 네트워크 인터페이스**에 노출한다. 컨테이너 특성상
-  0.0.0.0 바인딩 자체는 필요하지만, 운영자는 반드시 외부 보호를 추가해야 한다 — 인증을 둔 리버스 프록시,
-  방화벽, 또는 루프백 한정 publish(`-p 127.0.0.1:8765:8765`). 신뢰되지 않은 네트워크에 그대로 노출하지 말 것.
+- ⚠️ **토큰 인증 / 0.0.0.0 노출 주의(#106):** 컨테이너는 `--host 0.0.0.0` 으로 뜨므로
+  `WEB_UI_TOKEN` 이 없으면 서버가 fail-closed 로 기동을 거부한다. 최초 접속은
+  `http://<host>:8765/?token=<토큰>` 이며, 토큰은 HttpOnly 쿠키로 저장된 뒤 URL 에서 제거된다.
+  그래도 신뢰되지 않은 네트워크에는 그대로 노출하지 말고 인증 리버스 프록시/TLS/방화벽 또는
+  루프백 한정 publish(`-p 127.0.0.1:8765:8765`)를 함께 사용할 것.
 - 산출물·런 상태는 `/data/runs`(볼륨)에 생성된다.
 - CI: `.github/workflows/ci.yml` 가 lint(`ruff check .`)+포맷 검사(`ruff format --check .`)+테스트
   (`python -m pytest -q`, Python 3.10–3.12 매트릭스)를 실행한다. (`pytest` 대신 `python -m pytest` 를 써서

@@ -102,7 +102,7 @@ def test_coerce_helpers():
     assert webui._coerce_int("", 7) == 7
     assert webui._coerce_int("abc", 7) == 7
     assert webui._coerce_int("3", 7) == 3
-    assert webui._coerce_int("3.9", 7) == 3
+    assert webui._coerce_int("3.9", 7) == 7
     assert webui._coerce_int(4, 7) == 4
     assert webui._coerce_float(None, 1.0) == 1.0
     assert webui._coerce_float("bad", None) is None

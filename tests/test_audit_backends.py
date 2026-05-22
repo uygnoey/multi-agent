@@ -132,14 +132,32 @@ def test_backend_status_isolates_broken_backend(monkeypatch):
 
 
 def test_cli_backends_stderr_cap_increased():
-    import inspect
-
     from orchestrator.backends import claude_cli, claude_team, codex_cli
+    from orchestrator.backends.claude_cli import ClaudeCLIBackend
+    from orchestrator.backends.claude_team import ClaudeTeamBackend
+    from orchestrator.backends.codex_cli import CodexCLIBackend
 
-    for mod in (claude_cli, claude_team, codex_cli):
-        src = inspect.getsource(mod)
-        assert "[:500]" not in src, f"{mod.__name__} 가 여전히 stderr 를 500 으로 자름"
-        assert "[:4000]" in src, f"{mod.__name__} 에 4000 cap 이 없음"
+    async def fake_run(cmd, cwd, timeout, log_path=None, line_render=None):
+        err = ("HEAD_MARKER" + ("x" * 5000) + "TAIL_MARKER").encode()
+        return 1, b"", err, False
+
+    cases = [
+        (claude_cli, ClaudeCLIBackend()),
+        (claude_team, ClaudeTeamBackend()),
+        (codex_cli, CodexCLIBackend()),
+    ]
+    for mod, backend in cases:
+        old = mod.run_subprocess
+        mod.run_subprocess = fake_run
+        try:
+            req = _make_request(Path("/tmp"), "backend-developer", {"id": "U1", "title": "x"})
+            res = asyncio.run(backend.run_role(req))
+        finally:
+            mod.run_subprocess = old
+        assert res.ok is False
+        assert res.error.endswith("TAIL_MARKER")
+        assert "HEAD_MARKER" not in res.error
+        assert len(res.error) == 4000
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +307,7 @@ def test_openai_edit_is_targeted_replacement():
 
 
 # ---------------------------------------------------------------------------
-# #124 — openai run_bash 출력에 exit code 포함 (소스 검증)
+# #124 — openai run_bash 출력에 exit code 포함
 # ---------------------------------------------------------------------------
 
 
@@ -311,20 +329,53 @@ def test_openai_run_bash_includes_exit_code(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# #122 / #123 — openai read/write 크기 상한 (소스 검증)
+# #122 / #123 — openai read/write 크기 상한
 # ---------------------------------------------------------------------------
 
 
-def test_openai_read_write_have_size_limits():
-    import inspect
+def test_openai_read_write_have_size_limits(tmp_path):
+    from orchestrator.backends.openai_agents import OpenAIAgentsBackend
 
-    from orchestrator.backends import openai_agents
+    observations = {}
 
-    src = inspect.getsource(openai_agents)
-    assert "max_read_bytes" in src
-    assert "max_write_bytes" in src
-    assert "write rejected" in src
-    assert "truncated" in src
+    def function_tool(fn):
+        return fn
+
+    class _Agent:
+        def __init__(self, **kwargs):
+            observations["tools"] = {fn.__name__: fn for fn in kwargs["tools"]}
+
+    class _Runner:
+        @staticmethod
+        async def run(agent, prompt, max_turns=None):
+            tools = observations["tools"]
+            observations["read"] = tools["read_file"]("big.txt")
+            observations["write"] = tools["write_file"]("too-big.txt", "x" * (5 * 1024 * 1024 + 1))
+
+            class _Result:
+                final_output = "done"
+
+            return _Result()
+
+    fake_mod = type(sys)("agents")
+    fake_mod.Agent = _Agent
+    fake_mod.Runner = _Runner
+    fake_mod.function_tool = function_tool
+    old = sys.modules.get("agents")
+    sys.modules["agents"] = fake_mod
+    try:
+        (tmp_path / "big.txt").write_bytes(b"a" * (250 * 1024))
+        req = _make_request(tmp_path, "backend-developer", {"id": "U1", "title": "x"})
+        req.allowed_tools[:] = ["Read", "Write"]
+        res = asyncio.run(OpenAIAgentsBackend().run_role(req))
+    finally:
+        if old is None:
+            sys.modules.pop("agents", None)
+        else:
+            sys.modules["agents"] = old
+    assert res.ok is True
+    assert "truncated" in observations["read"]
+    assert "write rejected" in observations["write"]
 
 
 # ---------------------------------------------------------------------------
@@ -457,16 +508,63 @@ def test_claude_sdk_run_role_captures_model_and_tokens(monkeypatch):
 
 
 def test_budget_turn_limit_documented_as_unsupported_for_clis():
-    import inspect
+    from orchestrator.backends import codex_cli
+    from orchestrator.backends.codex_cli import CodexCLIBackend
+    from orchestrator.backends.openai_agents import OpenAIAgentsBackend
 
-    from orchestrator.backends import claude_cli, claude_team, codex_cli, openai_agents
+    captured = {}
 
-    for mod in (claude_cli, claude_team, codex_cli):
-        src = inspect.getsource(mod)
-        # CLI 에는 per-call budget/turn-limit 플래그가 없음을 코드 주석으로 명시
-        assert "budget" in src and "max_turns" in src
-        assert "불가" in src
-    # openai 는 budget 미지원 명시 + max_turns 는 전달
-    osrc = inspect.getsource(openai_agents)
-    assert "예산 캡 옵션이 없어" in osrc
-    assert "max_turns=req.max_turns" in osrc
+    async def fake_codex_run(cmd, cwd, timeout, log_path=None):
+        captured["codex_cmd"] = cmd
+        return 0, b'{"type":"turn.completed","usage":{}}\n', b"", False
+
+    old_codex = codex_cli.run_subprocess
+    codex_cli.run_subprocess = fake_codex_run
+    try:
+        req = _make_request(Path("/tmp"), "backend-developer", {"id": "U1", "title": "x"})
+        req.budget = 9.9
+        req.max_turns = 7
+        res = asyncio.run(CodexCLIBackend().run_role(req))
+    finally:
+        codex_cli.run_subprocess = old_codex
+    assert res.ok is True
+    assert "--max-turns" not in captured["codex_cmd"]
+    assert "--max-budget-usd" not in captured["codex_cmd"]
+    assert "--budget" not in captured["codex_cmd"]
+
+    def function_tool(fn):
+        return fn
+
+    class _Agent:
+        def __init__(self, **kwargs):
+            captured["openai_agent_kwargs"] = kwargs
+
+    class _Runner:
+        @staticmethod
+        async def run(agent, prompt, max_turns=None):
+            captured["openai_max_turns"] = max_turns
+
+            class _Result:
+                final_output = "done"
+
+            return _Result()
+
+    fake_mod = type(sys)("agents")
+    fake_mod.Agent = _Agent
+    fake_mod.Runner = _Runner
+    fake_mod.function_tool = function_tool
+    old = sys.modules.get("agents")
+    sys.modules["agents"] = fake_mod
+    try:
+        req = _make_request(Path("/tmp"), "backend-developer", {"id": "U1", "title": "x"})
+        req.budget = 9.9
+        req.max_turns = 7
+        res = asyncio.run(OpenAIAgentsBackend().run_role(req))
+    finally:
+        if old is None:
+            sys.modules.pop("agents", None)
+        else:
+            sys.modules["agents"] = old
+    assert res.ok is True
+    assert captured["openai_max_turns"] == 7
+    assert "max_budget_usd" not in captured["openai_agent_kwargs"]

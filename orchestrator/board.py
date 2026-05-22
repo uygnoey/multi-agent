@@ -221,9 +221,10 @@ class Board:
     # ---- mutations (single writer) ----
     async def add_units(self, units: list[dict]) -> None:
         added = 0
-        # 락 안에서는 add_warning(동일 락 재획득) 을 호출할 수 없으므로 충돌 경고를
+        # 락 안에서는 add_warning(동일 락 재획득) 을 호출할 수 없으므로 경고를
         # 모아 두었다가 락 해제 후 기록한다.
         collision_warnings: list[str] = []
+        skipped_warnings: list[str] = []
         async with self._lock:
             existing = {u["id"] for u in self._data["units"]}
             # 이번 호출에서 본 raw id(문자열화) 집합: 동일 raw 의 재투입은 진짜 중복 → skip.
@@ -234,16 +235,19 @@ class Board:
                 raw_key = str(raw_id)
                 # 동일한 raw id 가 이번 호출에서 또 나오면 진짜 중복 → skip.
                 if raw_key in seen_raw:
+                    skipped_warnings.append(f"unit skipped: duplicate raw id {raw_id!r}")
                     continue
                 seen_raw.add(raw_key)
                 # 숫자 ID 문자열화 + 경로/식별자 안전 문자만 (traversal·특수문자 차단)
                 uid = _safe_unit_id(raw_id)
                 if not uid:
+                    skipped_warnings.append(f"unit skipped: invalid id {raw_id!r}")
                     continue
                 if uid in existing:
                     if raw_key == uid:
                         # 이미 정규형(canonical) id 로 존재 → 동일 unit 의 멱등 재투입이므로
-                        # 조용히 skip(중복 생성/경고 없음). 기존 add_units 멱등성 계약 유지.
+                        # 중복 생성 없이 skip 하되, 원인은 보드 경고로 가시화한다.
+                        skipped_warnings.append(f"unit skipped: duplicate id {raw_id!r}")
                         continue
                     # 서로 다른 raw 입력이 같은 sanitized id 로 충돌하면 조용히 버리지 않고
                     # 숫자 접미사("-2","-3"…)를 붙여 보존하고 경고를 남긴다(silent drop 금지).
@@ -280,8 +284,8 @@ class Board:
                     }
                 )
             self._flush()
-        # 충돌로 인한 rename 은 락 밖에서 보드 경고로 기록(가시성 확보).
-        for msg in collision_warnings:
+        # 충돌/skip 은 락 밖에서 보드 경고로 기록(가시성 확보).
+        for msg in [*collision_warnings, *skipped_warnings]:
             await self.add_warning(msg)
         skipped = len(units) - added
         extra = f" ({skipped} skipped: dup/invalid id)" if skipped else ""

@@ -136,8 +136,25 @@ def _coerce_int(value, default: int) -> int:
     if value in (None, ""):
         return default
     try:
-        return int(float(value))  # "3.0" 같은 문자열도 허용
-    except (TypeError, ValueError):
+        if isinstance(value, bool):
+            return default
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value) if math.isfinite(value) and value.is_integer() else default
+        if isinstance(value, str):
+            s = value.strip()
+            if re.fullmatch(r"[+-]?\d+", s):
+                return int(s)
+            try:
+                f = float(s)
+            except ValueError:
+                return default
+            if math.isfinite(f) and f.is_integer():
+                return int(f)
+            return default
+        return default
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -146,9 +163,34 @@ def _coerce_float(value, default):
     if value in (None, ""):
         return default
     try:
-        return float(value)
+        f = float(value)
+        return f if math.isfinite(f) else default
     except (TypeError, ValueError):
         return default
+
+
+def _parse_int_option(value, *, field: str, minimum: int) -> tuple[int | None, str | None]:
+    """웹 API 정수 옵션 검증: JSON float truncation 없이 진짜 정수만 허용."""
+    if value in (None, ""):
+        return None, None
+    if isinstance(value, bool):
+        return None, f"invalid {field}: {value!r}"
+    if isinstance(value, int):
+        iv = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None, f"invalid {field}: {value!r}"
+        iv = int(value)
+    elif isinstance(value, str):
+        s = value.strip()
+        if not re.fullmatch(r"[+-]?\d+", s):
+            return None, f"invalid {field}: {value!r}"
+        iv = int(s)
+    else:
+        return None, f"invalid {field}: {value!r}"
+    if iv < minimum:
+        return None, f"{field} must be >= {minimum} (got {iv})"
+    return iv, None
 
 
 def _fmt_num(value) -> str:
@@ -468,6 +510,14 @@ def _make_handler(manager: RunManager, token: str | None = None):
                 code, json.dumps(obj, ensure_ascii=False).encode("utf-8"), "application/json"
             )
 
+        def _redirect(self, location: str, extra_headers=None):
+            self._send(
+                303,
+                b"",
+                "text/plain; charset=utf-8",
+                [("Location", location)] + (extra_headers or []),
+            )
+
         # ---- #17: 토큰 인증 (WEB_UI_TOKEN 설정 시에만 활성) ----
         def _provided_token(self) -> str:
             """요청에서 토큰을 추출: Authorization: Bearer → X-Auth-Token → ?token= → 쿠키."""
@@ -501,6 +551,12 @@ def _make_handler(manager: RunManager, token: str | None = None):
                 return False
             self._json({"error": "unauthorized"}, 401)
             return True
+
+        def _cookie_attrs(self) -> str:
+            attrs = "Path=/; HttpOnly; SameSite=Strict"
+            if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https":
+                attrs += "; Secure"
+            return attrs
 
         # ---- #9: CSRF/Origin 방어 ----
         def _origin_ok(self) -> bool:
@@ -538,10 +594,14 @@ def _make_handler(manager: RunManager, token: str | None = None):
                 if auth_token:
                     qt = (q.get("token") or [""])[0]
                     if qt and hmac.compare_digest(qt, auth_token):
-                        # #10: HttpOnly 로 JS/XSS 의 쿠키 탈취를 막는다(쿠키는 서버만 읽으면 됨).
-                        #      SameSite=Strict 로 cross-site 전송 차단. (http 에선 Secure 불가 —
-                        #      https 종단 프록시 뒤라면 프록시에서 Secure 를 부여하라.)
-                        extra = [("Set-Cookie", f"token={qt}; Path=/; HttpOnly; SameSite=Strict")]
+                        # #10: HttpOnly 로 JS/XSS 의 쿠키 탈취를 막고 SameSite=Strict 로 cross-site
+                        #      전송을 차단한다. TLS 종단 프록시가 X-Forwarded-Proto=https 를 주면
+                        #      Secure 도 붙인다.
+                        extra = [("Set-Cookie", f"token={qt}; {self._cookie_attrs()}")]
+                        # query token 은 브라우저 히스토리/리퍼러에 남을 수 있으므로 쿠키 설정 즉시
+                        # 깨끗한 URL 로 이동시킨다. API 토큰 인증은 그대로 유지된다.
+                        self._redirect("/", extra)
+                        return
                 self._send(
                     200,
                     INDEX_HTML.encode("utf-8"),
@@ -754,16 +814,10 @@ def _make_handler(manager: RunManager, token: str | None = None):
             # max_attempts/retries). retries 만 0 허용(>=0), 나머지는 >=1.
             for fld in ("concurrency", "max_units", "max_attempts", "retries"):
                 v = data.get(fld)
-                if v in (None, ""):
-                    continue
-                try:
-                    iv = int(v)
-                except (TypeError, ValueError):
-                    self._json({"error": f"invalid {fld}: {v!r}"}, 400)
-                    return
                 lo = 0 if fld == "retries" else 1
-                if iv < lo:
-                    self._json({"error": f"{fld} must be >= {lo} (got {iv})"}, 400)
+                _iv, err = _parse_int_option(v, field=fld, minimum=lo)
+                if err:
+                    self._json({"error": err}, 400)
                     return
             # #12: poll_interval / timeout / budget 은 실수(float) 옵션이다.
             #      CLI(--poll-interval type=float, default=20.0)와 RunConfig
@@ -1083,16 +1137,18 @@ async function tick(){
     if(s&&s.error){showErr("상태 조회 오류: "+s.error+(r.status===401?" — URL 에 ?token=… 를 추가하세요":""));return}
     showErr("");  // 성공 시 이전 오류 제거
     const b=s.board||{};const ag=b.agents||{};const proj=s.project_dir||"";
-    const done=(b.units||[]).filter(u=>u.status==="done").length;
+    const units=Array.isArray(b.units)?b.units:[];
+    const warns=Array.isArray(b.warnings)?b.warnings:[];
+    const globalArts=Array.isArray(b.artifacts)?b.artifacts:[];
+    const done=units.filter(u=>u&&u.status==="done").length;
     $("projDir").textContent=proj||"—";
     $("phase").textContent=b.phase||"—";
     $("cost").textContent="$"+num(b.total_cost_usd).toFixed(4)+(b.cost_estimated?" est.":"");
     $("tok").textContent=num(b.total_tokens).toLocaleString();
-    $("units").textContent=done+"/"+((b.units||[]).length);
+    $("units").textContent=done+"/"+units.length;
     const runN=(s.roles||[]).filter(r=>(ag[r]||{}).status==="running").length;
     $("runCount").textContent=runN+"개";
     // 3-state: 실행중 / 완료(done, 경고 있으면 ⚠) / 중단(stopped)
-    const warns=b.warnings||[];
     $("running").textContent=s.running?"running"
       :(b.phase==="done"?(warns.length?("⚠ done ("+warns.length+" 경고)"):"✅ done"):"⏹ stopped");
     $("stopBtn").style.display=s.running?"":"none";       // 실행 중에만 정지
@@ -1116,9 +1172,8 @@ async function tick(){
     let html="";
     if(warns.length)html+="<div style='color:#f85149;margin-bottom:6px'>⚠ "+warns.map(esc).join("<br>⚠ ")+"</div>";
     html+="<div>보드/런상태: <b style='user-select:all'>"+esc(proj)+"/.orchestrator/</b></div>";
-    const g=b.artifacts||[];
-    if(g.length)html+="<div style='margin-top:6px'><b>설계·공통</b><br>"+g.map(a=>"&nbsp;&nbsp;"+esc(proj)+"/"+esc(a)).join("<br>")+"</div>";
-    (b.units||[]).forEach(u=>{const arts=u.artifacts||[];if(arts.length){
+    if(globalArts.length)html+="<div style='margin-top:6px'><b>설계·공통</b><br>"+globalArts.map(a=>"&nbsp;&nbsp;"+esc(proj)+"/"+esc(a)).join("<br>")+"</div>";
+    units.forEach(u=>{if(!u)return;const arts=Array.isArray(u.artifacts)?u.artifacts:[];if(arts.length){
       html+="<div style='margin-top:6px'><b>"+esc(u.id)+"</b> ("+esc(u.status)+", "+arts.length+" files)<br>"+
         arts.map(a=>"&nbsp;&nbsp;"+esc(proj)+"/"+esc(a)).join("<br>")+"</div>"}});
     $("artifacts").innerHTML=html;

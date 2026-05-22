@@ -11,6 +11,7 @@ HTTP 엔드포인트는 임시 포트의 stdlib ThreadingHTTPServer 를 fake spa
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import signal
@@ -55,7 +56,12 @@ def make_server(tmp_path):
         t = threading.Thread(target=httpd.serve_forever, daemon=True)
         t.start()
         servers.append(httpd)
-        return {"base": f"http://127.0.0.1:{port}", "manager": manager, "spawned": spawned}
+        return {
+            "base": f"http://127.0.0.1:{port}",
+            "port": port,
+            "manager": manager,
+            "spawned": spawned,
+        }
 
     yield _make
     for h in servers:
@@ -167,9 +173,12 @@ def test_index_is_ungated_and_sets_cookie_on_valid_token(make_server):
     code, _t, _ = _request(s["base"], "/")
     assert code == 200
     # 유효한 ?token= 로 접속하면 쿠키를 심어 이후 fetch 가 자동 인증된다.
-    code, _t, hdrs = _request(s["base"], "/?token=SECRET")
-    assert code == 200
-    assert "token=SECRET" in (hdrs.get("Set-Cookie") or "")
+    conn = http.client.HTTPConnection("127.0.0.1", s["port"])
+    conn.request("GET", "/?token=SECRET")
+    resp = conn.getresponse()
+    assert resp.status == 303
+    assert resp.getheader("Location") == "/"
+    assert "token=SECRET" in (resp.getheader("Set-Cookie") or "")
 
 
 # ----------------- #20: seek-tail -----------------

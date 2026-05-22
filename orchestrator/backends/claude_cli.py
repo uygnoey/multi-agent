@@ -12,6 +12,16 @@ import shutil
 
 from .base import Backend, RoleRequest, RoleResult, run_subprocess
 
+_MAX_LOG_FIELD_CHARS = 4000
+
+
+def _clip_log_field(value: str) -> str:
+    if len(value) <= _MAX_LOG_FIELD_CHARS:
+        return value
+    return (
+        value[:_MAX_LOG_FIELD_CHARS] + f"... [truncated {len(value) - _MAX_LOG_FIELD_CHARS} chars]"
+    )
+
 
 def claude_stream_line(line_bytes: bytes) -> str | None:
     """stream-json 한 줄을 사람이 읽을 텍스트로 렌더 (실시간 로그용). 노이즈는 None."""
@@ -29,11 +39,10 @@ def claude_stream_line(line_bytes: bytes) -> str | None:
             if ct == "text" and c.get("text", "").strip():
                 out.append(c["text"])
             elif ct == "tool_use":
-                # 전문 저장 (절단 없음)
                 inp = json.dumps(c.get("input", {}), ensure_ascii=False)
-                out.append(f"🔧 {c.get('name')} {inp}")
+                out.append(f"🔧 {c.get('name')} {_clip_log_field(inp)}")
             elif ct == "thinking" and c.get("thinking"):
-                out.append("💭 " + c["thinking"])
+                out.append("💭 [thinking redacted]")
         return "\n".join(out) or None
     if t == "result":
         return f"✓ result (${o.get('total_cost_usd', 0)})"

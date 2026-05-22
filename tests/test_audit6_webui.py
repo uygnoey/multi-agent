@@ -9,6 +9,7 @@ HTTP 엔드포인트는 임시 포트의 stdlib ThreadingHTTPServer 를 fake spa
 
 from __future__ import annotations
 
+import http.client
 import json
 import threading
 import urllib.error
@@ -131,8 +132,11 @@ def test_cross_origin_blocked_before_auth(make_server):
 # ---------------- #10: HttpOnly 쿠키 ----------------
 def test_token_cookie_is_httponly(make_server):
     s = make_server(token="SECRET")
-    _code, _t, hdrs = _request(s["base"], "/?token=SECRET")
-    cookie = hdrs.get("Set-Cookie") or ""
+    conn = http.client.HTTPConnection("127.0.0.1", s["port"])
+    conn.request("GET", "/?token=SECRET")
+    resp = conn.getresponse()
+    assert resp.status == 303
+    cookie = resp.getheader("Set-Cookie") or ""
     assert "token=SECRET" in cookie
     assert "HttpOnly" in cookie
     assert "SameSite=Strict" in cookie
