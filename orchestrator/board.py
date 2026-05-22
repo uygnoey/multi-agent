@@ -19,6 +19,9 @@ from .config import normalize_role
 
 _UNSAFE_ID = re.compile(r"[^A-Za-z0-9_-]+")
 
+# 제어문자(개행/탭/CR 포함): 아티팩트 경로에 끼면 문서 주입/표 왜곡을 일으키므로 제거 대상.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
 # 로그/디렉티브 본문 최대 길이: LLM 폭주 출력이 파일을 무한히 키우는 것을 방지.
 _MAX_BODY_CHARS = 20000
 
@@ -49,13 +52,15 @@ def _coerce_int(raw) -> int:
 
 
 def _safe_artifact(raw) -> str | None:
-    """아티팩트 경로 경량 검증: str 만 허용, strip 후 절대경로/'..' 포함 시 drop.
+    """아티팩트 경로 경량 검증: str 만 허용, 제어문자 제거 후 절대경로/'..' 포함 시 drop.
 
     이 경로들은 타깃 프로젝트 기준 상대경로다. 비-str/빈값/안전하지 않은 값은 None.
     """
     if not isinstance(raw, str):
         return None
-    s = raw.strip()
+    # 개행/탭/CR 등 제어문자를 먼저 제거 → report/deliverables 표·문서 주입 차단.
+    # 제거 후 양끝 공백을 strip 하고, 빈 문자열이 되면 drop.
+    s = _CONTROL_CHARS.sub("", raw).strip()
     if not s:
         return None
     # 절대경로(POSIX '/' 또는 Windows 드라이브/역슬래시) 차단
@@ -63,7 +68,7 @@ def _safe_artifact(raw) -> str | None:
         return None
     if len(s) >= 2 and s[1] == ":":  # 예: C:\... 형태의 드라이브 절대경로
         return None
-    # 경로 traversal('..') 토큰 차단
+    # 경로 traversal('..') 토큰 차단 (제어문자 제거 후 재검사)
     parts = re.split(r"[\\/]+", s)
     if ".." in parts:
         return None
@@ -130,6 +135,40 @@ def _safe_warning(raw) -> str:
     return s
 
 
+# tail 시 끝에서부터 읽을 청크 크기: 큰 로그 전체를 메모리에 올리지 않기 위함(약 128KB).
+_TAIL_CHUNK_BYTES = 128 * 1024
+
+# 매 프롬프트에 주입되는 directives 누적분의 최대 크기(약 16KB). 끝(최신)에서부터만 읽는다 (#21).
+_MAX_DIRECTIVES_BYTES = 16 * 1024
+
+
+def _tail_lines(path: Path, n: int) -> list[str]:
+    """파일 끝에서 마지막 청크(~128KB)만 seek-read 해 마지막 n 줄을 반환.
+
+    전체 파일을 읽지 않아 대용량 로그에서도 메모리/IO 가 일정하다. 작은 파일,
+    디코드 오류는 모두 graceful 하게 처리한다.
+    """
+    if n <= 0:
+        return []
+    try:
+        with path.open("rb") as f:
+            f.seek(0, 2)  # 파일 끝으로 이동
+            size = f.tell()
+            # 작은 파일은 통째로, 큰 파일은 마지막 청크만 읽는다.
+            start = max(0, size - _TAIL_CHUNK_BYTES)
+            f.seek(start)
+            chunk = f.read()
+    except OSError:
+        return []
+    # 잘못된 바이트는 무시(errors='ignore')해 디코드 오류로 죽지 않게 함.
+    text = chunk.decode("utf-8", errors="ignore")
+    # 청크가 줄 중간에서 시작했다면 첫 줄은 불완전할 수 있으니 버린다(파일 시작이 아닌 경우).
+    if start > 0:
+        nl = text.find("\n")
+        text = text[nl + 1 :] if nl != -1 else ""
+    return text.splitlines()[-n:]
+
+
 def _norm_str_list(v) -> list[str]:
     """deps/roles 입력 정규화: list→[str…], scalar→[str], dict/None/빈값→[] (이상값 방어)."""
     if v in (None, "") or isinstance(v, dict):
@@ -182,13 +221,43 @@ class Board:
     # ---- mutations (single writer) ----
     async def add_units(self, units: list[dict]) -> None:
         added = 0
+        # 락 안에서는 add_warning(동일 락 재획득) 을 호출할 수 없으므로 충돌 경고를
+        # 모아 두었다가 락 해제 후 기록한다.
+        collision_warnings: list[str] = []
         async with self._lock:
             existing = {u["id"] for u in self._data["units"]}
+            # 이번 호출에서 본 raw id(문자열화) 집합: 동일 raw 의 재투입은 진짜 중복 → skip.
+            # str() 로 키를 만들어 dict/list/숫자 같은 비정상 입력에도 해시 안전하다.
+            seen_raw: set[str] = set()
             for u in units:
-                # 숫자 ID 문자열화 + 경로/식별자 안전 문자만 (traversal·특수문자 차단)
-                uid = _safe_unit_id(u.get("id"))
-                if not uid or uid in existing:
+                raw_id = u.get("id")
+                raw_key = str(raw_id)
+                # 동일한 raw id 가 이번 호출에서 또 나오면 진짜 중복 → skip.
+                if raw_key in seen_raw:
                     continue
+                seen_raw.add(raw_key)
+                # 숫자 ID 문자열화 + 경로/식별자 안전 문자만 (traversal·특수문자 차단)
+                uid = _safe_unit_id(raw_id)
+                if not uid:
+                    continue
+                if uid in existing:
+                    if raw_key == uid:
+                        # 이미 정규형(canonical) id 로 존재 → 동일 unit 의 멱등 재투입이므로
+                        # 조용히 skip(중복 생성/경고 없음). 기존 add_units 멱등성 계약 유지.
+                        continue
+                    # 서로 다른 raw 입력이 같은 sanitized id 로 충돌하면 조용히 버리지 않고
+                    # 숫자 접미사("-2","-3"…)를 붙여 보존하고 경고를 남긴다(silent drop 금지).
+                    base = uid
+                    suffix = 2
+                    new_uid = f"{base}-{suffix}"
+                    while new_uid in existing:
+                        suffix += 1
+                        new_uid = f"{base}-{suffix}"
+                    collision_warnings.append(
+                        f"unit id collision: {raw_id!r} sanitized to {base!r} which "
+                        f"already exists; renamed to {new_uid!r}"
+                    )
+                    uid = new_uid
                 existing.add(uid)
                 added += 1
                 # deps/roles 정규화: list→문자열들, scalar→[scalar], dict/None→[] (이상값 방어)
@@ -211,6 +280,9 @@ class Board:
                     }
                 )
             self._flush()
+        # 충돌로 인한 rename 은 락 밖에서 보드 경고로 기록(가시성 확보).
+        for msg in collision_warnings:
+            await self.add_warning(msg)
         skipped = len(units) - added
         extra = f" ({skipped} skipped: dup/invalid id)" if skipped else ""
         await self.log_event("board", f"added {added} unit(s){extra}")
@@ -361,9 +433,10 @@ class Board:
                 a["cost_est"] = True
                 self._data["cost_estimated"] = True
             if tokens_add:
-                # 잘못된 토큰 메타데이터(비-정수 등)는 무시하고 업데이트 진행
+                # 잘못된 토큰 메타데이터(비-정수 등)는 0 으로 강제(int 코어션 가드 유지)
                 add_t = _coerce_int(tokens_add)
-                if add_t:
+                # 토큰도 비용처럼 누적만 가능 → 음수는 no-op(per-agent/total 둘 다 감소 금지)
+                if add_t > 0:
                     a["tokens"] = a.get("tokens", 0) + add_t
                     self._data["total_tokens"] = self._data.get("total_tokens", 0) + add_t
             if message is not None:
@@ -402,7 +475,8 @@ class Board:
         p = self._log_path(role)
         if not p.exists():
             return ""
-        return "\n".join(p.read_text(encoding="utf-8").splitlines()[-n:])
+        # 전체 파일을 읽지 않고 끝 청크만 seek-read 해 마지막 n 줄만 반환(대용량 방어).
+        return "\n".join(_tail_lines(p, n))
 
     def write_report(self) -> Path:
         """Write a human-readable run report to .orchestrator/report.md."""
@@ -557,9 +631,8 @@ class Board:
                 f.write(line)
 
     def recent_events(self, n: int = 20) -> str:
-        if not self.events_path.exists():
-            return ""
-        return "\n".join(self.events_path.read_text(encoding="utf-8").splitlines()[-n:])
+        # #20: 전체 events.log 를 읽지 않고 끝 청크만 seek-read 해 마지막 n 줄만 반환(대용량 방어).
+        return "\n".join(_tail_lines(self.events_path, n))
 
     async def append_directive(self, who: str, text: str) -> None:
         # 대량/이상 LLM 출력이 directives.md 를 무한히 키우지 않도록 본문 크기 제한
@@ -569,6 +642,24 @@ class Board:
                 f.write(block)
 
     def directives(self) -> str:
-        if self.directives_path.exists():
-            return self.directives_path.read_text(encoding="utf-8")
-        return ""
+        # #21: directives 는 append 만 되고 매 역할 프롬프트에 통째로 다시 주입된다. 장기 run 에서
+        # 파일이 커지면 모든 프롬프트가 동반 비대해진다. 끝에서 최대 _MAX_DIRECTIVES_BYTES 만
+        # seek-read 해 크기를 묶는다(최신 디렉티브가 가장 중요하므로 tail 을 취한다).
+        if not self.directives_path.exists():
+            return ""
+        try:
+            with self.directives_path.open("rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                start = max(0, size - _MAX_DIRECTIVES_BYTES)
+                f.seek(start)
+                chunk = f.read()
+        except OSError:
+            return ""
+        text = chunk.decode("utf-8", errors="ignore")
+        if start > 0:
+            # 줄 중간에서 시작했을 수 있으니 첫 불완전 줄은 버리고, 생략 사실을 명시한다.
+            nl = text.find("\n")
+            text = text[nl + 1 :] if nl != -1 else ""
+            text = "…(오래된 directives 생략)\n" + text
+        return text

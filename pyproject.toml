@@ -1,6 +1,7 @@
 [build-system]
-# setuptools>=69.3 is required for [tool.setuptools.force-include] (used to bundle the
-# repo-root .claude/agents + templates dirs into the wheel; see below). #18 / #2.
+# Recent setuptools (>=69.3) for the declarative [tool.setuptools.data-files] bundling used to
+# ship the repo-root .claude/agents + templates dirs into the wheel/sdist (see below). #18 / #2.
+# (force-include is intentionally NOT used — it is not valid in the declarative table.)
 requires = ["setuptools>=69.3"]
 build-backend = "setuptools.build_meta"
 
@@ -42,11 +43,11 @@ orchestrator = ["codex_pricing.json"]
 # <site-packages> — where those repo-root dirs do NOT exist, because they live OUTSIDE the
 # orchestrator package and pyproject package-data can only bundle files *inside* a package.
 #
-# data-files DOES ship both dirs inside the built wheel + sdist (verified below). Note that
-# wheel data-files are installed relative to the install prefix (sys.prefix / the venv root),
-# NOT site-packages, so the *unchanged* FRAMEWORK_ROOT loader (which points at site-packages)
-# will not auto-discover them from a plain wheel. We ship them anyway so the bytes are present
-# and recoverable; full fidelity needs an editable install or Docker.
+# data-files DOES ship both dirs inside the built wheel + sdist (verified below). They install
+# relative to the install prefix (sys.prefix / the venv root), NOT site-packages. The loader
+# (config._resolve_runtime_dir) now scans BOTH the prefix data-files locations AND the
+# site-packages-style roots in addition to FRAMEWORK_ROOT, so a plain wheel auto-discovers them
+# at <prefix>/share/web-team-orchestrator/... — wheel installs are now a supported runtime path.
 [tool.setuptools.data-files]
 "share/web-team-orchestrator/.claude/agents" = [".claude/agents/*.md"]
 "share/web-team-orchestrator/templates" = ["templates/CLAUDE.md", "templates/AGENTS.md"]
@@ -60,11 +61,11 @@ orchestrator = ["codex_pricing.json"]
 #    present in the archive via MANIFEST.in, but a build from the sdist produces the same
 #    wheel-shaped layout below, so see the wheel caveat.
 #  * plain wheel (`pip install web-team-orchestrator`): the .claude/agents + templates bytes
-#    are bundled (data-files) but land under <prefix>/share/web-team-orchestrator/, which the
-#    current FRAMEWORK_ROOT (= site-packages) does NOT scan. Fully-correct auto-discovery from
-#    a wheel would require either moving the dirs INTO the orchestrator package + switching the
-#    loader to importlib.resources, or a setup.py force-include — both are code/layout changes
-#    outside this packaging-only fix. Until then, use an editable install or Docker for runtime.
+#    are bundled (data-files) and land under <prefix>/share/web-team-orchestrator/. The loader
+#    (orchestrator/config.py::_resolve_runtime_dir) now ALSO scans those data-files locations
+#    (sys.prefix / base_prefix and the site-packages-style roots), not just FRAMEWORK_ROOT, so a
+#    plain wheel install resolves the runtime dirs at <prefix>/share/... — this is now a
+#    SUPPORTED path. (Editable install and Docker resolve them from the repo/app root instead.)
 
 # Make plain `pytest` work like `python -m pytest`: put the repo root on sys.path so the
 # `orchestrator` package imports without a prior install.

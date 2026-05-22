@@ -61,6 +61,31 @@ def _extract_tokens(result) -> int | None:
     return None
 
 
+def _extract_model(result) -> str | None:
+    """#10: Runner 결과에서 실제 사용된 모델명을 best-effort 로 뽑는다 (SDK 형태에 견고).
+
+    호출부가 req.model 을 고정하지 않으면 SDK 가 고른 실제 모델을 알 수 없어 비용 추정이
+    영원히 None 으로 남는다. raw_responses[*].model 등을 guarded getattr 로 best-effort
+    캡처한다(첫 비어있지 않은 값 채택). 끝내 알 수 없으면 None — 가짜 모델명을 날조하지 않는다.
+    """
+    # ① raw_responses[*].model (가장 신뢰할 수 있는 실제 응답 모델)
+    try:
+        for resp in getattr(result, "raw_responses", None) or []:
+            m = getattr(resp, "model", None)
+            if m:
+                return str(m)
+    except Exception:
+        pass
+    # ② last_agent.model 이 문자열로 박혀 있으면 그것을 사용 (객체/None 은 무시)
+    try:
+        m = getattr(getattr(result, "last_agent", None), "model", None)
+        if isinstance(m, str) and m:
+            return m
+    except Exception:
+        pass
+    return None
+
+
 def _extract_io_tokens(result) -> tuple[int, int] | None:
     """#8: input/output 토큰을 분리 추출 (비용 추정용). 합산만 가능하면 None.
 
@@ -196,10 +221,15 @@ class _BashCapture:
 
 
 def _kill_process_group(proc, grace: float = 2.0) -> None:
-    """#3: 셸이 spawn 한 자식까지 프로세스 그룹째 종료한다 (좀비/고아 방지).
+    """#3/#1: 셸이 spawn 한 자식까지 프로세스 그룹째 종료한다 (좀비/고아 방지).
 
     SIGTERM → 짧은 유예 → SIGKILL 순서. start_new_session=True 로 만든 새 그룹을
     os.killpg 로 통째 종료한다. 그룹 조회/전송 실패 시 단일 프로세스 kill 로 폴백.
+
+    #1: 부모가 유예 안에 graceful 종료하더라도, SIGTERM 을 무시한 채 살아남은 그룹 내
+    자식(부모 셸은 종료) 이 고아로 남을 수 있다. 그래서 마지막에 항상 그룹 SIGKILL 을 한 번
+    더 쓸어(try/except) 잔존 자식을 일소한다 — 부모 graceful/무응답 두 경로 모두 그룹
+    SIGKILL 으로 끝나야 호출 후 살아남는 자식이 없다(그룹이 이미 비었으면 무해).
     """
     if proc is None:
         return
@@ -221,27 +251,36 @@ def _kill_process_group(proc, grace: float = 2.0) -> None:
             proc.terminate()
         except Exception:
             pass
-    # 2) 짧은 유예 동안 자발적 종료 대기
+    # 2) 짧은 유예 동안 자발적 종료 대기 (예외/타임아웃이어도 아래 SIGKILL 스윕으로 진행)
+    parent_exited = False
     try:
         proc.wait(timeout=grace)
-        return
+        parent_exited = True
     except Exception:
         pass
-    # 3) 아직 살아있으면 SIGKILL 로 그룹째 강제 종료
-    try:
-        if pgid is not None:
-            os.killpg(pgid, signal.SIGKILL)
-        else:
-            proc.kill()
-    except Exception:
+    # 3) 부모가 아직 살아있으면 SIGKILL 로 그룹째 강제 종료
+    if not parent_exited:
         try:
-            proc.kill()
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=grace)
         except Exception:
             pass
-    try:
-        proc.wait(timeout=grace)
-    except Exception:
-        pass
+    # 4) #1: 부모 종료 여부와 무관하게 그룹 SIGKILL 을 마지막으로 한 번 더 쓸어, SIGTERM 을
+    #    무시한 채 살아남은 자식(straggler)을 반드시 일소한다. 그룹이 비었으면 무해(try/except).
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except Exception:
+            pass
 
 
 def _run_bash_command(command: str, cwd: str, timeout: float, max_capture: int) -> str:
@@ -300,6 +339,17 @@ def _run_bash_command(command: str, cwd: str, timeout: float, max_capture: int) 
         return f"<bash error: {e}>"
 
 
+# #3: edit_file 은 유일성 치환을 위해 파일 전체 내용이 필요하다. 거대 파일을 read_text() 로
+# 통째 올리면 메모리가 폭주하므로, 읽기 전에 파일 크기를 먼저 검사한다. 상한(read 와 동일한
+# ~200KB) 초과 파일은 로드하지 않고 거부하고 write_file 사용을 안내한다(편집은 전체 내용 필요).
+_MAX_EDIT_BYTES = 200 * 1024
+
+
+def _edit_too_large(size_bytes: int, cap: int = _MAX_EDIT_BYTES) -> bool:
+    """#3: 편집 대상 파일 바이트 크기가 상한을 초과하면 True (읽기 전 size 가드, 순수 함수)."""
+    return size_bytes > cap
+
+
 def _edit_file_text(content: str, old_string: str, new_string: str) -> str:
     """#13: 타깃 부분 치환을 수행하고 새 파일 내용을 반환한다 (순수 함수, SDK 불필요).
 
@@ -316,6 +366,25 @@ def _edit_file_text(content: str, old_string: str, new_string: str) -> str:
     if count > 1:
         raise ValueError(f"old_string is not unique ({count} matches) — add more context")
     return content.replace(old_string, new_string, 1)
+
+
+# #4: list_dir 이 node_modules/.venv 처럼 항목이 수만 개인 디렉터리를 정렬해 통째 문자열로
+# 반환하면 컨텍스트가 폭주한다. 정렬 후 앞쪽 일부(기본 500개)만 반환하고, 잘렸으면 남은 개수를
+# "... (N more)" 로 안내한다.
+_MAX_LIST_ENTRIES = 500
+
+
+def _format_dir_listing(names: list[str], cap: int = _MAX_LIST_ENTRIES) -> str:
+    """#4: 정렬된 항목 이름 리스트를 상한까지만 합쳐 반환(초과 시 '... (N more)' 안내).
+
+    순수 함수(SDK 불필요): 입력 names 를 정렬해 앞쪽 cap 개만 줄바꿈 연결한다.
+    """
+    ordered = sorted(names)
+    if len(ordered) <= cap:
+        return "\n".join(ordered)
+    head = ordered[:cap]
+    remaining = len(ordered) - cap
+    return "\n".join(head) + f"\n... ({remaining} more)"
 
 
 class OpenAIAgentsBackend(Backend):
@@ -398,6 +467,17 @@ class OpenAIAgentsBackend(Backend):
             p = _safe(path)
             if not p.exists():
                 return f"<no file: {path}>"
+            # #3: read_text() 로 통째 올리기 전에 크기를 먼저 검사 — 거대 파일은 메모리를
+            # 폭주시키므로 로드하지 않고 거부한다(편집은 유일성 치환 위해 전체 내용 필요).
+            try:
+                size = p.stat().st_size
+            except Exception as e:
+                return f"<read error: {path}: {e}>"
+            if _edit_too_large(size):
+                return (
+                    f"<edit rejected: {path} too large to edit "
+                    f"({size} > {_MAX_EDIT_BYTES} bytes); use write_file>"
+                )
             try:
                 content = p.read_text(encoding="utf-8")
             except Exception as e:
@@ -414,11 +494,16 @@ class OpenAIAgentsBackend(Backend):
 
         @function_tool
         def list_dir(path: str = ".") -> str:
-            """디렉터리 목록 (타깃 디렉터리 한정)."""
+            """디렉터리 목록 (타깃 디렉터리 한정, 정렬 후 최대 ~500개 — 초과는 '... (N more)')."""
             p = _safe(path)
             if not p.exists():
                 return f"<no dir: {path}>"
-            return "\n".join(sorted(x.name + ("/" if x.is_dir() else "") for x in p.iterdir()))
+            try:
+                names = [x.name + ("/" if x.is_dir() else "") for x in p.iterdir()]
+            except Exception as e:
+                return f"<list error: {path}: {e}>"
+            # #4: node_modules/.venv 같은 거대 디렉터리도 상한까지만 반환해 컨텍스트 폭주 방지.
+            return _format_dir_listing(names)
 
         bash_timeout = req.timeout if req.timeout else 120  # config 의 세션 타임아웃을 따른다
         # #36: 반환 텍스트는 어차피 4000자로 자르므로, 보관하는 양도 상한선으로 묶는다.
@@ -475,7 +560,9 @@ class OpenAIAgentsBackend(Backend):
             return RoleResult(ok=False, error=str(e))
         # #46: model/tokens/cost 를 best-effort 로 캡처 (Runner 결과 형태에 따라 guard).
         tokens = _extract_tokens(result)
-        model = req.model
+        # #10: 호출부가 모델을 고정하지 않으면 SDK 가 고른 실제 모델을 결과에서 캡처해, 보고
+        # 모델과 비용 추정 둘 다에 쓴다(fallback req.model). 끝내 알 수 없으면 None.
+        model = _extract_model(result) or req.model
         # #8: input/output 토큰이 분리되고 모델 단가를 알면 비용을 추정한다(추정치 표시).
         cost = None
         cost_estimated = False

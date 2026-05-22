@@ -25,6 +25,7 @@ import unicodedata
 from pathlib import Path
 
 from .backends import backend_status
+from .board import _tail_lines
 from .config import BACKEND_INFO, ROLES
 
 
@@ -123,6 +124,11 @@ def _stop_run(orch_dir: Path) -> bool:
         # SIGTERM 후 graceful 종료를 최대 ≈4초 기다린다(0.1초 간격 폴링). 죽으면 즉시 제거.
         for _ in range(40):
             if not _alive():
+                # #3: 부모(run.pid) 가 graceful 종료해도 SIGTERM 을 무시한 채 그룹에 남은
+                #     자식(부모만 먼저 죽은 child-only 잔존)이 있을 수 있다. pid 생존만 보면
+                #     놓치므로, 마지막에 그룹 SIGKILL 로 한 번 더 쓸어 잔존 자식을 일소한다
+                #     (그룹이 이미 비었으면 무해 — _kill 은 try/except).
+                _kill(signal.SIGKILL)
                 _remove_pidfile()
                 return
             time.sleep(0.1)
@@ -259,13 +265,11 @@ def _read_board(orch_dir: Path) -> dict:
 
 
 def _read_agent_log(orch_dir: Path, role: str, n: int = 500) -> str:
+    # #20: 전체 파일을 읽지 않고 끝 청크만 seek-read 해 마지막 n 줄만 반환(대용량 로그 방어).
     p = orch_dir / "agents" / f"{role}.log"
     if not p.exists():
         return ""
-    try:
-        return "\n".join(p.read_text(encoding="utf-8").splitlines()[-n:])
-    except Exception:
-        return ""
+    return "\n".join(_tail_lines(p, n))
 
 
 # 상세 뷰 로그 mtime 캐시: 같은 파일이 안 바뀌었으면 매 refresh 마다 다시 읽지 않는다 (#36).

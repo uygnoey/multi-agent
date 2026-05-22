@@ -64,6 +64,13 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None):
         limit=2**20,  # 큰 JSON 라인 대응 (기본 64KB 초과 방지)
         start_new_session=True,  # 새 프로세스 그룹 → 타임아웃 시 자식까지 그룹째 종료
     )
+    # pgid 는 spawn 직후(부모 확실히 생존) 캡처한다. start_new_session 으로 부모 pid 가
+    # 곧 그룹 리더 pgid 다. 부모가 먼저 죽고 자식만 살아남은 경우 타임아웃 처리 시점에는
+    # os.getpgid(proc.pid) 가 ProcessLookupError 로 실패해 그룹 SIGKILL 일소를 못 했다(#1).
+    try:
+        pgid = os.getpgid(proc.pid)
+    except Exception:
+        pgid = None
     # 호출 시점의 모듈 상한을 읽어 전달 (설정/테스트에서 _MAX_STREAM_BYTES 조정 가능).
     out_chunks = _BoundedBuffer(_MAX_STREAM_BYTES)
     err_chunks = _BoundedBuffer(_MAX_STREAM_BYTES)
@@ -111,10 +118,7 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None):
     except asyncio.TimeoutError:
         # #17: 즉시 SIGKILL 대신 SIGTERM 으로 정리(락/임시파일 등) 유예를 준 뒤 SIGKILL.
         # 프로세스 그룹째 종료한다 (CLI 가 spawn 한 자식 — node/codex 등 — 이 살아남지 않도록).
-        try:
-            pgid = os.getpgid(proc.pid)
-        except Exception:
-            pgid = None
+        # pgid 는 spawn 직후 캡처한 값을 재사용한다(여기서 다시 조회하면 부모가 이미 죽어 실패).
         # 1) SIGTERM (graceful) — 그룹 우선, 실패 시 단일 프로세스
         try:
             if pgid is not None:
@@ -147,6 +151,15 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None):
                 pass
         except Exception:
             pass
+        # 4) 부모가 유예 안에 죽었더라도(grace-success), SIGTERM 을 무시한 채 살아남은
+        #    그룹 내 자식(부모 셸은 종료) 을 마지막으로 한 번 더 SIGKILL 로 일소한다.
+        #    두 경로(부모 graceful 종료 / 부모 무응답) 모두 그룹 SIGKILL 으로 끝나야
+        #    호출이 끝난 뒤 살아남는 자식이 없다. 그룹이 이미 비었으면 무해(try/except).
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except Exception:
+                pass
         return None, out_chunks.getvalue(), err_chunks.getvalue(), True
     finally:
         if f is not None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import math
 import sys
 from pathlib import Path
 
@@ -170,9 +171,13 @@ def _print_summary(snap: dict, cfg: RunConfig) -> None:
     done = sum(1 for u in units if u["status"] == "done")
     print(f"units       : {done}/{len(units)} done")
     # 손상된 스냅샷(문자열/None/리스트 cost)이라도 보드/리포트 경로는 출력되도록 안전 변환 (#29)
+    # (#10) NaN/Inf 도 방어: float("nan")/float("inf") 은 float() 를 통과하지만 그대로
+    #       :.4f 로 찍으면 "$nan"/"$inf"/"$-inf" 가 출력된다. 비유한값은 0.0 으로 강제한다.
     try:
         cost = float(snap.get("total_cost_usd", 0.0))
     except (TypeError, ValueError):
+        cost = 0.0
+    if not math.isfinite(cost):
         cost = 0.0
     print(f"cost        : ${cost:.4f}")
     warnings = snap.get("warnings") or []

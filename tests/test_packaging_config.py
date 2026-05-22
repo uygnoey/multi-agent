@@ -6,7 +6,6 @@ These tests only read repo-root config/docs files (pyproject.toml, MANIFEST.in, 
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import pytest
@@ -15,11 +14,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _load_pyproject() -> dict:
-    if sys.version_info >= (3, 11):
-        import tomllib
-
-        return tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    pytest.skip("tomllib requires Python 3.11+")
+    # #19: tomllib(3.11+) 우선, 없으면 tomli 폴백 → Python 3.10 에서도 pyproject 검증이
+    #      skip 되지 않게 한다. 둘 다 없을 때만 skip(커버리지 구멍 최소화).
+    try:
+        import tomllib as _toml
+    except ModuleNotFoundError:
+        try:
+            import tomli as _toml
+        except ModuleNotFoundError:
+            pytest.skip("need tomllib (Python 3.11+) or tomli")
+    return _toml.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
 
 def test_pyproject_is_valid_toml():
