@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import os
 import signal
 from collections import deque
@@ -37,7 +38,10 @@ class _BoundedBuffer:
 
     def append(self, line: bytes) -> None:
         if len(line) > self._max:
-            line = line[-self._max :]
+            # Tail retention is right for ordinary logs, but stream-json records start with
+            # "{" and losing the head makes the whole event unparsable. Preserve the head for
+            # oversized JSON-looking records; keep tail semantics for everything else.
+            line = line[: self._max] if line.lstrip().startswith(b"{") else line[-self._max :]
             self.dropped = True
             self._lines.clear()
             self._size = 0
@@ -89,6 +93,17 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None):
     async def _pump(stream, chunks, render):
         pending = b""
 
+        decoder = codecs.getincrementaldecoder("utf-8")("replace") if render is None else None
+
+        def _write_text(text: str) -> None:
+            if f is None:
+                return
+            try:
+                f.write(text)
+                f.flush()
+            except Exception:
+                pass
+
         def _write_rendered(line: bytes) -> None:
             if f is None:
                 return
@@ -99,8 +114,7 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None):
                         f.write(rendered if rendered.endswith("\n") else rendered + "\n")
                         f.flush()
                 else:
-                    f.write(line.decode(errors="replace"))
-                    f.flush()
+                    _write_text(line.decode(errors="replace"))
             except Exception:
                 pass
 
@@ -113,7 +127,7 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None):
                 break
             chunks.append(data)
             if render is None:
-                _write_rendered(data)
+                _write_text(decoder.decode(data, final=False) if decoder is not None else "")
                 continue
             pending += data
             while True:
@@ -133,6 +147,10 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None):
                         pass
         if render is not None and pending:
             _write_rendered(pending)
+        if render is None and decoder is not None:
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                _write_text(tail)
 
     async def _drain_and_wait():
         # #21: stdout/stderr pump 와 proc.wait() 를 한 타임아웃 창 안에 함께 넣는다.

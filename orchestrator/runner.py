@@ -225,10 +225,7 @@ class Runner:
                     )
                 self.board.write_agent_block(role, title, body)
                 # 후보가 예외를 던져도 다음 후보로 폴오버 (전체 role 을 죽이지 않는다)
-                try:
-                    res = await self._run_with_retries(get_backend(name), req, role, key)
-                except Exception as e:
-                    res = RoleResult(ok=False, error=f"backend {name} raised: {e}")
+                res = await self._run_with_retries(get_backend(name), req, role, key)
                 # 상세 로그: 받은 결과. board.write_agent_block 가 본문을 ~20000자로 절단하므로
                 # spec/directives/대용량 출력이 로그를 무한히 키우지 않음 (#31/#32). 단, spec 내
                 # 민감정보는 여전히 .orchestrator/agents 로그에 (절단된 형태로) 남을 수 있음.
@@ -287,17 +284,39 @@ class Runner:
     async def _run_with_retries(self, backend, req, role, key):
         attempts = max(1, self.cfg.retries + 1)
         last = None
+        total_cost = 0.0
+        total_tokens = 0
+        estimated = False
         for i in range(attempts):
-            res = await backend.run_role(req)
+            try:
+                res = await backend.run_role(req)
+            except Exception as e:
+                res = RoleResult(ok=False, error=f"backend raised: {e}")
+            if res.cost_usd:
+                total_cost += res.cost_usd
+                estimated = estimated or res.cost_estimated
+            if res.tokens:
+                total_tokens += res.tokens
             if res.ok:
+                if total_cost:
+                    res.cost_usd = total_cost
+                    res.cost_estimated = estimated
+                if total_tokens:
+                    res.tokens = total_tokens
                 return res
             last = res
             if i < attempts - 1:
-                delay = self.cfg.retry_backoff * (2**i)
+                delay = min(self.cfg.retry_backoff * (2**i), 60.0)
                 await self.board.log_event(
                     role, f"retry {i + 1}/{attempts - 1} after err: {res.error} (in {delay:.0f}s)"
                 )
                 await asyncio.sleep(delay)
+        if last is not None:
+            if total_cost:
+                last.cost_usd = total_cost
+                last.cost_estimated = estimated
+            if total_tokens:
+                last.tokens = total_tokens
         return last
 
     @staticmethod

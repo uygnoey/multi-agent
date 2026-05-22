@@ -203,7 +203,11 @@ def main(argv=None) -> int:
         from .webui import serve
 
         # --web 은 --base-dir(우선) 또는 --project-dir 를 결과 베이스로 사용
-        serve(a.port, a.base_dir or a.project_dir, a.host)
+        serve(
+            a.port,
+            (a.base_dir or a.project_dir or (Path.home() / "agent-runs")).expanduser().resolve(),
+            a.host,
+        )
         return 0
     if a.watch:
         if not a.project_dir:
@@ -214,7 +218,7 @@ def main(argv=None) -> int:
         return 0
     if not a.spec or not a.project_dir:
         raise SystemExit("--spec 와 --project-dir 는 필수입니다 (또는 --check 만 사용).")
-    if not a.spec.exists():
+    if not a.spec.is_file():
         raise SystemExit(f"spec 파일을 찾을 수 없음: {a.spec}")
 
     cfg = build_config(a)

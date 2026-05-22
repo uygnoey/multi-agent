@@ -12,6 +12,7 @@ import json
 import os
 import signal
 import sys
+import time
 
 from . import workspace
 from .board import (
@@ -79,9 +80,11 @@ class Scheduler:
             design_outcomes = await asyncio.gather(*[self.runner.run_role(r) for r in DESIGN_ROLES])
             # 아키텍트 결과를 역할명으로 선택 (DESIGN_ROLES 순서가 바뀌어도 안전)
             by_role = dict(zip(DESIGN_ROLES, design_outcomes, strict=False))
-            arch_outcome = by_role.get("architecture-engineer", design_outcomes[0])
-            for o in design_outcomes:  # 설계/테스트시트 산출물 → 전역 노출
-                await self.board.add_global_artifacts(o.get("artifacts", []))
+            arch_outcome = by_role.get("architecture-engineer")
+            if arch_outcome is None:
+                await self.board.add_warning("architecture-engineer outcome missing; design failed")
+                await self.board.set_phase("failed")
+                return self.board.snapshot()
             if not arch_outcome.get("_ok", True):
                 # #19: 설계(architecture-engineer) 실패 시, 의미 없는 fallback U1 빌드로 실비를
                 #      쓰지 않고 즉시 중단한다. 설계 실패는 spec/설계를 고쳐 재실행해야 풀린다
@@ -96,6 +99,9 @@ class Scheduler:
                 )
                 await self.board.set_phase("failed")
                 return self.board.snapshot()
+            for o in design_outcomes:  # 성공한 설계/테스트시트 산출물만 전역 노출
+                if o.get("_ok", True):
+                    await self.board.add_global_artifacts(o.get("artifacts", []))
             units = arch_outcome.get("units") or []
             if units:
                 await self.board.add_units(units)
@@ -361,10 +367,11 @@ class Scheduler:
         # 단순 시간초과가 아니라 '진행이 멈췄을 때'만 포기한다(stall). dep 가 아직 작업 중이면
         # (상태가 바뀌거나 에이전트가 활동 중이면) 계속 기다린다 — 한 role 호출이 상태를 붙잡는
         # 최대 시간(session_timeout)보다 넉넉한 윈도. timeout 인자를 주면 그 값을 stall 로 쓴다.
-        base_to = self.cfg.session_timeout or 1200.0  # --timeout 0 → None(무제한) 이어도 안전
+        base_to = self.cfg.session_timeout if self.cfg.session_timeout is not None else 1200.0
         stall = timeout if timeout is not None else max(1800.0, base_to * 2)
         prev_sig = None
         idle = 0.0
+        last_check = time.monotonic()
         while True:
             units = {u["id"]: u for u in self.board.units()}
             pending = [d for d in deps if d in units]  # 미지 dep 은 스킵
@@ -388,12 +395,14 @@ class Scheduler:
             if sig != prev_sig:
                 prev_sig, idle = sig, 0.0  # 진행 있음 → 리셋 (살아있으면 막지 않음)
             else:
-                idle += 1.0
+                now = time.monotonic()
+                idle += max(0.0, now - last_check)
                 if idle >= stall:
                     await self.board.log_event(
                         uid, f"deps stalled {stall:.0f}s (no progress) → fail: {pending}"
                     )
                     return False
+            last_check = time.monotonic()
             await asyncio.sleep(1.0)
 
     async def _supervise(self, role: str) -> None:

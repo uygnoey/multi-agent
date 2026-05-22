@@ -11,6 +11,8 @@ from pathlib import Path
 
 def _coerce_int(raw, default: int) -> int:
     """정수로 변환하되 비-정수/None/이상값은 default 로 안전화 (raw ValueError 차단; #37)."""
+    if isinstance(raw, bool):
+        return default
     try:
         return int(raw)
     except (TypeError, ValueError):
@@ -300,6 +302,7 @@ class RunConfig:
             self.budget = bv
         # (#9) session_timeout: NaN/Inf/0/음수는 asyncio.wait_for 를 오작동시키거나 의미가 없다.
         # 비유한/비-숫자/≤0 은 None(역할 호출 무제한)으로 정규화한다(CLI 의 0=무제한 정책과 일치).
+        tv = None
         if self.session_timeout is not None:
             try:
                 tv = float(self.session_timeout)
@@ -308,7 +311,14 @@ class RunConfig:
             else:
                 if not math.isfinite(tv) or tv <= 0:
                     tv = None
-            self.session_timeout = tv
+        self.session_timeout = tv
+        try:
+            rb = float(self.retry_backoff)
+        except (TypeError, ValueError):
+            rb = 2.0
+        if not math.isfinite(rb) or rb < 0:
+            rb = 2.0
+        self.retry_backoff = rb
 
     def backends_for(self, role: str) -> list[str]:
         """역할에 대한 백엔드 후보를 우선순위 순서로 반환 (폴오버용)."""

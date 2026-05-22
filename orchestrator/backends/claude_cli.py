@@ -60,11 +60,17 @@ def parse_stream_result(out_bytes: bytes):
         if o.get("type") == "system" and o.get("model"):
             model = o.get("model")
         if o.get("type") == "result":
-            final = o.get("result", final)
+            candidate = o.get("result", final)
+            final = candidate if isinstance(candidate, str) else final
             cost = o.get("total_cost_usd", cost)
             u = o.get("usage") or {}
             if u:
-                tokens = (u.get("input_tokens") or 0) + (u.get("output_tokens") or 0)
+                tokens = (
+                    (u.get("input_tokens") or 0)
+                    + (u.get("cache_creation_input_tokens") or 0)
+                    + (u.get("cache_read_input_tokens") or 0)
+                    + (u.get("output_tokens") or 0)
+                )
     return final, cost, model, tokens
 
 

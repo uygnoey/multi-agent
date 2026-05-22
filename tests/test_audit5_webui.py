@@ -120,10 +120,10 @@ def test_token_server_blocks_without_token(make_server):
     assert "unauthorized" in json.loads(text)["error"]
 
 
-def test_token_via_query(make_server):
+def test_token_via_query_rejected_on_api(make_server):
     s = make_server(token="SECRET")
     code, _t, _ = _request(s["base"], "/api/runs?token=SECRET")
-    assert code == 200
+    assert code == 401
 
 
 def test_token_via_bearer_header(make_server):

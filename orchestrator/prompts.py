@@ -50,6 +50,9 @@ def compose_prompt(
     spec_excerpt: str,
     recent_events: str = "",
 ) -> str:
+    directives = directives or ""
+    spec_excerpt = spec_excerpt or ""
+    recent_events = recent_events or ""
     parts: list[str] = [f"# Role: {role}"]
     parts.append(
         "Follow the shared protocol, coding conventions, and tech stack in this directory's "
@@ -60,12 +63,16 @@ def compose_prompt(
         parts.append("## PM/PL directives (latest)\n" + directives.strip()[-2000:])
 
     if unit:
+        uid = unit.get("id", "?") if isinstance(unit, dict) else "?"
+        title = unit.get("title", "") if isinstance(unit, dict) else ""
+        description = unit.get("description", "") if isinstance(unit, dict) else ""
+        deps = unit.get("deps", []) if isinstance(unit, dict) else []
         parts.append(
             "## Target work unit\n"
-            f"- id: {unit['id']}\n"
-            f"- title: {unit.get('title', '')}\n"
-            f"- description: {unit.get('description', '')}\n"
-            f"- deps: {unit.get('deps', [])}"
+            f"- id: {uid}\n"
+            f"- title: {title}\n"
+            f"- description: {description}\n"
+            f"- deps: {deps}"
         )
     else:
         parts.append("## Scope\nThe entire spec.")
