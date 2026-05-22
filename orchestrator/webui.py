@@ -150,13 +150,30 @@ def _coerce_float(value, default):
         return default
 
 
+def _fmt_num(value) -> str:
+    """#12: 숫자를 CLI 인자 문자열로 포맷. 정수값은 ".0" 없이(600), 소수는 보존(1.5).
+
+    poll_interval 은 float 이지만 정수값(600/30)을 "600.0" 처럼 보내면 보기에 지저분하고
+    기존 동작과 어긋난다. 정수와 같은 값이면 int 로, 아니면 float repr 로 렌더한다.
+    (CLI 는 --poll-interval 을 float 로 파싱하므로 어느 쪽이든 동일하게 받는다.)
+    """
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return str(int(f)) if f.is_integer() else repr(f)
+
+
 def build_command(py: str, spec_path: Path, project_dir: Path, opts: dict) -> list[str]:
     # #61/#136: poll-interval 은 opts 에서 읽되 웹 기본은 600(장기 감독 주기). 미지정 시 600.
     #   CLI RunConfig 기본(20초)과 의도적으로 다르다 — 웹 dogfood 는 감독 주기를 길게 둔다.
     #   이 divergence 가 조용하지 않도록 UI 폼에 poll-interval 입력칸과 라벨(웹 600/CLI 20)을
     #   노출했다. 사용자는 폼에서 직접 짧은 주기를 지정할 수 있다.
-    # #38: 손상된 _run_opts.json(예: poll_interval="abc")이 와도 int() 가 raise 하지 않도록 관대하게 변환.
-    poll = _coerce_int(opts.get("poll_interval"), 600)
+    # #12/#38: poll_interval 은 float (CLI/RunConfig 모두 float; 1.5 같은 소수 유효).
+    #   예전엔 _coerce_int 로 강제 정수화해 1.5 가 1 로 깎였다 — 웹 검증이 float 를
+    #   통과시켜도 명령엔 int 로 전달되는 불일치. _coerce_float 로 raw 값을 그대로 전달한다.
+    #   손상된 _run_opts.json(예: poll_interval="abc")이 와도 raise 하지 않고 600 폴백.
+    poll = _coerce_float(opts.get("poll_interval"), 600)
     cmd = [
         py,
         "-m",
@@ -170,7 +187,7 @@ def build_command(py: str, spec_path: Path, project_dir: Path, opts: dict) -> li
         "--concurrency",
         str(_coerce_int(opts.get("concurrency"), 3)),
         "--poll-interval",
-        str(poll),
+        _fmt_num(poll),
     ]
     backends = opts.get("backends")
     if backends:
@@ -638,9 +655,10 @@ def _make_handler(manager: RunManager):
                     if p and resolve(p) not in VALID_BACKENDS:
                         self._json({"error": f"invalid backend for {role}: {p}"}, 400)
                         return
-            # 숫자 옵션 검증: int 변환 + 범위. 음수/0/비정상값은 400 으로 거부.
-            # poll_interval 은 0 허용(>=0), 나머지는 >=1.
-            for fld in ("concurrency", "max_units", "max_attempts", "retries", "poll_interval"):
+            # 정수 옵션 검증: int 변환 + 범위. 음수/0/비정상값은 400 으로 거부.
+            # 이 필드들은 CLI/RunConfig 에서도 진짜 int (concurrency/max_units/
+            # max_attempts/retries). retries 만 0 허용(>=0), 나머지는 >=1.
+            for fld in ("concurrency", "max_units", "max_attempts", "retries"):
                 v = data.get(fld)
                 if v in (None, ""):
                     continue
@@ -649,12 +667,19 @@ def _make_handler(manager: RunManager):
                 except (TypeError, ValueError):
                     self._json({"error": f"invalid {fld}: {v!r}"}, 400)
                     return
-                lo = 0 if fld in ("retries", "poll_interval") else 1
+                lo = 0 if fld == "retries" else 1
                 if iv < lo:
                     self._json({"error": f"{fld} must be >= {lo} (got {iv})"}, 400)
                     return
-            # timeout/budget 은 실수 허용(>=0). budget 0 은 의미 없으나 음수만 거부.
-            for fld in ("timeout", "budget"):
+            # #12: poll_interval / timeout / budget 은 실수(float) 옵션이다.
+            #      CLI(--poll-interval type=float, default=20.0)와 RunConfig
+            #      (poll_interval: float)에서 모두 float 이므로 1.5 같은 소수도 유효하다.
+            #      예전엔 poll_interval 을 int(v) 로 검증해 1.5 가 불필요하게 400 으로
+            #      거부됐다 — 같은 값이 CLI 에선 통과하는데 웹에선 막히는 정책 불일치.
+            #      이제 float 로 검증해 두 진입점의 타입 정책을 일치시킨다.
+            #      poll_interval 은 0 허용(>=0; RunConfig __post_init__ 가 안전 하한으로
+            #      클램프), budget/timeout 도 0 은 의미 없으나 음수만 거부(>=0).
+            for fld in ("poll_interval", "timeout", "budget"):
                 v = data.get(fld)
                 if v in (None, ""):
                     continue

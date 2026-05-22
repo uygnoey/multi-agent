@@ -2,14 +2,20 @@
 
 pip install openai-agents / 인증 OPENAI_API_KEY.
 내장 파일/배시 툴이 없으므로 타깃 cwd 로 스코프 한정한 function_tool 을 직접 제공한다.
+
+환경변수:
+- OPENAI_PRICING_FILE: 비용 추정 단가표 JSON 경로 (없으면 코드 fallback).
+- ORCH_OPENAI_ALLOW_BASH: 기본 활성. 0/false/no/off 로 끄면 Bash 역할이라도 run_bash 를
+  툴셋에서 제거한다 — in-process FS 격리가 불가능한 잠긴 배포용 정직한 옵트아웃(#1).
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import subprocess
-import time
+import threading
 from pathlib import Path
 
 from .base import Backend, RoleRequest, RoleResult
@@ -146,6 +152,172 @@ def _estimate_openai_cost(model: str | None, in_tokens: int, out_tokens: int):
     return round(cost, 6)
 
 
+# #1: 잠긴(locked-down) 배포에서 Bash 역할이라도 run_bash 노출을 끄는 정직한 옵트아웃.
+# 기본은 켜짐(기존 동작 보존). 0/false/no/off 면 run_bash 를 툴셋에서 제거한다.
+# (in-process FS 격리는 불가능한 근본 제약이므로 — 가짜 path-filter 대신 노출 자체를 차단.)
+def _bash_enabled() -> bool:
+    """ORCH_OPENAI_ALLOW_BASH 가 0/false/no/off 가 아니면 True (기본 활성)."""
+    v = os.environ.get("ORCH_OPENAI_ALLOW_BASH")
+    if v is None:
+        return True
+    return v.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+class _BashCapture:
+    """배시 출력을 백그라운드 스레드에서 비우되, 보관량을 상한(bytes)으로 묶는 버퍼.
+
+    #2/#36: stdout 을 별도 스레드가 계속 소비해 파이프 버퍼가 가득 차 자식이 블록되는 것을
+    막는다. 동시에 메인 스레드는 proc.wait(timeout) 으로 wall-clock 데드라인을 강제할 수
+    있다(출력이 전혀 없는 silent 명령도 타임아웃). 상한 초과분은 읽되 버려(drop) 메모리를
+    묶는다(거대 출력 OOM 방지).
+    """
+
+    def __init__(self, max_bytes: int):
+        self._max = max_bytes
+        self._buf = bytearray()
+        self.truncated = False
+        self._lock = threading.Lock()
+
+    def feed(self, chunk: bytes) -> None:
+        with self._lock:
+            if len(self._buf) >= self._max:
+                self.truncated = True
+                return  # 상한 도달 — 이후는 읽되 버린다(소비는 계속해 블록 방지)
+            room = self._max - len(self._buf)
+            if len(chunk) > room:
+                self._buf.extend(chunk[:room])
+                self.truncated = True
+            else:
+                self._buf.extend(chunk)
+
+    def text(self) -> str:
+        with self._lock:
+            return bytes(self._buf).decode("utf-8", errors="replace")
+
+
+def _kill_process_group(proc, grace: float = 2.0) -> None:
+    """#3: 셸이 spawn 한 자식까지 프로세스 그룹째 종료한다 (좀비/고아 방지).
+
+    SIGTERM → 짧은 유예 → SIGKILL 순서. start_new_session=True 로 만든 새 그룹을
+    os.killpg 로 통째 종료한다. 그룹 조회/전송 실패 시 단일 프로세스 kill 로 폴백.
+    """
+    if proc is None:
+        return
+    pid = getattr(proc, "pid", None)
+    pgid = None
+    if pid is not None:
+        try:
+            pgid = os.getpgid(pid)
+        except Exception:
+            pgid = None
+    # 1) SIGTERM (그룹 우선, 실패 시 단일)
+    try:
+        if pgid is not None:
+            os.killpg(pgid, signal.SIGTERM)
+        else:
+            proc.terminate()
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    # 2) 짧은 유예 동안 자발적 종료 대기
+    try:
+        proc.wait(timeout=grace)
+        return
+    except Exception:
+        pass
+    # 3) 아직 살아있으면 SIGKILL 로 그룹째 강제 종료
+    try:
+        if pgid is not None:
+            os.killpg(pgid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=grace)
+    except Exception:
+        pass
+
+
+def _run_bash_command(command: str, cwd: str, timeout: float, max_capture: int) -> str:
+    """#2/#3: 셸 명령을 wall-clock 타임아웃·바운디드 버퍼·프로세스그룹 종료로 실행.
+
+    - start_new_session=True 로 새 프로세스 그룹을 만들어 자식까지 그룹째 정리한다(#3).
+    - 백그라운드 스레드가 stdout 을 max_capture 까지만 보관(초과는 drop)하며 계속 소비해
+      파이프 블록을 막는다(#36). 메인은 proc.wait(timeout) 으로 데드라인을 강제하므로
+      출력이 전혀 없는 silent 명령(sleep 100 등)도 정확히 타임아웃된다(#2).
+    - 반환: 정상 종료면 ``[exit <code>]\\n<본문>``, 타임아웃이면 ``[timeout]\\n<본문>``.
+    """
+    proc = None
+    cap = _BashCapture(max_capture)
+    try:
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # stdout+stderr 를 한 스트림으로 합쳐 순서 보존
+            start_new_session=True,  # #3: 새 프로세스 그룹 → 자식까지 그룹째 종료 가능
+        )
+
+        def _drain() -> None:
+            # #2/#36: 바이너리로 청크 단위 소비 — 상한 도달 후에도 계속 읽어 버려 블록 방지.
+            try:
+                assert proc.stdout is not None
+                while True:
+                    chunk = proc.stdout.read(8192)
+                    if not chunk:
+                        break
+                    cap.feed(chunk)
+            except Exception:
+                pass
+
+        drainer = threading.Thread(target=_drain, daemon=True)
+        drainer.start()
+
+        timed_out = False
+        try:
+            rc = proc.wait(timeout=timeout)  # #2: 출력 유무와 무관하게 데드라인 강제
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            rc = None
+            _kill_process_group(proc)  # #3: 그룹째 종료
+        # 드레인 스레드가 EOF 까지 마무리하도록 잠깐 join (kill 후엔 곧 끝난다).
+        drainer.join(timeout=2.0)
+
+        body = cap.text()[:4000]
+        note = "\n<... output truncated>" if cap.truncated and len(body) >= 4000 else ""
+        if timed_out:
+            return f"[timeout]\n{body}{note}"
+        return f"[exit {rc}]\n{body}{note}"
+    except Exception as e:
+        _kill_process_group(proc)
+        return f"<bash error: {e}>"
+
+
+def _edit_file_text(content: str, old_string: str, new_string: str) -> str:
+    """#13: 타깃 부분 치환을 수행하고 새 파일 내용을 반환한다 (순수 함수, SDK 불필요).
+
+    - old_string 이 정확히 1회만 등장해야 한다(patch 처럼 유일성 요구). 0회면 명확한 에러,
+      2회 이상이면 모호하므로 거부한다 — 잘못된 위치 치환으로 파일이 깨지는 것을 방지.
+    - 실패 시 ``ValueError`` 를 던진다(호출부가 에러 문자열로 변환).
+    """
+    if not old_string:
+        # 빈 old_string 은 "전체를 치환"으로 오인되기 쉬워 거부(생성/덮어쓰기는 Write 사용).
+        raise ValueError("old_string is empty — use write_file to create/overwrite")
+    count = content.count(old_string)
+    if count == 0:
+        raise ValueError("old_string not found in file")
+    if count > 1:
+        raise ValueError(f"old_string is not unique ({count} matches) — add more context")
+    return content.replace(old_string, new_string, 1)
+
+
 class OpenAIAgentsBackend(Backend):
     name = "openai-agents"
 
@@ -160,14 +332,9 @@ class OpenAIAgentsBackend(Backend):
 
     @staticmethod
     def _kill_proc(proc) -> None:
-        # #36: 타임아웃/예외 시 자식 셸을 확실히 정리한다 (좀비/고아 방지).
-        if proc is None:
-            return
-        try:
-            proc.kill()
-            proc.wait(timeout=2.0)
-        except Exception:
-            pass
+        # #3/#36: 타임아웃/예외 시 자식까지 프로세스 그룹째 정리한다 (좀비/고아 방지).
+        # 단일 proc.kill() 은 셸이 spawn 한 자식을 남기므로 _kill_process_group 으로 위임.
+        _kill_process_group(proc)
 
     async def run_role(self, req: RoleRequest) -> RoleResult:
         try:
@@ -210,10 +377,7 @@ class OpenAIAgentsBackend(Backend):
         def write_file(path: str, content: str) -> str:
             """파일을 생성/'전체 덮어쓰기'한다 (타깃 디렉터리 한정, 5MB 초과 거부).
 
-            주의(#16/#95): 이 백엔드의 Edit 툴도 이 함수에 매핑되어 부분 패치가 아닌 전체
-            파일 덮어쓰기로 동작한다 — in-process function_tool 만으로는 true patch tool 을
-            안전히 구현하기 어려운 근본 제약(KEEP-DOCUMENTED). 에이전트는 Edit 도 전체
-            덮어쓰기로 인지하고 항상 전체 내용을 보내야 한다.
+            Write 툴 전용(전체 내용 전송). 부분 수정은 edit_file(Edit) 을 사용한다.
             """
             p = _safe(path)
             # #123: 비정상적으로 거대한 content 는 거부한다.
@@ -224,6 +388,31 @@ class OpenAIAgentsBackend(Backend):
             return f"wrote {path} ({len(content)} bytes)"
 
         @function_tool
+        def edit_file(path: str, old_string: str, new_string: str) -> str:
+            """#13: 파일에서 old_string(유일하게 등장) 1회를 new_string 으로 치환한다.
+
+            진짜 부분 패치(타깃 디렉터리 한정, 5MB 초과 거부). old_string 이 없으면 에러,
+            여러 번 등장하면 모호하므로 거부한다(더 많은 문맥을 포함하도록 안내). 전체
+            생성/덮어쓰기는 write_file(Write) 을 쓴다.
+            """
+            p = _safe(path)
+            if not p.exists():
+                return f"<no file: {path}>"
+            try:
+                content = p.read_text(encoding="utf-8")
+            except Exception as e:
+                return f"<read error: {path}: {e}>"
+            try:
+                updated = _edit_file_text(content, old_string, new_string)
+            except ValueError as e:
+                return f"<edit rejected: {path}: {e}>"
+            # #123: 치환 후 비정상적으로 거대해지면 거부한다.
+            if len(updated.encode("utf-8")) > max_write_bytes:
+                return f"<edit rejected: result exceeds {max_write_bytes} bytes>"
+            p.write_text(updated, encoding="utf-8")
+            return f"edited {path} ({len(updated)} bytes)"
+
+        @function_tool
         def list_dir(path: str = ".") -> str:
             """디렉터리 목록 (타깃 디렉터리 한정)."""
             p = _safe(path)
@@ -232,9 +421,7 @@ class OpenAIAgentsBackend(Backend):
             return "\n".join(sorted(x.name + ("/" if x.is_dir() else "") for x in p.iterdir()))
 
         bash_timeout = req.timeout if req.timeout else 120  # config 의 세션 타임아웃을 따른다
-        # #36: 반환 텍스트는 어차피 4000자로 자르므로, 파이프에서 읽어 보관하는 양도 상한선으로
-        # 묶는다(메모리 폭주 방지). capture_output=True 는 출력을 통째로 버퍼링하므로 쓰지 않고,
-        # PIPE 에서 상한까지만 읽고 초과분은 흘려보낸 뒤 프로세스를 정리한다.
+        # #36: 반환 텍스트는 어차피 4000자로 자르므로, 보관하는 양도 상한선으로 묶는다.
         max_bash_capture = 64 * 1024  # 보관 상한(~64KB) — 4000자 절단보다 넉넉
 
         @function_tool
@@ -243,58 +430,26 @@ class OpenAIAgentsBackend(Backend):
 
             주의(#1/#16): shell=True 이며 cwd 만 설정한다. 셸 자체는 FS 경계를 강제하지 않으므로
             절대경로/상위참조로 타깃 밖 파일 접근이 가능하다 — 진짜 격리는 in-process 로 불가능한
-            근본 제약(KEEP-DOCUMENTED; 진짜 샌드박스는 컨테이너/OS 레벨에서만 가능).
-            노출 자체는 역할의 allowed_tools(Bash 포함 여부)로만 제어된다.
+            근본 제약(KEEP-DOCUMENTED; 진짜 샌드박스는 컨테이너/OS 레벨에서만 가능). 노출 자체는
+            역할의 allowed_tools(Bash) + 환경변수 ORCH_OPENAI_ALLOW_BASH(기본 활성)로 제어된다.
+
+            #2: 출력이 전혀 없는 silent 명령(sleep 100 등)도 wall-clock 타임아웃되고, #3: 셸이
+            spawn 한 자식까지 프로세스 그룹째 종료된다(고아/좀비 방지). 정상 종료는 ``[exit N]``,
+            타임아웃은 ``[timeout]`` 접두로 반환한다.
             """
-            proc = None
-            try:
-                proc = subprocess.Popen(
-                    command,
-                    shell=True,
-                    cwd=str(root),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,  # stdout+stderr 를 한 스트림으로 합쳐 순서 보존
-                    text=True,
-                )
-                buf: list[str] = []
-                size = 0
-                truncated = False
-                deadline = time.monotonic() + bash_timeout
-                # #36: 상한(max_bash_capture)까지만 보관하고, 초과분은 읽어서 버린다
-                # (파이프 버퍼가 가득 차 자식이 블록되지 않도록 계속 소비한다).
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    if time.monotonic() > deadline:
-                        raise subprocess.TimeoutExpired(command, bash_timeout)
-                    if size < max_bash_capture:
-                        take = line[: max_bash_capture - size]
-                        buf.append(take)
-                        size += len(take)
-                        if len(take) < len(line):
-                            truncated = True
-                    else:
-                        truncated = True
-                # #36: 예전엔 subprocess.run() 의 r.returncode 를 썼으나, 출력 버퍼링을 피하려
-                # Popen 스트리밍으로 바꿨다. exit code 는 proc.wait() 의 rc 로 동일하게 얻는다.
-                rc = proc.wait(timeout=max(0.1, deadline - time.monotonic()))
-                # #124: exit code 를 출력에 포함해 에이전트가 실패를 성공으로 오인하지 않게 한다.
-                body = "".join(buf)[:4000]
-                note = "\n<... output truncated>" if truncated and len(body) >= 4000 else ""
-                return f"[exit {rc}]\n{body}{note}"
-            except subprocess.TimeoutExpired:
-                self._kill_proc(proc)
-                return f"<bash error: timed out after {bash_timeout}s>"
-            except Exception as e:
-                self._kill_proc(proc)
-                return f"<bash error: {e}>"
+            return _run_bash_command(command, str(root), bash_timeout, max_bash_capture)
 
         # 역할의 allowed_tools 만 노출 (다른 백엔드의 --allowedTools 와 동일한 격리).
+        # #13: Edit → edit_file(진짜 부분 패치). Write → write_file(전체 덮어쓰기).
         tool_map = {
             "Read": [read_file, list_dir],
             "Write": [write_file],
-            "Edit": [write_file],
+            "Edit": [edit_file],
             "Bash": [run_bash],
         }
+        # #1: ORCH_OPENAI_ALLOW_BASH 가 꺼져 있으면 Bash 역할이라도 run_bash 를 노출하지 않는다.
+        if not _bash_enabled():
+            tool_map["Bash"] = []
         tools: list = []
         for t in req.allowed_tools or []:
             for fn in tool_map.get(t, []):
