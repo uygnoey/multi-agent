@@ -192,7 +192,9 @@ class Board:
                 existing.add(uid)
                 added += 1
                 # deps/roles 정규화: list→문자열들, scalar→[scalar], dict/None→[] (이상값 방어)
-                deps = _norm_str_list(u.get("deps"))
+                # deps 도 unit id 와 동일하게 _safe_unit_id 로 안전화해야 sanitize 된
+                # id("U/1"→"U-1")와 매칭됨. 안전화 후 빈 항목은 drop.
+                deps = [d for d in (_safe_unit_id(x) for x in _norm_str_list(u.get("deps"))) if d]
                 roles_raw = _norm_str_list(u.get("roles"))
                 self._data["units"].append(
                     {
@@ -301,6 +303,9 @@ class Board:
             return
         if not math.isfinite(val):
             return
+        # 비용은 누적만 가능하며 절대 감소하면 안 됨 → 음수 입력은 무시(0 처리)
+        if val < 0:
+            return
         async with self._lock:
             self._data["total_cost_usd"] = round(self._data.get("total_cost_usd", 0.0) + val, 6)
             self._flush()
@@ -349,7 +354,8 @@ class Board:
             if cost_add:
                 # 잘못된 비용 메타데이터(비-숫자/NaN/Inf)가 업데이트를 깨지 않도록 방어
                 add = _coerce_finite_float(cost_add)
-                if add:
+                # per-agent 비용도 누적만 가능 → 음수는 무시(비용이 감소하지 않게)
+                if add > 0:
                     a["cost_usd"] = round(a["cost_usd"] + add, 6)
             if cost_est:
                 a["cost_est"] = True
@@ -492,7 +498,8 @@ class Board:
             ]
             + table(["id", "status", "test", "files", "title"])
             + ["", "## Design & shared artifacts", ""]
-            + ([f"- {a}" for a in artifacts] or ["- (none)"])
+            # 전역 산출물도 per-unit 과 동일하게 _md_cell 로 이스케이프(개행/파이프 주입 방지)
+            + ([f"- {_md_cell(a)}" for a in artifacts] or ["- (none)"])
             + ["", "## Per-unit files", ""]
             + unit_files()
             + ["See `docs/RUN_GUIDE.md` for how to run."]
@@ -511,7 +518,8 @@ class Board:
             ]
             + table(["id", "상태", "테스트", "파일수", "제목"])
             + ["", "## 설계·공통 산출물", ""]
-            + ([f"- {a}" for a in artifacts] or ["- (없음)"])
+            # 전역 산출물도 per-unit 과 동일하게 _md_cell 로 이스케이프(개행/파이프 주입 방지)
+            + ([f"- {_md_cell(a)}" for a in artifacts] or ["- (없음)"])
             + ["", "## 단위별 파일", ""]
             + unit_files()
             + ["실행 방법은 `docs/RUN_GUIDE.ko.md` 참고."]

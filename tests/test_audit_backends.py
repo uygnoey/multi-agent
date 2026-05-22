@@ -275,15 +275,17 @@ def test_mock_e2e_empty_spec_still_has_smoke_scenario():
 # ---------------------------------------------------------------------------
 
 
-def test_openai_edit_documented_as_full_overwrite():
-    import inspect
+def test_openai_edit_is_targeted_replacement():
+    # 감사 후속(#13): Edit 는 전체 덮어쓰기가 아니라 실제 부분 치환(edit_file)으로 개선됨.
+    import pytest
 
-    from orchestrator.backends import openai_agents
+    from orchestrator.backends.openai_agents import _edit_file_text
 
-    src = inspect.getsource(openai_agents)
-    # Edit 가 write_file 에 매핑되고, 전체 덮어쓰기임을 코드/문서로 명시
-    assert '"Edit": [write_file]' in src
-    assert "덮어쓰기" in src
+    assert _edit_file_text("a\nOLD\nb", "OLD", "NEW") == "a\nNEW\nb"  # 부분 치환
+    with pytest.raises(ValueError):  # 미존재 → 에러(전체 덮어쓰기 아님)
+        _edit_file_text("a\nb", "ZZZ", "x")
+    with pytest.raises(ValueError):  # 중복 → 모호하므로 거부
+        _edit_file_text("x\nx", "x", "y")
 
 
 # ---------------------------------------------------------------------------
@@ -291,14 +293,21 @@ def test_openai_edit_documented_as_full_overwrite():
 # ---------------------------------------------------------------------------
 
 
-def test_openai_run_bash_includes_exit_code():
-    import inspect
+def test_openai_run_bash_includes_exit_code(tmp_path):
+    # 감사 후속(#2/#3/#124): run_bash 는 [exit N] 을 출력하고, 무출력 명령에도 타임아웃이 걸린다.
+    import sys
 
-    from orchestrator.backends import openai_agents
+    from orchestrator.backends.openai_agents import _run_bash_command
 
-    src = inspect.getsource(openai_agents)
-    assert "r.returncode" in src
-    assert "[exit " in src
+    out = _run_bash_command(
+        f'{sys.executable} -c "import sys; sys.exit(3)"', str(tmp_path), 10, 65536
+    )
+    assert "[exit 3]" in out  # 종료코드 노출
+    # 무출력 장시간 명령도 deadline 에 끊긴다(라인 대기로 막히지 않음)
+    out2 = _run_bash_command(
+        f'{sys.executable} -c "import time; time.sleep(30)"', str(tmp_path), 1.0, 65536
+    )
+    assert "timeout" in out2.lower()
 
 
 # ---------------------------------------------------------------------------

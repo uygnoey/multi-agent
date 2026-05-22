@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -16,9 +17,71 @@ def _coerce_int(raw, default: int) -> int:
 
 
 # 프레임워크 저장소 루트 (이 파일 = orchestrator/config.py)
+# 후방 호환을 위해 그대로 유지: 편집/소스/Docker 설치에서는 이게 곧 저장소 루트다.
 FRAMEWORK_ROOT = Path(__file__).resolve().parent.parent
-AGENTS_DIR = FRAMEWORK_ROOT / ".claude" / "agents"
-TEMPLATES_DIR = FRAMEWORK_ROOT / "templates"
+
+# 휠(wheel) 설치 시 .claude/agents 와 templates 는 data-files 로
+# <prefix>/share/web-team-orchestrator/ 아래에 깔린다(#5). 저장소 루트만 보던
+# 기존 로더는 휠 설치에서 이를 못 찾아 역할 로딩/스캐폴딩이 깨졌다. 그래서
+# "저장소 루트 우선 → 설치 data 위치 폴백" 순서로 첫 존재 디렉터리를 고르는
+# 리졸버를 둔다. 어디서도 못 찾으면 저장소 루트 경로를 기본값으로 돌려주어
+# 소스 실행 시 동작/테스트가 그대로 유지되게 한다.
+
+# data-files 가 깔리는 상대 경로(설치 prefix 기준). pyproject 의
+# [tool.setuptools.data-files] 키와 1:1 로 맞춘다.
+_DATA_AGENTS_REL = Path("share") / "web-team-orchestrator" / ".claude" / "agents"
+_DATA_TEMPLATES_REL = Path("share") / "web-team-orchestrator" / "templates"
+
+
+def _site_packages_roots() -> list[Path]:
+    """현재 import 된 orchestrator 패키지의 상위 디렉터리(들) 후보 (<site-packages> 류)."""
+    roots: list[Path] = []
+    pkg_root = Path(__file__).resolve().parent.parent  # orchestrator 의 부모
+    roots.append(pkg_root)
+    # importlib 로 패키지가 실제 깔린 위치도 후보에 추가(편집/네임스페이스 대응).
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec("orchestrator")
+        if spec is not None and spec.origin:
+            roots.append(Path(spec.origin).resolve().parent.parent)
+    except Exception:
+        pass
+    return roots
+
+
+def _resolve_runtime_dir(repo_rel: Path, data_rel: Path) -> Path:
+    """런타임 데이터 디렉터리를 후보 순서대로 찾아 첫 존재 경로를 반환.
+
+    우선순위:
+      1) 저장소 루트(FRAMEWORK_ROOT/repo_rel) — 편집/소스/Docker 설치
+      2) sys.prefix/data_rel — 일반 휠 설치(data-files)
+      3) <site-packages 류>/data_rel — importlib 기반 후보 포함
+
+    하나도 없으면 저장소 루트 경로를 기본값으로 반환 → 소스 실행 시 기존 동작/테스트 유지.
+    """
+    repo_candidate = FRAMEWORK_ROOT / repo_rel
+    candidates: list[Path] = [repo_candidate]
+    # sys.prefix / venv 루트(있으면) 아래의 data-files 위치.
+    for prefix in (sys.prefix, getattr(sys, "base_prefix", sys.prefix)):
+        candidates.append(Path(prefix) / data_rel)
+    # <site-packages> 류 루트 아래의 data-files 위치.
+    for root in _site_packages_roots():
+        candidates.append(root / data_rel)
+
+    seen: set[Path] = set()
+    for cand in candidates:
+        if cand in seen:
+            continue
+        seen.add(cand)
+        if cand.is_dir():
+            return cand
+    # 폴백: 저장소 루트 경로(존재하지 않더라도) — 후방 호환.
+    return repo_candidate
+
+
+AGENTS_DIR = _resolve_runtime_dir(Path(".claude") / "agents", _DATA_AGENTS_REL)
+TEMPLATES_DIR = _resolve_runtime_dir(Path("templates"), _DATA_TEMPLATES_REL)
 
 # 페이즈
 PHASE_SUPERVISOR = "supervisor"

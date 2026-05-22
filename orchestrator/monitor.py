@@ -20,6 +20,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import unicodedata
 from pathlib import Path
 
@@ -75,7 +76,16 @@ def _run_alive(orch_dir: Path) -> bool:
 
 
 def _stop_run(orch_dir: Path) -> bool:
-    """run.pid 프로세스 그룹 종료 (SIGTERM → 4s 후 SIGKILL). 웹 stop 과 동일 기준."""
+    """run.pid 프로세스 그룹 종료 (SIGTERM → 확인 → 필요 시 SIGKILL). 웹 stop 과 동일 기준.
+
+    #6: 예전 구현은 SIGTERM 직후 곧바로 run.pid 를 지웠다. 그러면 프로세스가 아직 살아
+    run 상태(board.json 등)를 쓰는 중인데도 _run_alive 가 False 가 되어 TUI 가 "stopped"
+    로 표시되는 불일치가 생긴다. 웹 UI(webui.RunManager.stop)처럼, SIGTERM 후 실제 종료를
+    "확인"한 뒤에만(또는 SIGKILL 폴백 후) pidfile 을 제거한다.
+
+    TUI 루프를 막지 않도록 동기 작업은 SIGTERM 전송 1회뿐이고, 종료 확인·SIGKILL 에스컬레
+    이션·pidfile 제거는 데몬 스레드에서 처리한다. stop 이 시작되면 True 를 반환한다.
+    """
     pf = orch_dir / "run.pid"
     if not pf.exists():
         return False
@@ -94,12 +104,41 @@ def _stop_run(orch_dir: Path) -> bool:
         except Exception:
             pass
 
+    def _alive() -> bool:
+        # os.kill(pid,0) 은 좀비(종료됐지만 reap 안 됨)도 성공하므로 _is_zombie 로 보정한다
+        # (#6/#32: _run_alive 와 동일 기준 → stop 후 상태 라벨이 어긋나지 않게).
+        try:
+            os.kill(pid, 0)  # signal 0 = 존재/권한 확인 (죽었으면 OSError)
+        except OSError:
+            return False
+        return not _is_zombie(pid)
+
+    def _remove_pidfile():
+        try:
+            pf.unlink()
+        except Exception:
+            pass
+
+    def _supervise():
+        # SIGTERM 후 graceful 종료를 최대 ≈4초 기다린다(0.1초 간격 폴링). 죽으면 즉시 제거.
+        for _ in range(40):
+            if not _alive():
+                _remove_pidfile()
+                return
+            time.sleep(0.1)
+        # SIGTERM 을 트랩(graceful)해 안 죽는 경우 강제 종료. SIGKILL 은 비동기라 즉시 죽지
+        # 않을 수 있어 잠깐 사멸을 확인한 뒤(좀비 reap 포함) pidfile 을 제거한다 — 어떤
+        # 경우에도 최종적으로 pidfile 은 반드시 제거되어 "running" 잔상이 남지 않게 한다.
+        _kill(signal.SIGKILL)
+        for _ in range(20):  # ≈1초: SIGKILL 후 커널 teardown 대기
+            if not _alive():
+                break
+            time.sleep(0.05)
+        _remove_pidfile()
+
     _kill(signal.SIGTERM)
-    threading.Timer(4.0, lambda: _kill(signal.SIGKILL)).start()
-    try:
-        pf.unlink()
-    except Exception:
-        pass
+    # 동기 unlink 금지 (#6): pidfile 제거는 종료 확인 후 데몬 스레드에서만 수행.
+    threading.Thread(target=_supervise, daemon=True).start()
     return True
 
 
