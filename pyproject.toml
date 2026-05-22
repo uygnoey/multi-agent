@@ -6,9 +6,9 @@ requires = ["setuptools>=69.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "web-team-orchestrator"
+name = "dev-crew-orchestrator"
 version = "0.1.0"
-description = "Multi-agent, multi-backend orchestrator that builds a web service into a target project directory."
+description = "Multi-agent, multi-backend orchestrator: a team of role-specialized AI agents builds software (web/app/service/CLI) from a spec into a target project directory."
 requires-python = ">=3.10"
 dependencies = [
     # Frontmatter parsing has a no-dep fallback; pyyaml is optional but recommended.
@@ -25,9 +25,9 @@ openai = ["openai-agents>=0.0.1"]
 all = ["claude-agent-sdk>=0.1.0", "openai-agents>=0.0.1"]
 
 [project.scripts]
-web-team = "orchestrator.__main__:main"
-web-team-monitor = "orchestrator.monitor:main"
-web-team-web = "orchestrator.webui:main"
+dev-crew = "orchestrator.__main__:main"
+dev-crew-monitor = "orchestrator.monitor:main"
+dev-crew-web = "orchestrator.webui:main"
 
 [tool.setuptools]
 packages = ["orchestrator", "orchestrator.backends"]
@@ -47,21 +47,21 @@ orchestrator = ["codex_pricing.json"]
 # relative to the install prefix (sys.prefix / the venv root), NOT site-packages. The loader
 # (config._resolve_runtime_dir) now scans BOTH the prefix data-files locations AND the
 # site-packages-style roots in addition to FRAMEWORK_ROOT, so a plain wheel auto-discovers them
-# at <prefix>/share/web-team-orchestrator/... — wheel installs are now a supported runtime path.
+# at <prefix>/share/dev-crew-orchestrator/... — wheel installs are now a supported runtime path.
 [tool.setuptools.data-files]
-"share/web-team-orchestrator/.claude/agents" = [".claude/agents/*.md"]
-"share/web-team-orchestrator/templates" = ["templates/CLAUDE.md", "templates/AGENTS.md"]
+"share/dev-crew-orchestrator/.claude/agents" = [".claude/agents/*.md"]
+"share/dev-crew-orchestrator/templates" = ["templates/CLAUDE.md", "templates/AGENTS.md"]
 
 # Loader-fallback note — WHAT WORKS / WHAT DOES NOT (#18 / #2), precisely:
 #  * editable install (`pip install -e .`): WORKS fully. FRAMEWORK_ROOT == repo root; both
 #    .claude/agents and templates are read in place. This is a SUPPORTED path.
 #  * Docker image: WORKS fully. The Dockerfile COPYs .claude and templates to /app and runs
 #    from there (FRAMEWORK_ROOT == /app). This is a SUPPORTED path.
-#  * sdist (`pip install web-team-orchestrator-*.tar.gz` from source build): the dirs are
+#  * sdist (`pip install dev-crew-orchestrator-*.tar.gz` from source build): the dirs are
 #    present in the archive via MANIFEST.in, but a build from the sdist produces the same
 #    wheel-shaped layout below, so see the wheel caveat.
-#  * plain wheel (`pip install web-team-orchestrator`): the .claude/agents + templates bytes
-#    are bundled (data-files) and land under <prefix>/share/web-team-orchestrator/. The loader
+#  * plain wheel (`pip install dev-crew-orchestrator`): the .claude/agents + templates bytes
+#    are bundled (data-files) and land under <prefix>/share/dev-crew-orchestrator/. The loader
 #    (orchestrator/config.py::_resolve_runtime_dir) now ALSO scans those data-files locations
 #    (sys.prefix / base_prefix and the site-packages-style roots), not just FRAMEWORK_ROOT, so a
 #    plain wheel install resolves the runtime dirs at <prefix>/share/... — this is now a

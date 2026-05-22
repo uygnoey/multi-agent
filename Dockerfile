@@ -24,7 +24,7 @@ COPY examples ./examples
 #               가린 채 성공하지 않게 한다.
 #   1         — hard 모드. `pip install -e ".[all]"` 가 실패하면 `||` 폴백 없이 빌드를 즉시
 #               실패시킨다. claude-sdk/openai-agents 백엔드가 반드시 필요한 운영 이미지용.
-#   사용 예:   docker build --build-arg REQUIRE_ALL_BACKENDS=1 -t web-team .
+#   사용 예:   docker build --build-arg REQUIRE_ALL_BACKENDS=1 -t dev-crew .
 ARG REQUIRE_ALL_BACKENDS=0
 RUN pip install -e . \
     && if [ "$REQUIRE_ALL_BACKENDS" = "1" ]; then \

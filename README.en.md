@@ -2,11 +2,12 @@
 
 [한국어](README.md) · **English**
 
-Give it one planning spec, and a **virtual dev team of 10 role agents** collaborates to build a
-web service/platform into a separate target directory — a multi-agent orchestrator.
-(package name: `web-team-orchestrator`)
+Give it one planning spec, and a **virtual dev team of role-specialized agents** collaborates to
+build **software (web app, service, CLI, …)** into a separate target directory — a multi-agent
+orchestrator. (package name: `dev-crew-orchestrator`; web is just the default stack, overridable
+by the architect.)
 
-> **This repository is the framework (the tool).** The web-service output is not created here; it
+> **This repository is the framework (the tool).** The output is not created here; it
 > is generated inside the `--project-dir <target>` you pass at run time.
 
 See [`docs/PLAN.md`](docs/PLAN.md) for the full design and [`docs/architecture.html`](docs/architecture.html) for the structure diagram.
@@ -84,8 +85,8 @@ pip install -e ".[all]"          # both
 > - **editable install (`pip install -e .`)** — works fully. `FRAMEWORK_ROOT` == repo root, so both dirs are read in place. **(recommended / supported)**
 > - **Docker image** — works fully. `.claude` and `templates` are COPYed to `/app`. **(supported)**
 > - **sdist** — `MANIFEST.in` includes both dirs in the archive (an install from it follows the wheel layout).
-> - **plain wheel (`pip install web-team-orchestrator`)** — both dirs' bytes are bundled (`[tool.setuptools.data-files]`)
->   but land under `<prefix>/share/web-team-orchestrator/`, which the current `FRAMEWORK_ROOT` (= site-packages) does not
+> - **plain wheel (`pip install dev-crew-orchestrator`)** — both dirs' bytes are bundled (`[tool.setuptools.data-files]`)
+>   but land under `<prefix>/share/dev-crew-orchestrator/`, which the current `FRAMEWORK_ROOT` (= site-packages) does not
 >   auto-scan. Fully automatic discovery would require moving the dirs into the package + switching the loader to
 >   `importlib.resources` (a code change), so **for runtime use an editable install or Docker.**
 > **OpenAI backend note (#51):** the `openai-agents` extra (`[openai]`/`[all]`) must install for the
@@ -158,7 +159,7 @@ python -m orchestrator --spec examples/specs/sample-spec.md --project-dir /tmp/d
 # Terminal B: watch the same project-dir live
 python -m orchestrator --watch --project-dir /tmp/demo-web
 #  or:  python -m orchestrator.monitor --project-dir /tmp/demo-web
-#  or (after install):  web-team-monitor --project-dir /tmp/demo-web
+#  or (after install):  dev-crew-monitor --project-dir /tmp/demo-web
 ```
 
 - **List view**: status (● running / ○ idle), cumulative cost, call count, current unit for all 10 roles
@@ -177,7 +178,7 @@ Upload a spec file in the browser to **run it**, and watch progress live without
 Zero deps (stdlib `http.server`), binds `127.0.0.1` by default.
 
 ```bash
-python -m orchestrator --web --port 8765          # or: web-team-web --port 8765
+python -m orchestrator --web --port 8765          # or: dev-crew-web --port 8765
 # you can also set the output base directory (default ~/agent-runs)
 python -m orchestrator --web --port 8765 --base-dir ~/agent-runs
 # open http://localhost:8765 in the browser
@@ -236,13 +237,13 @@ python -m orchestrator --web --port 8765 --base-dir ~/agent-runs
 Run the web UI in a container (mock works instantly without keys):
 
 ```bash
-docker build -t web-team .
-docker run --rm -p 8765:8765 -v "$PWD/runs:/data/runs" web-team
+docker build -t dev-crew .
+docker run --rm -p 8765:8765 -v "$PWD/runs:/data/runs" dev-crew
 # browser: http://localhost:8765
 
 # If the optional SDK backends ([all]: claude-agent-sdk/openai-agents) are mandatory, build in
 # hard mode — the build fails if [all] does not install (default soft mode only warns and continues):
-docker build --build-arg REQUIRE_ALL_BACKENDS=1 -t web-team .
+docker build --build-arg REQUIRE_ALL_BACKENDS=1 -t dev-crew .
 ```
 
 Production notes:

@@ -2,11 +2,11 @@
 
 **한국어** · [English](README.en.md)
 
-기획서(spec) 하나를 입력하면, **10개 역할 에이전트로 구성된 가상 개발팀**이 협업하여
-별도 타깃 디렉터리에 웹서비스/플랫폼을 만들어내는 멀티 에이전트 오케스트레이터.
-(패키지명: `web-team-orchestrator`)
+기획서(spec) 하나를 입력하면, **역할별 에이전트로 구성된 가상 개발팀**이 협업하여
+별도 타깃 디렉터리에 **소프트웨어(웹·앱·서비스·CLI 등)**를 만들어내는 멀티 에이전트 오케스트레이터.
+(패키지명: `dev-crew-orchestrator` · 웹은 기본 스택의 한 예시일 뿐, 아키텍트가 재정의 가능)
 
-> **이 저장소는 프레임워크(도구)다.** 웹서비스 결과물은 여기 안에 생기지 않고,
+> **이 저장소는 프레임워크(도구)다.** 산출물은 여기 안에 생기지 않고,
 > 실행 시 지정한 `--project-dir <타깃>` 안에 생성된다.
 
 전체 설계는 [`docs/PLAN.md`](docs/PLAN.md), 구조 다이어그램은 [`docs/architecture.html`](docs/architecture.html) 참고.
@@ -75,8 +75,8 @@ pip install -e ".[all]"          # 둘 다
 > - **editable 설치(`pip install -e .`)** — 완전 동작. `FRAMEWORK_ROOT` = 저장소 루트이므로 두 디렉터리를 그대로 읽는다. **(권장/지원 경로)**
 > - **Docker 이미지** — 완전 동작. `.claude` 와 `templates` 를 `/app` 으로 COPY 한다. **(지원 경로)**
 > - **sdist(소스 배포본)** — `MANIFEST.in` 으로 두 디렉터리를 아카이브에 포함한다(설치 시 wheel 레이아웃을 따름).
-> - **일반 wheel(`pip install web-team-orchestrator`)** — 두 디렉터리의 내용은 wheel 에 번들되지만(`[tool.setuptools.data-files]`)
->   설치 위치가 `<prefix>/share/web-team-orchestrator/` 라 현재 `FRAMEWORK_ROOT`(= site-packages)가 자동 탐색하지 않는다.
+> - **일반 wheel(`pip install dev-crew-orchestrator`)** — 두 디렉터리의 내용은 wheel 에 번들되지만(`[tool.setuptools.data-files]`)
+>   설치 위치가 `<prefix>/share/dev-crew-orchestrator/` 라 현재 `FRAMEWORK_ROOT`(= site-packages)가 자동 탐색하지 않는다.
 >   완전 자동 탐색은 디렉터리를 패키지 내부로 옮기고 로더를 `importlib.resources` 로 바꾸는 코드 변경이 필요하므로, **런타임은 editable 설치나 Docker 를 사용한다.**
 > **OpenAI 백엔드 주의(#51):** `openai-agents` extra(`[openai]`/`[all]`)가 설치되어야 OpenAI Agents
 > 백엔드가 동작한다. 이 패키지는 환경에 따라 설치가 실패할 수 있으니, `--check` 로 실제 가용성을 확인할 것.
@@ -147,7 +147,7 @@ python -m orchestrator --spec examples/specs/sample-spec.md --project-dir /tmp/d
 # 터미널 B: 같은 project-dir 를 실시간 감시
 python -m orchestrator --watch --project-dir /tmp/demo-web
 #  또는:  python -m orchestrator.monitor --project-dir /tmp/demo-web
-#  또는(설치 후):  web-team-monitor --project-dir /tmp/demo-web
+#  또는(설치 후):  dev-crew-monitor --project-dir /tmp/demo-web
 ```
 
 - **리스트 뷰**: 10개 역할의 상태(● 실행중 / ○ 대기)·누적 비용·호출수·현재 unit
@@ -163,7 +163,7 @@ python -m orchestrator --watch --project-dir /tmp/demo-web
 의존성 0(stdlib `http.server`), 기본 `127.0.0.1`.
 
 ```bash
-python -m orchestrator --web --port 8765          # 또는: web-team-web --port 8765
+python -m orchestrator --web --port 8765          # 또는: dev-crew-web --port 8765
 # 결과 베이스 디렉터리 지정도 가능 (기본 ~/agent-runs)
 python -m orchestrator --web --port 8765 --base-dir ~/agent-runs
 # 브라우저에서 http://localhost:8765 접속
@@ -218,13 +218,13 @@ python -m orchestrator --web --port 8765 --base-dir ~/agent-runs
 웹 UI를 컨테이너로 띄운다 (mock 은 키 없이 즉시 동작):
 
 ```bash
-docker build -t web-team .
-docker run --rm -p 8765:8765 -v "$PWD/runs:/data/runs" web-team
+docker build -t dev-crew .
+docker run --rm -p 8765:8765 -v "$PWD/runs:/data/runs" dev-crew
 # 브라우저: http://localhost:8765
 
 # 선택 SDK 백엔드([all]: claude-agent-sdk/openai-agents)가 반드시 필요하면 hard 모드로 빌드:
 #   설치 실패 시 빌드를 즉시 실패시킨다(기본 soft 모드는 경고만 남기고 빌드를 계속).
-docker build --build-arg REQUIRE_ALL_BACKENDS=1 -t web-team .
+docker build --build-arg REQUIRE_ALL_BACKENDS=1 -t dev-crew .
 ```
 
 프로덕션 주의:

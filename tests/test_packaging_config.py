@@ -28,7 +28,7 @@ def _load_pyproject() -> dict:
 
 def test_pyproject_is_valid_toml():
     data = _load_pyproject()
-    assert data["project"]["name"] == "web-team-orchestrator"
+    assert data["project"]["name"] == "dev-crew-orchestrator"
 
 
 def test_pyproject_bundles_runtime_dirs_for_wheel_and_sdist():

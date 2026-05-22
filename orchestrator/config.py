@@ -22,7 +22,7 @@ def _coerce_int(raw, default: int) -> int:
 FRAMEWORK_ROOT = Path(__file__).resolve().parent.parent
 
 # 휠(wheel) 설치 시 .claude/agents 와 templates 는 data-files 로
-# <prefix>/share/web-team-orchestrator/ 아래에 깔린다(#5). 저장소 루트만 보던
+# <prefix>/share/dev-crew-orchestrator/ 아래에 깔린다(#5). 저장소 루트만 보던
 # 기존 로더는 휠 설치에서 이를 못 찾아 역할 로딩/스캐폴딩이 깨졌다. 그래서
 # "저장소 루트 우선 → 설치 data 위치 폴백" 순서로 첫 존재 디렉터리를 고르는
 # 리졸버를 둔다. 어디서도 못 찾으면 저장소 루트 경로를 기본값으로 돌려주어
@@ -30,8 +30,8 @@ FRAMEWORK_ROOT = Path(__file__).resolve().parent.parent
 
 # data-files 가 깔리는 상대 경로(설치 prefix 기준). pyproject 의
 # [tool.setuptools.data-files] 키와 1:1 로 맞춘다.
-_DATA_AGENTS_REL = Path("share") / "web-team-orchestrator" / ".claude" / "agents"
-_DATA_TEMPLATES_REL = Path("share") / "web-team-orchestrator" / "templates"
+_DATA_AGENTS_REL = Path("share") / "dev-crew-orchestrator" / ".claude" / "agents"
+_DATA_TEMPLATES_REL = Path("share") / "dev-crew-orchestrator" / "templates"
 
 
 def _site_packages_roots() -> list[Path]:
