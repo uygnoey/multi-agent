@@ -8,6 +8,7 @@ codex exec ... --cd <타깃> --sandbox workspace-write --json -o <out> --skip-gi
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -64,7 +65,10 @@ def load_pricing() -> dict:
             for k, v in data.items():
                 if k.startswith("_") or not isinstance(v, (list, tuple)) or len(v) < 3:
                     continue
-                out[k] = (float(v[0]), float(v[1]), float(v[2]))
+                prices = (float(v[0]), float(v[1]), float(v[2]))
+                if any((not math.isfinite(x)) or x < 0 for x in prices):
+                    continue
+                out[k] = prices
             if out:
                 return out
         except Exception:
@@ -172,7 +176,7 @@ class CodexCLIBackend(Backend):
 
     async def run_role(self, req: RoleRequest) -> RoleResult:
         prompt = f"[SYSTEM ROLE INSTRUCTIONS]\n{req.system_prompt}\n\n[TASK]\n{req.prompt}"
-        key = req.unit["id"] if req.unit else "global"
+        key = req.unit.get("id", "global") if isinstance(req.unit, dict) else "global"
         # #108: unit id 는 board 에서 slug 처리되지만, 여기서도 방어적으로 경로 구분자를 제거해
         # codex transcript 가 .orchestrator/results 밖으로 탈출하지 못하도록 한다.
         safe_key = _sanitize_key(key)
@@ -203,45 +207,61 @@ class CodexCLIBackend(Backend):
         # (근본 제약, KEEP-DOCUMENTED). req.budget / req.max_turns 강제는 이 백엔드에서 불가 —
         # 누적 예산은 상위 runner 가 사전 체크로 처리하고, 긴 세션은 timeout 으로만 통제된다.
         try:
-            rc, out, err, timed_out = await run_subprocess(
-                cmd, str(req.cwd), req.timeout, req.live_log_path
-            )
-        except Exception as e:
-            return RoleResult(ok=False, error=str(e))
-
-        if timed_out:
-            return RoleResult(ok=False, error=f"codex timed out after {req.timeout}s")
-        if rc != 0:
-            # #6(#43): sandbox/login/runtime 진단의 '끝부분'(마지막 에러 컨텍스트)이 살아남도록
-            # 예전의 head 절단(err[:4000])이 아니라 tail(마지막 4000자, err[-4000:])을 보존한다.
-            return RoleResult(ok=False, error=err.decode(errors="replace")[-4000:] or f"exit {rc}")
-
-        final = ""
-        if out_path.exists():
             try:
-                final = out_path.read_text(encoding="utf-8")[:2000]
+                rc, out, err, timed_out = await run_subprocess(
+                    cmd, str(req.cwd), req.timeout, req.live_log_path
+                )
+            except Exception as e:
+                return RoleResult(ok=False, error=str(e))
+
+            if timed_out:
+                return RoleResult(ok=False, error=f"codex timed out after {req.timeout}s")
+            if rc != 0:
+                # #6(#43): sandbox/login/runtime 진단의 '끝부분'(마지막 에러 컨텍스트)이 살아남도록
+                # 예전의 head 절단(err[:4000])이 아니라 tail(마지막 4000자, err[-4000:])을 보존한다.
+                return RoleResult(
+                    ok=False, error=err.decode(errors="replace")[-4000:] or f"exit {rc}"
+                )
+
+            final = ""
+            if out_path.exists():
+                try:
+                    with out_path.open("r", encoding="utf-8", errors="replace") as fh:
+                        final = fh.read(2000)
+                except Exception:
+                    pass
+            # codex 는 USD 를 안 주므로 turn.completed 의 usage(토큰)로 비용을 추정 계산.
+            usage: dict[str, int] = {}
+            for line in out.splitlines():
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if o.get("type") == "turn.completed" and isinstance(o.get("usage"), dict):
+                    for k, v in o["usage"].items():
+                        try:
+                            iv = int(v)
+                        except (TypeError, ValueError):
+                            continue
+                        usage[k] = usage.get(k, 0) + max(0, iv)
+            model = req.model or _codex_default_model()
+            inp = usage.get("input_tokens", 0)
+            cached = usage.get("cached_input_tokens", 0)
+            out_t = usage.get("output_tokens", 0)
+            tokens = (inp + out_t) or None
+            cost = codex_cost(model, inp, cached, out_t) if usage else None
+            return RoleResult(
+                ok=True,
+                final_message=final or "codex exec ok",
+                model=model,
+                tokens=tokens,
+                cost_usd=cost,
+                cost_estimated=cost is not None,  # 가격표 기반 추정치 → est.
+            )
+        finally:
+            try:
+                out_path.unlink()
+            except FileNotFoundError:
+                pass
             except Exception:
                 pass
-        # codex 는 USD 를 안 주므로 turn.completed 의 usage(토큰)로 비용을 추정 계산.
-        usage = {}
-        for line in out.splitlines():
-            try:
-                o = json.loads(line)
-            except Exception:
-                continue
-            if o.get("type") == "turn.completed" and isinstance(o.get("usage"), dict):
-                usage = o["usage"]
-        model = req.model or _codex_default_model()
-        inp = usage.get("input_tokens") or 0
-        cached = usage.get("cached_input_tokens") or 0
-        out_t = usage.get("output_tokens") or 0
-        tokens = (inp + out_t) or None
-        cost = codex_cost(model, inp, cached, out_t) if usage else None
-        return RoleResult(
-            ok=True,
-            final_message=final or "codex exec ok",
-            model=model,
-            tokens=tokens,
-            cost_usd=cost,
-            cost_estimated=cost is not None,  # 가격표 기반 추정치 → est.
-        )

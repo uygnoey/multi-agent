@@ -17,6 +17,7 @@ import argparse
 import json
 import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -117,6 +118,8 @@ def _stop_run(orch_dir: Path) -> bool:
 
     def _remove_pidfile():
         try:
+            if pf.read_text(encoding="utf-8").strip() != str(pid):
+                return
             pf.unlink()
         except Exception:
             pass
@@ -200,6 +203,9 @@ _VALUE_RERUN_FLAGS = frozenset(
         "--timeout",
     }
 )
+_NONNEG_FLOAT_RERUN_FLAGS = frozenset({"--budget", "--poll-interval", "--timeout"})
+_POSITIVE_INT_RERUN_FLAGS = frozenset({"--max-units", "--concurrency", "--max-attempts"})
+_NONNEG_INT_RERUN_FLAGS = frozenset({"--retries"})
 # 값 없는 store-true 플래그 (#12).
 _STORE_TRUE_RERUN_FLAGS = frozenset(
     {
@@ -237,19 +243,55 @@ def _validate_rerun_argv(argv) -> tuple[bool, str]:
         return False, "재실행 인자 거부 (첫 토큰이 오케스트레이터 플래그가 아님)"
     # 화이트리스트 + arity 검사: '-' 로 시작하는 토큰(=플래그)을 허용 목록과 대조 (#15/#12).
     n = len(argv)
+    expecting_value_for: str | None = None
     for i, tok in enumerate(argv):
+        if expecting_value_for is not None:
+            ok, why = _validate_rerun_value(expecting_value_for, tok)
+            if not ok:
+                return False, why
+            expecting_value_for = None
+            continue
         if not tok.startswith("-"):
-            continue  # 비플래그 토큰은 직전 플래그의 값으로 본다
+            return False, f"재실행 인자 거부 (플래그 없는 값: {tok})"
         name = tok.split("=", 1)[0]  # '--flag=value' → '--flag'
         if name not in _ALLOWED_RERUN_FLAGS:
             return False, f"재실행 인자 거부 (허용되지 않은 플래그: {name})"
         # #12: 값이 필요한 플래그의 arity 검증.
-        if name in _VALUE_RERUN_FLAGS and "=" not in tok:
-            if i + 1 >= n:
-                return False, f"재실행 인자 거부 ({name} 에 값이 없음)"
-            nxt = argv[i + 1]
-            if nxt.startswith("-"):
-                return False, f"재실행 인자 거부 ({name} 에 값 대신 플래그 {nxt} 가 옴)"
+        if name in _VALUE_RERUN_FLAGS:
+            if "=" in tok:
+                ok, why = _validate_rerun_value(name, tok.split("=", 1)[1])
+                if not ok:
+                    return False, why
+            else:
+                if i + 1 >= n:
+                    return False, f"재실행 인자 거부 ({name} 에 값이 없음)"
+                nxt = argv[i + 1]
+                if nxt.startswith("-"):
+                    return False, f"재실행 인자 거부 ({name} 에 값 대신 플래그 {nxt} 가 옴)"
+                expecting_value_for = name
+        elif "=" in tok:
+            return False, f"재실행 인자 거부 ({name} 는 값을 받지 않음)"
+    return True, ""
+
+
+def _validate_rerun_value(flag: str, value: str) -> tuple[bool, str]:
+    if value == "":
+        return False, f"재실행 인자 거부 ({flag} 값이 비어 있음)"
+    try:
+        if flag in _NONNEG_FLOAT_RERUN_FLAGS:
+            v = float(value)
+            if not math.isfinite(v) or v < 0:
+                return False, f"재실행 인자 거부 ({flag} 값이 0 이상의 유한수가 아님)"
+        elif flag in _POSITIVE_INT_RERUN_FLAGS:
+            if not re.fullmatch(r"[+]?\d+", value):
+                return False, f"재실행 인자 거부 ({flag} 값이 양의 정수가 아님)"
+            if int(value) < 1:
+                return False, f"재실행 인자 거부 ({flag} 값이 1 이상이어야 함)"
+        elif flag in _NONNEG_INT_RERUN_FLAGS:
+            if not re.fullmatch(r"[+]?\d+", value):
+                return False, f"재실행 인자 거부 ({flag} 값이 0 이상의 정수가 아님)"
+    except ValueError:
+        return False, f"재실행 인자 거부 ({flag} 값이 잘못됨)"
     return True, ""
 
 

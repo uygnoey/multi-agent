@@ -16,8 +16,12 @@ import pytest
 
 from orchestrator import webui
 from orchestrator.backends import base as base_mod
+from orchestrator.backends.base import RoleRequest, RoleResult
 from orchestrator.backends.claude_cli import claude_stream_line
+from orchestrator.backends.codex_cli import CodexCLIBackend
 from orchestrator.config import RunConfig
+from orchestrator.prompts import compose_prompt
+from orchestrator.runner import Runner
 
 
 @pytest.fixture
@@ -144,3 +148,122 @@ def test_claude_stream_redacts_thinking_and_truncates_tool_input():
     assert "secret reasoning" not in rendered
     assert "[thinking redacted]" in rendered
     assert "truncated" in rendered
+
+
+def test_compose_prompt_tolerates_none_and_missing_unit_id():
+    out = compose_prompt(
+        role="backend-developer",
+        phase="dev",
+        unit={"title": "No id"},
+        directives=None,  # type: ignore[arg-type]
+        result_rel=".orchestrator/results/r.json",
+        spec_excerpt=None,  # type: ignore[arg-type]
+        recent_events=None,  # type: ignore[arg-type]
+    )
+    assert "- id: ?" in out
+    assert "No id" in out
+
+
+def test_query_token_only_bootstraps_index(server):
+    httpd, _spawned = server
+    url = f"http://127.0.0.1:{httpd.server_address[1]}/api/runs?token=SECRET"
+    try:
+        urllib.request.urlopen(url)
+        assert False, "query token should not authenticate API routes"
+    except urllib.error.HTTPError as e:
+        assert e.code == 401
+        assert "unauthorized" in e.read().decode("utf-8")
+
+
+def test_bounded_buffer_preserves_head_for_huge_json_line():
+    buf = base_mod._BoundedBuffer(max_bytes=12)
+    buf.append(b'{"type":"' + (b"x" * 100))
+    assert buf.getvalue().startswith(b'{"type"')
+
+
+def test_runconfig_rejects_bool_ints_and_bad_retry_backoff(tmp_path):
+    cfg = RunConfig(
+        spec_path=Path("s.md"),
+        project_dir=tmp_path / "p",
+        concurrency=True,  # type: ignore[arg-type]
+        retry_backoff=float("inf"),
+    )
+    assert cfg.concurrency == 3
+    assert cfg.retry_backoff == 2.0
+
+
+def test_runner_retries_backend_exceptions_and_accumulates_cost(tmp_path):
+    class _Backend:
+        def __init__(self):
+            self.calls = 0
+
+        async def run_role(self, req):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("boom")
+            return RoleResult(ok=True, final_message="ok", cost_usd=0.25, tokens=3)
+
+    class _Board:
+        async def log_event(self, role, message):
+            pass
+
+    cfg = RunConfig(spec_path=Path("s.md"), project_dir=tmp_path / "p", retries=1, retry_backoff=0)
+    runner = Runner(cfg, _Board())  # type: ignore[arg-type]
+    backend = _Backend()
+    req = RoleRequest(
+        role="backend-developer",
+        phase="dev",
+        unit={"id": "U1"},
+        system_prompt="sys",
+        prompt="prompt",
+        cwd=tmp_path,
+        allowed_tools=[],
+        model=None,
+        max_turns=1,
+        budget=None,
+        result_path=tmp_path / "r.json",
+        result_rel="r.json",
+        spec_text="spec",
+    )
+
+    res = asyncio.run(runner._run_with_retries(backend, req, "backend-developer", "U1"))
+    assert backend.calls == 2
+    assert res.ok is True
+    assert res.cost_usd == 0.25
+    assert res.tokens == 3
+
+
+def test_codex_removes_transcript_and_sums_usage(tmp_path, monkeypatch):
+    captured = {}
+
+    async def fake_run(cmd, cwd, timeout, log_path=None):
+        captured["out_path"] = Path(cmd[cmd.index("-o") + 1])
+        captured["out_path"].write_text("transcript", encoding="utf-8")
+        out = (
+            b'{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}\n'
+            b'{"type":"turn.completed","usage":{"input_tokens":3,"cached_input_tokens":1,"output_tokens":4}}\n'
+        )
+        return 0, out, b"", False
+
+    import orchestrator.backends.codex_cli as codex_cli
+
+    monkeypatch.setattr(codex_cli, "run_subprocess", fake_run)
+    req = RoleRequest(
+        role="backend-developer",
+        phase="dev",
+        unit={},
+        system_prompt="sys",
+        prompt="prompt",
+        cwd=tmp_path,
+        allowed_tools=[],
+        model="gpt-5.5",
+        max_turns=1,
+        budget=None,
+        result_path=tmp_path / ".orchestrator" / "results" / "r.json",
+        result_rel=".orchestrator/results/r.json",
+        spec_text="spec",
+    )
+    res = asyncio.run(CodexCLIBackend().run_role(req))
+    assert res.ok is True
+    assert res.tokens == 10
+    assert not captured["out_path"].exists()

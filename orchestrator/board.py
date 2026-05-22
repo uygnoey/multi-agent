@@ -45,6 +45,8 @@ def _coerce_finite_float(raw) -> float:
 
 def _coerce_int(raw) -> int:
     """비-정수 입력은 0 으로 변환 (잘못된 토큰 메타데이터 방어)."""
+    if isinstance(raw, bool):
+        return 0
     try:
         return int(raw)
     except (TypeError, ValueError):
@@ -383,7 +385,7 @@ class Board:
         if val < 0:
             return
         async with self._lock:
-            self._data["total_cost_usd"] = round(self._data.get("total_cost_usd", 0.0) + val, 6)
+            self._data["total_cost_usd"] = self._data.get("total_cost_usd", 0.0) + val
             self._flush()
 
     # ---- per-agent live state (for the monitor TUI) ----
@@ -432,7 +434,7 @@ class Board:
                 add = _coerce_finite_float(cost_add)
                 # per-agent 비용도 누적만 가능 → 음수는 무시(비용이 감소하지 않게)
                 if add > 0:
-                    a["cost_usd"] = round(a["cost_usd"] + add, 6)
+                    a["cost_usd"] = a["cost_usd"] + add
             if cost_est:
                 a["cost_est"] = True
                 self._data["cost_estimated"] = True
@@ -486,7 +488,7 @@ class Board:
         """Write a human-readable run report to .orchestrator/report.md."""
         d = self._data
         units = d.get("units", [])
-        done = sum(1 for u in units if u["status"] == "done")
+        done = sum(1 for u in units if u["status"] in TERMINAL_OK)
         failed = [u for u in units if u["status"] in (BLOCKED, FAILED)]
         warnings = d.get("warnings") or []
         if failed:
@@ -536,7 +538,7 @@ class Board:
         """
         d = self._data
         units = d.get("units", [])
-        done = sum(1 for u in units if u["status"] == "done")
+        done = sum(1 for u in units if u["status"] in TERMINAL_OK)
         artifacts = d.get("artifacts", [])
         docs_dir = self.project_dir / "docs"
         docs_dir.mkdir(parents=True, exist_ok=True)

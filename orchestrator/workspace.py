@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from .config import AGENTS_DIR, TEMPLATES_DIR
@@ -24,6 +25,15 @@ _GEN_MARKER = "<!-- orchestrator-generated -->"
 
 def _fmt_stack(stack: dict) -> str:
     return ", ".join(f"{k}={v}" for k, v in stack.items())
+
+
+def _render_template_once(template: str, values: dict[str, str]) -> str:
+    """Replace known {{PLACEHOLDER}} tokens in one pass so replacements are not re-expanded."""
+
+    def repl(match: re.Match[str]) -> str:
+        return values.get(match.group(1), match.group(0))
+
+    return re.sub(r"\{\{([A-Z_]+)\}\}", repl, template)
 
 
 def expose_team_agents(project_dir: Path) -> int:
@@ -74,7 +84,13 @@ def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
         content = (
             _GEN_MARKER
             + "\n"
-            + base.replace("{{STACK}}", stack_str).replace("{{SPEC_EXCERPT}}", spec_text[:1200])
+            + _render_template_once(
+                base,
+                {
+                    "STACK": stack_str,
+                    "SPEC_EXCERPT": spec_text[:1200],
+                },
+            )
         )
         # 기존 파일이 없거나(처음) 마커를 포함하면(우리가 만든 것) → 현재 내용으로 새로 갱신
         # (#141 refresh). 마커가 없으면(사용자가 직접 쓴 것) → 덮어쓰지 않고 보존 (#40).

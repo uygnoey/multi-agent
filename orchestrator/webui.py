@@ -34,6 +34,14 @@ from .monitor import _read_agent_log, _read_board
 
 MAX_BODY_BYTES = 4 * 1024 * 1024  # 요청 바디 상한 (메모리 고갈 방지)
 MAX_SPEC_BYTES = 1024 * 1024  # 기획서 텍스트 상한
+_COOKIE_VALUE_RE = re.compile(r"^[A-Za-z0-9._~+/=-]+$")
+
+
+def _token_equal(provided: str, expected: str) -> bool:
+    try:
+        return bool(provided) and hmac.compare_digest(provided, expected)
+    except TypeError:
+        return False
 
 
 def _read_events(orch_dir, n: int = 300) -> str:
@@ -393,6 +401,8 @@ class RunManager:
 
         def _remove_pidfile():
             try:
+                if pf.read_text(encoding="utf-8").strip() != str(pid):
+                    return
                 pf.unlink()
             except Exception:
                 pass
@@ -520,7 +530,7 @@ def _make_handler(manager: RunManager, token: str | None = None):
 
         # ---- #17: 토큰 인증 (WEB_UI_TOKEN 설정 시에만 활성) ----
         def _provided_token(self) -> str:
-            """요청에서 토큰을 추출: Authorization: Bearer → X-Auth-Token → ?token= → 쿠키."""
+            """요청에서 토큰을 추출: Authorization: Bearer → X-Auth-Token → 쿠키."""
             auth = self.headers.get("Authorization", "") or ""
             if auth.startswith("Bearer "):
                 t = auth[len("Bearer ") :].strip()
@@ -529,9 +539,6 @@ def _make_handler(manager: RunManager, token: str | None = None):
             x = (self.headers.get("X-Auth-Token") or "").strip()
             if x:
                 return x
-            qtok = (parse_qs(urlparse(self.path).query).get("token") or [""])[0]
-            if qtok:
-                return qtok
             for part in (self.headers.get("Cookie", "") or "").split(";"):
                 k, _, val = part.strip().partition("=")
                 if k == "token" and val:
@@ -543,7 +550,7 @@ def _make_handler(manager: RunManager, token: str | None = None):
                 return True  # 토큰 미설정 → 인증 비활성(하위호환)
             provided = self._provided_token()
             # 타이밍 공격 방지를 위해 상수시간 비교.
-            return bool(provided) and hmac.compare_digest(provided, auth_token)
+            return _token_equal(provided, auth_token)
 
         def _require_auth(self) -> bool:
             """인증 실패면 401 을 보내고 True 를 반환(호출부는 곧장 return)."""
@@ -593,7 +600,7 @@ def _make_handler(manager: RunManager, token: str | None = None):
                 extra = None
                 if auth_token:
                     qt = (q.get("token") or [""])[0]
-                    if qt and hmac.compare_digest(qt, auth_token):
+                    if _token_equal(qt, auth_token) and _COOKIE_VALUE_RE.fullmatch(qt):
                         # #10: HttpOnly 로 JS/XSS 의 쿠키 탈취를 막고 SameSite=Strict 로 cross-site
                         #      전송을 차단한다. TLS 종단 프록시가 X-Forwarded-Proto=https 를 주면
                         #      Secure 도 붙인다.
