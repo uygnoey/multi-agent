@@ -27,7 +27,9 @@ from .board import (
 from .config import DESIGN_ROLES, DEV_ROLES, SUPERVISOR_ROLES, RunConfig
 from .runner import Runner
 
-DEFAULT_STACK = {"frontend": "React/Vite", "backend": "FastAPI", "db": "SQLite"}
+# 기본 스택은 특정 도메인(web 등)을 가정하지 않는다 — 아키텍트가 spec 을 보고 실제 스택을
+# 결정한다. (이 값은 {{STACK}} 로 템플릿/보드에 문자열로만 들어가며 코드가 키를 읽지 않는다.)
+DEFAULT_STACK = {"stack": "아키텍트가 spec 기반으로 결정 (architect decides from the spec)"}
 
 
 class Scheduler:
