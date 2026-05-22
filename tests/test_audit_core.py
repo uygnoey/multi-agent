@@ -197,7 +197,8 @@ def test_read_board_missing_vs_corrupt(tmp_path):
 
 def test_validate_rerun_argv():
     assert _validate_rerun_argv(["--mock", "--spec", "x.md"])[0] is True
-    assert _validate_rerun_argv(["--help"])[0] is True
+    # #11(round-6): --help 는 rerun argv 로 거부(도움말만 찍고 끝나는 거짓 "재실행" 방지).
+    assert _validate_rerun_argv(["--help"])[0] is False
     # list[str] 아님
     assert _validate_rerun_argv("not-a-list")[0] is False
     assert _validate_rerun_argv(["--ok", 5])[0] is False

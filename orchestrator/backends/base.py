@@ -167,6 +167,17 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None):
                 f.close()
             except Exception:
                 pass
+        # #2: asyncio 서브프로세스 transport 를 루프가 살아있는 지금 명시적으로 닫는다.
+        #     닫지 않으면 Process 가 나중에(이벤트 루프가 이미 닫힌 뒤) GC 될 때
+        #     BaseSubprocessTransport.__del__ → pipe.close() → loop.call_soon 이
+        #     "Event loop is closed" unraisable warning 을 낸다. 지금 닫으면 transport 가
+        #     이미 closed 라 __del__ 이 재차 닫지 않아 경고가 사라진다.
+        transport = getattr(proc, "_transport", None)
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception:
+                pass
 
 
 @dataclass

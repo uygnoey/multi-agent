@@ -4,7 +4,9 @@
 # orchestrator package) and loads role definitions from .claude/agents/*.md and shared
 # instruction templates from templates/*. Those directories live OUTSIDE the orchestrator
 # package, so they are not picked up automatically. Ship them in the sdist explicitly here,
-# and in the wheel via [tool.setuptools.force-include] in pyproject.toml (#18 / #2).
+# and in the wheel via [tool.setuptools.data-files] in pyproject.toml. 설치형 wheel 에서는
+# 로더(config._resolve_runtime_dir)가 설치된 data-files 위치(sys.prefix / site-packages 루트)를
+# 추가로 스캔하므로 평범한 wheel 설치에서도 런타임 디렉터리가 해소된다 (#18 / #2).
 recursive-include .claude/agents *.md
 recursive-include templates *
 include examples/specs/*.md

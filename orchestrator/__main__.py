@@ -82,6 +82,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="실행 대신 --project-dir 의 진행을 실시간 모니터 TUI 로 본다",
     )
     p.add_argument(
+        "--interval",
+        type=float,
+        default=1.0,
+        help="--watch 모니터 TUI 의 갱신 주기(초). 기본 1.0",  # #16
+    )
+    p.add_argument(
         "--web",
         action="store_true",
         help="웹 UI 서버 실행 (브라우저에서 기획서 업로드·실행·모니터링)",
@@ -204,7 +210,7 @@ def main(argv=None) -> int:
             raise SystemExit("--watch 에는 --project-dir 가 필요합니다.")
         from .monitor import run_tui
 
-        run_tui(a.project_dir.resolve())
+        run_tui(a.project_dir.resolve(), a.interval)  # #16: --interval 을 TUI 갱신 주기로 전달
         return 0
     if not a.spec or not a.project_dir:
         raise SystemExit("--spec 와 --project-dir 는 필수입니다 (또는 --check 만 사용).")

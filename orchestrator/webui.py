@@ -502,6 +502,29 @@ def _make_handler(manager: RunManager, token: str | None = None):
             self._json({"error": "unauthorized"}, 401)
             return True
 
+        # ---- #9: CSRF/Origin 방어 ----
+        def _origin_ok(self) -> bool:
+            """상태변경 POST 의 cross-origin 요청 차단(쿠키 인증을 켜도 CSRF 막기).
+
+            Origin 헤더가 없으면(curl 등 비-브라우저) 허용하고, 있으면 host 가 요청 Host 와
+            일치할 때만 허용한다(same-origin). 브라우저 SPA 는 same-origin 이라 통과한다.
+            """
+            origin = self.headers.get("Origin")
+            if not origin:
+                return True  # 비-브라우저(Origin 없음) — CSRF 대상 아님
+            try:
+                origin_host = urlparse(origin).netloc
+            except Exception:
+                return False
+            return bool(origin_host) and origin_host == (self.headers.get("Host") or "")
+
+        def _require_same_origin(self) -> bool:
+            """cross-origin 이면 403 을 보내고 True 를 반환(호출부는 곧장 return)."""
+            if self._origin_ok():
+                return False
+            self._json({"error": "cross-origin request blocked"}, 403)
+            return True
+
         def do_GET(self):
             u = urlparse(self.path)
             q = parse_qs(u.query)
@@ -515,7 +538,10 @@ def _make_handler(manager: RunManager, token: str | None = None):
                 if auth_token:
                     qt = (q.get("token") or [""])[0]
                     if qt and hmac.compare_digest(qt, auth_token):
-                        extra = [("Set-Cookie", f"token={qt}; Path=/; SameSite=Strict")]
+                        # #10: HttpOnly 로 JS/XSS 의 쿠키 탈취를 막는다(쿠키는 서버만 읽으면 됨).
+                        #      SameSite=Strict 로 cross-site 전송 차단. (http 에선 Secure 불가 —
+                        #      https 종단 프록시 뒤라면 프록시에서 Secure 를 부여하라.)
+                        extra = [("Set-Cookie", f"token={qt}; Path=/; HttpOnly; SameSite=Strict")]
                 self._send(
                     200,
                     INDEX_HTML.encode("utf-8"),
@@ -600,6 +626,9 @@ def _make_handler(manager: RunManager, token: str | None = None):
             u = urlparse(self.path)
             if u.path not in ("/api/run", "/api/stop", "/api/rerun"):
                 self._json({"error": "not found"}, 404)
+                return
+            # #9: 상태변경 POST 는 cross-origin 요청을 먼저 차단한다(쿠키 인증 CSRF 방어).
+            if self._require_same_origin():
                 return
             # #17: 모든 POST 는 run 제어(/api/run·stop·rerun)이므로 토큰 인증을 강제한다.
             if self._require_auth():
@@ -777,19 +806,22 @@ def _make_handler(manager: RunManager, token: str | None = None):
 
 def serve(port: int = 8765, base_dir: Path | None = None, host: str = "127.0.0.1") -> None:
     base = Path(base_dir) if base_dir else (Path.home() / "agent-runs")
-    manager = RunManager(base)
     # #17: WEB_UI_TOKEN 이 설정되면 토큰 인증을 켠다(없으면 하위호환으로 인증 없음).
     token = os.environ.get("WEB_UI_TOKEN", "").strip()
+    loopback = host in ("127.0.0.1", "localhost", "::1")
+    # #8: 인증 없이 비-루프백(예: 0.0.0.0)에 바인딩하는 것은 fail-closed 로 거부한다 —
+    #     run 제어 UI 가 무인증으로 네트워크에 노출되는 배포 사고를 막는다. Docker 기본은
+    #     0.0.0.0 이므로 WEB_UI_TOKEN 을 반드시 설정해야 웹 UI 가 기동한다.
+    if not loopback and not token:
+        raise SystemExit(
+            f"거부: 인증 없이 비-루프백 호스트({host})에 바인딩할 수 없습니다. "
+            "WEB_UI_TOKEN 을 설정(예: -e WEB_UI_TOKEN=…)하거나 127.0.0.1 에 바인딩하세요."
+        )
+    manager = RunManager(base)
     httpd = ThreadingHTTPServer((host, port), _make_handler(manager, token))
     print(f"web ui: http://{host}:{port}   (runs → {base})")
     if token:
         print(f"  [auth] WEB_UI_TOKEN 필요 — 최초 접속: http://{host}:{port}/?token=…")
-    elif host not in ("127.0.0.1", "localhost", "::1"):
-        # 인증 없이 비-루프백(예: 0.0.0.0)에 노출 — 신뢰되지 않은 네트워크에 위험.
-        print(
-            f"  ⚠ 경고: 인증 없이 {host} 에 바인딩됨. WEB_UI_TOKEN 설정 또는 루프백 한정 "
-            "publish(-p 127.0.0.1:8765:8765)를 권장합니다."
-        )
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

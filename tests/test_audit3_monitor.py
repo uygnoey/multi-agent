@@ -64,10 +64,11 @@ def test_rerun_argv_allows_known_flags():
     assert ok is True
 
 
-def test_rerun_argv_allows_help():
-    # argparse 자동 플래그(--help/-h)는 정상 토큰이므로 허용 (기존 동작 유지).
-    assert _validate_rerun_argv(["--help"])[0] is True
-    assert _validate_rerun_argv(["-h"])[0] is True
+def test_rerun_argv_rejects_help():
+    # #11(round-6): --help/-h 는 rerun argv 로는 거부한다. 허용하면 rerun 이 도움말만 찍고
+    # 끝나는데 UI 는 "재실행 시작됨"이라 거짓 보고하기 때문이다. 정상 저장 argv 엔 help 가 없다.
+    assert _validate_rerun_argv(["--help"])[0] is False
+    assert _validate_rerun_argv(["-h"])[0] is False
 
 
 def test_rerun_argv_allows_equals_form():

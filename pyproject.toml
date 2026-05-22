@@ -71,3 +71,9 @@ orchestrator = ["codex_pricing.json"]
 # `orchestrator` package imports without a prior install.
 [tool.pytest.ini_options]
 pythonpath = ["."]
+# #25: unraisable 예외(예: asyncio transport __del__ 의 "Event loop is closed")가 CI 의
+#      성공에 묻히지 않도록 해당 경고를 에러로 승격한다. 전체 -W error 는 서드파티
+#      DeprecationWarning 까지 깨뜨려 과하므로, 실제로 버그를 나타내는 unraisable 만 가둔다.
+filterwarnings = [
+    "error::pytest.PytestUnraisableExceptionWarning",
+]

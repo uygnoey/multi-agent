@@ -81,10 +81,19 @@ class Scheduler:
             for o in design_outcomes:  # 설계/테스트시트 산출물 → 전역 노출
                 await self.board.add_global_artifacts(o.get("artifacts", []))
             if not arch_outcome.get("_ok", True):
-                # 설계 실패는 '성공한 빌드'로 오탐되면 안 됨 → 경고로 명시 기록
+                # #19: 설계(architecture-engineer) 실패 시, 의미 없는 fallback U1 빌드로 실비를
+                #      쓰지 않고 즉시 중단한다. 설계 실패는 spec/설계를 고쳐 재실행해야 풀린다
+                #      ("실패 → 고쳐서 다시"). 조기 return 이어도 finally 가 report 기록·감독
+                #      정리·run.pid 제거를 수행하므로 run 상태는 깨끗하게 닫힌다.
                 await self.board.add_warning(
                     f"design(architecture-engineer) failed: {arch_outcome.get('blockers') or '?'}"
+                    " → 빌드 중단(fallback 미생성). spec/설계를 수정해 재실행하세요."
                 )
+                await self.board.log_event(
+                    "scheduler", "design failed; aborting build (no fallback unit)"
+                )
+                await self.board.set_phase("failed")
+                return self.board.snapshot()
             units = arch_outcome.get("units") or []
             if units:
                 await self.board.add_units(units)
@@ -296,16 +305,27 @@ class Scheduler:
         await self.board.set_status(uid, TESTING)
         te = await self.runner.run_role("test-engineer", unit)
         await self.board.add_artifacts(uid, te.get("artifacts", []))
+
+        # #18: test-engineer(테스트 작성)가 실패하면 그 산출물 위에서 qa 비용을 쓰지 않는다.
+        #      미통과로 표시하고, 시도가 남았으면 dev 부터 재작업해 '고쳐서' 다시 검증한다
+        #      (단순 중단이 아니라 rework 경로 — "실패 → 버그픽스 → 재검증").
+        te_ok = te.get("_ok", True) and te.get("status") != "failed"
+        if not te_ok:
+            await self.board.log_event(uid, "test-engineer 실패 → qa 건너뜀(비용 절감)")
+            await self.board.set_test_status(uid, "fail")
+            if attempt < self.cfg.max_attempts:
+                await self.board.log_event(uid, f"test 작성 실패 → 재작업 (attempt {attempt + 1})")
+                if await self._develop_unit(unit, sem, attempt + 1):
+                    await self._test_unit(unit, sem, attempt + 1)
+                    return
+            await self.board.set_status(uid, FAILED, "test-engineer failed after retries")
+            return
+
         qa = await self.runner.run_role("qa", unit)
         await self.board.add_artifacts(uid, qa.get("artifacts", []))
 
-        # test-engineer 와 qa 가 모두 성공해야 통과 (test 작성 실패도 미통과로 본다)
-        passed = (
-            te.get("_ok", True)
-            and qa.get("_ok", True)
-            and qa.get("status") != "failed"
-            and te.get("status") != "failed"
-        )
+        # test-engineer 가 성공한 경우에만 qa 를 돌렸으므로, 통과 판정은 qa 결과만 본다.
+        passed = qa.get("_ok", True) and qa.get("status") != "failed"
         await self.board.set_test_status(uid, "pass" if passed else "fail")
         if passed:
             await self.board.set_status(uid, DONE)

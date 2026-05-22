@@ -43,6 +43,10 @@ def expose_team_agents(project_dir: Path) -> int:
         dest = dest_dir / md.name
         # 기존 파일은 건드리지 않음 (#12): 동일하면 재기록 불필요, 다르면 사용자 편집본 보존.
         # 없을 때만 새로 기록한다.
+        # 의도된 동작(#20): 기존 .claude/agents/*.md 는 절대 덮어쓰지 않아 사용자 편집을 보존한다.
+        # 부작용으로 프레임워크의 역할정의(role-definition) 변경은 *이미 존재하는* 타깃에
+        # 자동 전파되지 않는다. 최신 역할정의로 강제 갱신하려면 해당 파일(또는
+        # .claude/agents/ 디렉터리)을 지운 뒤 다시 스캐폴딩하면 된다.
         if dest.exists():
             continue
         dest.write_text(bundled, encoding="utf-8")
@@ -87,8 +91,16 @@ def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
     if gi.exists():
         cur = gi.read_text(encoding="utf-8")
         # 라인 단위로 실제 ignore 패턴을 확인 (주석/부분일치 오인 방지; #92)
-        lines = {ln.strip() for ln in cur.splitlines()}
-        if ".orchestrator/" not in lines:
-            gi.write_text(cur.rstrip() + "\n" + _GITIGNORE_SEED, encoding="utf-8")
+        existing = {ln.strip() for ln in cur.splitlines()}
+        # 시드 블록을 통째로 붙이면 이미 있는 패턴(node_modules/, .venv/ 등)이 중복된다 (#21).
+        # 따라서 아직 없는 시드 패턴만 골라 추가한다(공백 무시·정확 라인 일치로 dedupe).
+        # .orchestrator/ 는 시드에 포함되므로 이 과정에서 누락되지 않고 결국 ignore 된다.
+        missing = [
+            pat
+            for pat in _GITIGNORE_SEED.splitlines()
+            if pat.strip() and pat.strip() not in existing
+        ]
+        if missing:
+            gi.write_text(cur.rstrip() + "\n" + "\n".join(missing) + "\n", encoding="utf-8")
     else:
         gi.write_text(_GITIGNORE_SEED, encoding="utf-8")
