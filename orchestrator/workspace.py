@@ -1,7 +1,9 @@
 """타깃 프로젝트 스캐폴딩.
 
 - 디렉터리 생성, .orchestrator/ 초기화
-- spec.md·CLAUDE.md·AGENTS.md 를 현재 run 의 spec/stack 으로 항상 (재)기록 (#140/#141)
+- .orchestrator/spec.md 는 오케스트레이터 내부 상태 → 항상 (재)기록 (#140)
+- CLAUDE.md·AGENTS.md 는 생성 마커가 있으면(=우리가 만든 것) 새로 갱신, 없으면
+  (=사용자가 직접 쓴 것) 보존한다 (#40 + #141)
 - 사용자 작성 파일(.claude/agents/*.md)은 보존 (#12)
 - 타깃 .gitignore 에 .orchestrator/ 시드
 """
@@ -13,6 +15,11 @@ from pathlib import Path
 from .config import AGENTS_DIR, TEMPLATES_DIR
 
 _GITIGNORE_SEED = ".orchestrator/\n__pycache__/\nnode_modules/\n.venv/\n*.db\n"
+
+# 우리가 생성한 CLAUDE.md/AGENTS.md 임을 표시하는 마커 (#40).
+# 이 마커가 있는 파일만 재실행 시 안전하게 (재)기록한다. 사용자가 직접 쓴 파일(마커 없음)은
+# 덮어쓰지 않는다. HTML 주석이라 Markdown 렌더링에 보이지 않는다.
+_GEN_MARKER = "<!-- orchestrator-generated -->"
 
 
 def _fmt_stack(stack: dict) -> str:
@@ -50,9 +57,8 @@ def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
     orch = project_dir / ".orchestrator"
     (orch / "results").mkdir(parents=True, exist_ok=True)
     (orch / "qa").mkdir(parents=True, exist_ok=True)
-    # spec.md / CLAUDE.md / AGENTS.md 는 오케스트레이터가 현재 run 의 spec·stack 을 박아 넣는
-    # 생성물이다. 재사용 디렉터리에 새 spec 을 돌리면 이전 값이 stale 해지므로 항상 현재
-    # 내용으로 (재)기록한다 (#140/#141). 사용자가 직접 쓴 .claude/agents/*.md 만 보존(#12).
+    # .orchestrator/spec.md 는 사용자 파일이 아니라 오케스트레이터 내부 상태다. 재사용 디렉터리에
+    # 새 spec 을 돌리면 이전 값이 stale 해지므로 항상 현재 내용으로 (재)기록한다 (#140).
     (orch / "spec.md").write_text(spec_text, encoding="utf-8")
 
     stack_str = _fmt_stack(stack)
@@ -60,10 +66,20 @@ def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
         target = project_dir / fname
         tpl = TEMPLATES_DIR / fname
         base = tpl.read_text(encoding="utf-8") if tpl.exists() else f"# {fname}\n"
-        target.write_text(
-            base.replace("{{STACK}}", stack_str).replace("{{SPEC_EXCERPT}}", spec_text[:1200]),
-            encoding="utf-8",
+        # 생성 마커를 본문 맨 앞에 박아 두어 우리 생성물임을 표시한다 (#40).
+        content = (
+            _GEN_MARKER
+            + "\n"
+            + base.replace("{{STACK}}", stack_str).replace("{{SPEC_EXCERPT}}", spec_text[:1200])
         )
+        # 기존 파일이 없거나(처음) 마커를 포함하면(우리가 만든 것) → 현재 내용으로 새로 갱신
+        # (#141 refresh). 마커가 없으면(사용자가 직접 쓴 것) → 덮어쓰지 않고 보존 (#40).
+        if target.exists():
+            existing = target.read_text(encoding="utf-8", errors="replace")
+            if _GEN_MARKER not in existing:
+                print(f"[scaffold] {fname} 은 사용자 작성으로 판단되어 보존합니다 (덮어쓰지 않음)")
+                continue
+        target.write_text(content, encoding="utf-8")
 
     expose_team_agents(project_dir)
 

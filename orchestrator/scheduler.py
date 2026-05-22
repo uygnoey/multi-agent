@@ -163,6 +163,14 @@ class Scheduler:
                 await self.board.add_warning(
                     f"빌드 미완료: {len(broken)}개 unit failed/blocked: {broken}"
                 )
+                # 결정(#28): cicd/docs 산출물은 부분이라도 유용하므로 계속 실행한다. 단, 불완전
+                # 빌드 위에서 돌았음을 로그로 분명히 남겨 '완전 완료'로 오해받지 않게 한다.
+                # (위 broken 경고 + 아래 still_broken→phase=failed 가 result≠ok 를 보장한다.)
+                await self.board.log_event(
+                    "scheduler",
+                    f"cicd/docs run on INCOMPLETE build ({len(broken)} unit failed/blocked: "
+                    f"{broken}); 산출물은 부분일 수 있으며 run 은 완전 완료가 아님",
+                )
 
             # Phase D — CI/CD
             await self.board.set_phase("cicd")

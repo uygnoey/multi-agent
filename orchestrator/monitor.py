@@ -27,16 +27,51 @@ from .backends import backend_status
 from .config import BACKEND_INFO, ROLES
 
 
+def _is_zombie(pid: int) -> bool:
+    """pid 가 좀비(이미 종료, 부모가 reap 대기 중) 인지 best-effort 로 판별 (#32).
+
+    webui._is_zombie 와 동일한 기준이지만, 무거운 import 사이클을 피하려고 monitor 에
+    가벼운 사본을 둔다. Linux 는 /proc, 그 외(macOS 등)는 `ps` 로 상태 코드를 본다.
+    판별 불가 시 False (= 좀비 아님으로 보수적 처리).
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat")
+        if stat.exists():
+            # 형식: pid (comm) STATE ... — comm 에 ')' 가 있을 수 있어 마지막 ')' 기준.
+            txt = stat.read_text(encoding="utf-8", errors="replace")
+            state = txt[txt.rfind(")") + 1 :].strip().split(" ", 1)[0]
+            return state == "Z"
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "state=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return out.stdout.strip().startswith("Z")
+    except Exception:
+        return False
+
+
 def _run_alive(orch_dir: Path) -> bool:
     """run.pid 의 프로세스가 살아있는지 (웹 UI 와 동일 기준)."""
     pf = orch_dir / "run.pid"
     if not pf.exists():
         return False
     try:
-        os.kill(int(pf.read_text(encoding="utf-8").strip()), 0)
+        pid = int(pf.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         return False
-    return True
+    try:
+        os.kill(pid, 0)  # signal 0 = 존재/권한 확인 (죽었으면 OSError)
+    except OSError:
+        return False
+    # #32: 좀비(종료됐지만 reap 안 됨)는 os.kill(pid,0) 이 계속 성공한다. 웹 UI 와 동일하게
+    #      좀비는 종료로 본다 (그렇지 않으면 끝난 run 이 TUI 에 계속 "running" 으로 남아
+    #      stop/rerun 컨트롤·상태 라벨이 웹과 어긋난다).
+    return not _is_zombie(pid)
 
 
 def _stop_run(orch_dir: Path) -> bool:
@@ -96,12 +131,44 @@ def _rerun(orch_dir: Path) -> tuple[bool, str]:
         return False, f"재실행 실패: {e}"
 
 
-def _validate_rerun_argv(argv) -> tuple[bool, str]:
-    """rerun.json 의 argv 경량 검증 (#90).
+# 재실행에 허용되는 오케스트레이터 플래그 화이트리스트 (#15).
+# rerun.json 이 조작돼도 알려진 플래그만 통과시켜 예상치 못한 플래그 주입을 막는다.
+# argparse 가 자동 추가하는 --help/-h 도 정상 토큰이므로 포함한다.
+_ALLOWED_RERUN_FLAGS = frozenset(
+    {
+        "--spec",
+        "--project-dir",
+        "--backend",
+        "--backends",
+        "--distribute",
+        "--cross-check",
+        "--role-backend",
+        "--max-units",
+        "--concurrency",
+        "--budget",
+        "--model",
+        "--poll-interval",
+        "--delegate",
+        "--max-attempts",
+        "--retries",
+        "--timeout",
+        "--mock",
+        "--help",
+        "-h",
+    }
+)
 
-    rerun.json 은 로컬 신뢰 데이터지만 손상/조작될 수 있으므로 임의 프로그램 실행을 막는다.
+
+def _validate_rerun_argv(argv) -> tuple[bool, str]:
+    """rerun.json 의 argv 검증 (#90 + #15).
+
+    rerun.json 은 로컬 신뢰 데이터지만 손상/조작될 수 있으므로 임의 프로그램 실행과
+    예상치 못한 플래그 주입을 막는다.
     - argv 는 list[str] 여야 함
     - 첫 토큰은 '--' 로 시작하는 오케스트레이터 플래그여야 함 (절대경로/다른 프로그램명 거부)
+    - '-' 로 시작하는 토큰은 모두 화이트리스트(_ALLOWED_RERUN_FLAGS)에 있어야 함.
+      플래그가 아닌 토큰은 값(value)으로 보고 통과시킨다 (실용성: 로컬 신뢰 데이터).
+      단, '--flag=value' 형태는 '=' 앞부분만 떼어 화이트리스트와 대조한다.
     """
     if not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
         return False, "재실행 인자 형식 오류 (list[str] 아님)"
@@ -112,6 +179,13 @@ def _validate_rerun_argv(argv) -> tuple[bool, str]:
         return False, "재실행 인자 거부 (첫 토큰이 절대경로)"
     if not first.startswith("-"):
         return False, "재실행 인자 거부 (첫 토큰이 오케스트레이터 플래그가 아님)"
+    # 화이트리스트 검사: '-' 로 시작하는 모든 토큰(=플래그)을 허용 목록과 대조한다 (#15).
+    for tok in argv:
+        if not tok.startswith("-"):
+            continue  # 비플래그 토큰은 직전 플래그의 값으로 본다
+        name = tok.split("=", 1)[0]  # '--flag=value' → '--flag'
+        if name not in _ALLOWED_RERUN_FLAGS:
+            return False, f"재실행 인자 거부 (허용되지 않은 플래그: {name})"
     return True, ""
 
 

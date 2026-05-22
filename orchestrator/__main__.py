@@ -169,7 +169,12 @@ def _print_summary(snap: dict, cfg: RunConfig) -> None:
         print(f"  {u['id']:<6} {u['status']:<11} test={str(u.get('test_status')):<5} {u['title']}")
     done = sum(1 for u in units if u["status"] == "done")
     print(f"units       : {done}/{len(units)} done")
-    print(f"cost        : ${snap.get('total_cost_usd', 0.0):.4f}")
+    # 손상된 스냅샷(문자열/None/리스트 cost)이라도 보드/리포트 경로는 출력되도록 안전 변환 (#29)
+    try:
+        cost = float(snap.get("total_cost_usd", 0.0))
+    except (TypeError, ValueError):
+        cost = 0.0
+    print(f"cost        : ${cost:.4f}")
     warnings = snap.get("warnings") or []
     if warnings:  # 설계/CI/docs 등 실패성 완료를 터미널에서도 놓치지 않게
         print(f"result      : ⚠ DONE WITH {len(warnings)} WARNING(S)")

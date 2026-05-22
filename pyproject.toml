@@ -1,5 +1,7 @@
 [build-system]
-requires = ["setuptools>=64"]
+# setuptools>=69.3 is required for [tool.setuptools.force-include] (used to bundle the
+# repo-root .claude/agents + templates dirs into the wheel; see below). #18 / #2.
+requires = ["setuptools>=69.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -28,14 +30,41 @@ web-team-web = "orchestrator.webui:main"
 
 [tool.setuptools]
 packages = ["orchestrator", "orchestrator.backends"]
+include-package-data = true
 
 [tool.setuptools.package-data]
 orchestrator = ["codex_pricing.json"]
 
-# config.FRAMEWORK_ROOT resolves to the repo root and loads .claude/agents/*.md and
-# templates/* from there. Those live OUTSIDE the orchestrator package, so a plain wheel
-# install cannot bundle them — install from a source checkout (`pip install -e .`) or use
-# the Docker image (which COPYs both dirs). See README "Install" / "Deploy (Docker)".
+# --- Bundling repo-root runtime data into wheel + sdist (#18 / #2) ---------------------
+# config.FRAMEWORK_ROOT = Path(orchestrator/config.py).parent.parent. In an editable install
+# that is the repo root, so .claude/agents and templates are found in place. In a *built
+# wheel* the orchestrator package lands at <site-packages>/orchestrator/, so parent.parent is
+# <site-packages> — where those repo-root dirs do NOT exist, because they live OUTSIDE the
+# orchestrator package and pyproject package-data can only bundle files *inside* a package.
+#
+# data-files DOES ship both dirs inside the built wheel + sdist (verified below). Note that
+# wheel data-files are installed relative to the install prefix (sys.prefix / the venv root),
+# NOT site-packages, so the *unchanged* FRAMEWORK_ROOT loader (which points at site-packages)
+# will not auto-discover them from a plain wheel. We ship them anyway so the bytes are present
+# and recoverable; full fidelity needs an editable install or Docker.
+[tool.setuptools.data-files]
+"share/web-team-orchestrator/.claude/agents" = [".claude/agents/*.md"]
+"share/web-team-orchestrator/templates" = ["templates/CLAUDE.md", "templates/AGENTS.md"]
+
+# Loader-fallback note — WHAT WORKS / WHAT DOES NOT (#18 / #2), precisely:
+#  * editable install (`pip install -e .`): WORKS fully. FRAMEWORK_ROOT == repo root; both
+#    .claude/agents and templates are read in place. This is a SUPPORTED path.
+#  * Docker image: WORKS fully. The Dockerfile COPYs .claude and templates to /app and runs
+#    from there (FRAMEWORK_ROOT == /app). This is a SUPPORTED path.
+#  * sdist (`pip install web-team-orchestrator-*.tar.gz` from source build): the dirs are
+#    present in the archive via MANIFEST.in, but a build from the sdist produces the same
+#    wheel-shaped layout below, so see the wheel caveat.
+#  * plain wheel (`pip install web-team-orchestrator`): the .claude/agents + templates bytes
+#    are bundled (data-files) but land under <prefix>/share/web-team-orchestrator/, which the
+#    current FRAMEWORK_ROOT (= site-packages) does NOT scan. Fully-correct auto-discovery from
+#    a wheel would require either moving the dirs INTO the orchestrator package + switching the
+#    loader to importlib.resources, or a setup.py force-include — both are code/layout changes
+#    outside this packaging-only fix. Until then, use an editable install or Docker for runtime.
 
 # Make plain `pytest` work like `python -m pytest`: put the repo root on sys.path so the
 # `orchestrator` package imports without a prior install.

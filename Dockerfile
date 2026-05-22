@@ -16,12 +16,32 @@ COPY templates ./templates
 COPY examples ./examples
 # docs/ is intentionally not copied (excluded by .dockerignore); the runtime does not need it.
 
-# 코어를 먼저 설치(반드시 성공) → 선택 백엔드 SDK([all])는 비치명적으로 시도한다.
-# [all] 설치가 실패해도 빌드는 계속되지만(이미지에 mock/CLI 백엔드는 항상 동작),
-# 빌드 로그에 명확한 경고를 남겨 "실 SDK 백엔드 누락"을 가린 채 성공하지 않게 한다(#52).
+# 코어를 먼저 설치(반드시 성공) → 선택 백엔드 SDK([all])는 기본적으로 비치명적으로 시도한다.
+#
+# REQUIRE_ALL_BACKENDS 빌드 ARG (#52 / #10):
+#   0 (기본) — soft 모드. [all] 설치가 실패해도 빌드는 계속되지만(이미지에 mock/CLI 백엔드는
+#               항상 동작), 빌드 로그에 매우 눈에 띄는 경고 배너를 남겨 "실 SDK 백엔드 누락"을
+#               가린 채 성공하지 않게 한다.
+#   1         — hard 모드. `pip install -e ".[all]"` 가 실패하면 `||` 폴백 없이 빌드를 즉시
+#               실패시킨다. claude-sdk/openai-agents 백엔드가 반드시 필요한 운영 이미지용.
+#   사용 예:   docker build --build-arg REQUIRE_ALL_BACKENDS=1 -t web-team .
+ARG REQUIRE_ALL_BACKENDS=0
 RUN pip install -e . \
-    && (pip install -e ".[all]" \
-        || echo "WARNING: optional backend SDKs ([all]: claude-agent-sdk/openai-agents) failed to install. Image has mock + CLI backends only; claude-sdk/openai-agents backends will be unavailable.")
+    && if [ "$REQUIRE_ALL_BACKENDS" = "1" ]; then \
+            echo ">>> REQUIRE_ALL_BACKENDS=1: optional SDK backends are MANDATORY; build fails if [all] does not install."; \
+            pip install -e ".[all]"; \
+        else \
+            pip install -e ".[all]" \
+            || { \
+                echo "============================================================================"; \
+                echo "!! WARNING (#52): optional backend SDKs ([all]: claude-agent-sdk /"; \
+                echo "!! openai-agents) FAILED to install. This image has mock + CLI backends"; \
+                echo "!! ONLY; the claude-sdk and openai-agents backends will be UNAVAILABLE at"; \
+                echo "!! runtime. The build was NOT failed (soft mode). To make this a hard build"; \
+                echo "!! failure, rebuild with: --build-arg REQUIRE_ALL_BACKENDS=1"; \
+                echo "============================================================================"; \
+            }; \
+        fi
 
 EXPOSE 8765
 VOLUME ["/data"]

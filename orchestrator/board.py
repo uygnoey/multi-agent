@@ -102,6 +102,34 @@ def _md_cell(v) -> str:
     return str(v).replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").replace("\r", " ")
 
 
+# 리포트/산출물에 찍히는 경고 1건의 최대 길이: 거대한 경고가 report.md 를 부풀리지 않게 캡.
+_MAX_WARNING_CHARS = 500
+
+
+def _safe_report_num(raw) -> float:
+    """리포트 포맷용 숫자 강제: float() 실패/bool/NaN/Inf 는 0.0.
+
+    부분 손상된 보드(문자열/null/list/bool 비용·토큰)가 :.4f 포맷에서 터지지 않게 방어해
+    report.md / docs/DELIVERABLES*.md 가 항상 기록되도록(복구성) 보장한다.
+    """
+    # bool 은 int 의 서브클래스라 float(True)==1.0 이 되므로 명시적으로 거부.
+    if isinstance(raw, bool):
+        return 0.0
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return val if math.isfinite(val) else 0.0
+
+
+def _safe_warning(raw) -> str:
+    """경고 문자열을 리포트에 안전하게: 개행/파이프 중화 후 길이 캡(구조 왜곡·비대화 방지)."""
+    s = _md_cell(raw)
+    if len(s) > _MAX_WARNING_CHARS:
+        s = s[:_MAX_WARNING_CHARS] + "…(truncated)"
+    return s
+
+
 def _norm_str_list(v) -> list[str]:
     """deps/roles 입력 정규화: list→[str…], scalar→[str], dict/None/빈값→[] (이상값 방어)."""
     if v in (None, "") or isinstance(v, dict):
@@ -392,11 +420,12 @@ class Board:
             f"- phase: **{d.get('phase')}**",
             f"- result: **{result}**",
             f"- units done: **{done}/{len(units)}**",
-            f"- total cost: **${d.get('total_cost_usd', 0.0):.4f}**",
+            f"- total cost: **${_safe_report_num(d.get('total_cost_usd', 0.0)):.4f}**",
             f"- stack: {d.get('stack')}",
         ]
         if warnings:
-            lines += ["", "## ⚠ Warnings", ""] + [f"- {w}" for w in warnings]
+            # 경고는 개행/마크다운/거대 텍스트를 포함할 수 있어 중화+길이 캡 후 기록.
+            lines += ["", "## ⚠ Warnings", ""] + [f"- {_safe_warning(w)}" for w in warnings]
         lines += [
             "",
             "## Units",
@@ -455,7 +484,7 @@ class Board:
                 "",
                 f"- phase: **{d.get('phase')}**",
                 f"- units done: **{done}/{len(units)}**",
-                f"- total cost: **${d.get('total_cost_usd', 0.0):.4f}**",
+                f"- total cost: **${_safe_report_num(d.get('total_cost_usd', 0.0)):.4f}**",
                 f"- stack: {d.get('stack')}",
                 "",
                 "## Work units",
@@ -474,7 +503,7 @@ class Board:
                 "",
                 f"- 단계: **{d.get('phase')}**",
                 f"- 완료 unit: **{done}/{len(units)}**",
-                f"- 총비용: **${d.get('total_cost_usd', 0.0):.4f}**",
+                f"- 총비용: **${_safe_report_num(d.get('total_cost_usd', 0.0)):.4f}**",
                 f"- 스택: {d.get('stack')}",
                 "",
                 "## 작업 단위",

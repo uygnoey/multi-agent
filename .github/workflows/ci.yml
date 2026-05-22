@@ -26,4 +26,6 @@ jobs:
       - run: pip install ruff pytest
       - run: ruff check .
       - run: ruff format --check .
-      - run: pytest -q
+      # Use `python -m pytest` (not bare `pytest`) so the repo root is on sys.path and the
+      # `orchestrator` package imports correctly even without an install on PATH (#134 / #42).
+      - run: python -m pytest -q

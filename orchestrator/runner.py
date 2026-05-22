@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 
 from .agents import load_agent
@@ -25,11 +26,38 @@ from .config import (
 )
 from .prompts import compose_prompt
 
+# #39: 동시 호출이 시작 시점에 모두 "예산 충분" 으로 보고 N-way 로 초과하는 것을 막기 위한
+# in-flight 예약 추정치(USD). 실제 비용은 호출 후에야 알 수 있으므로 보수적인 한 호출 추정으로
+# 자리를 미리 점유한다. 정확한 값이 아니어도 시작 시점 동시 통과를 막는 것이 목적이다.
+_INFLIGHT_RESERVE_USD = 0.50
+
+
+def _truthy_env(name: str, default: bool) -> bool:
+    """ORCH_* 불리언 환경변수 파싱. 미설정이면 default. 0/false/no/off → False, 그 외 → True."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _log_prompt_bodies() -> bool:
+    """전체 프롬프트 본문을 per-agent 로그에 남길지 여부 (#3).
+
+    기본값은 True(디버깅 편의 유지·하위호환). ORCH_LOG_PROMPTS=0(또는 false/no/off)로 끄면
+    spec/directives 등 민감 내용이 .orchestrator/agents 로그에 남지 않도록 짧은 메모만 기록한다.
+    """
+    return _truthy_env("ORCH_LOG_PROMPTS", True)
+
 
 class Runner:
     def __init__(self, cfg: RunConfig, board: Board):
         self.cfg = cfg
         self.board = board
+        # #39: 예산 사전점검+예약을 직렬화하는 락. 동시에 시작한 여러 역할이 모두 예산을
+        # "충분" 으로 보지 못하게 한다(check+reserve 를 원자적으로 처리).
+        self._budget_lock = asyncio.Lock()
+        # 현재 진행 중인(아직 add_cost 로 커밋되지 않은) 호출들의 예약 추정 합계.
+        self._inflight_reserved = 0.0
 
     def _candidates(self, role: str) -> tuple[list[str], list[str]]:
         """(가용 후보, skip된 후보) 반환. 가용이 없으면 첫 후보로 명확히 실패시킨다."""
@@ -98,23 +126,48 @@ class Runner:
 
         # 누적 예산 enforcement: 백엔드 무관하게 runner 에서 강제 (#112). 보드 누적 비용이 이미
         # 예산 이상이면 백엔드를 호출하지 않고 blocked 반환 → --budget 가 모든 백엔드에 의미.
+        #
+        # #39: concurrency>1 일 때 여러 역할이 add_cost 전에 모두 사전점검을 통과해 N-way 로
+        # 초과하던 문제를 줄인다. check+reserve 를 _budget_lock 으로 직렬화하고, "커밋된 보드
+        # 누적 + 진행 중 예약 추정" 을 함께 보아 동시 시작이 모두 예산을 충분으로 보지 못하게 한다.
+        # 잔여 한계: 이미 시작된 한 호출은 실제 비용을 끝나봐야 알 수 있어 한 호출 비용만큼은
+        # 여전히 초과할 수 있다(완벽 방지는 불가능). reserved 는 호출 종료 시 finally 에서 해제한다.
+        reserved = 0.0
         if self.cfg.budget is not None:
-            total = self.board.snapshot().get("total_cost_usd", 0.0) or 0.0
-            if total >= self.cfg.budget:
-                blocker = f"budget exceeded: spent ${total:.4f} >= budget ${self.cfg.budget:.4f}"
-                await self.board.log_event(role, f"skip [budget] {blocker}")
-                await self.board.agent_update(
-                    role, status="idle", activity=f"⏸ skipped (budget) {key if unit else ''}"
-                )
-                return {
-                    "status": "blocked",
-                    "artifacts": [],
-                    "notes": [],
-                    "blockers": [blocker],
-                    "units": [],
-                    "_ok": False,
-                }
+            async with self._budget_lock:
+                committed = self.board.snapshot().get("total_cost_usd", 0.0) or 0.0
+                projected = committed + self._inflight_reserved
+                if projected >= self.cfg.budget:
+                    blocker = (
+                        f"budget exceeded: spent ${committed:.4f} "
+                        f"(+${self._inflight_reserved:.4f} in-flight) >= "
+                        f"budget ${self.cfg.budget:.4f}"
+                    )
+                    await self.board.log_event(role, f"skip [budget] {blocker}")
+                    await self.board.agent_update(
+                        role, status="idle", activity=f"⏸ skipped (budget) {key if unit else ''}"
+                    )
+                    return {
+                        "status": "blocked",
+                        "artifacts": [],
+                        "notes": [],
+                        "blockers": [blocker],
+                        "units": [],
+                        "_ok": False,
+                    }
+                # 통과 → 한 호출분 추정치를 예약(동시 시작자가 같은 잔액을 중복 사용 못 하게).
+                reserved = _INFLIGHT_RESERVE_USD
+                self._inflight_reserved += reserved
 
+        try:
+            return await self._run_role_inner(role, spec, agent, unit, key, result_path, result_rel)
+        finally:
+            if reserved:
+                async with self._budget_lock:
+                    # 음수 방지: 부동소수 오차 등으로 0 미만이 되지 않게 클램프.
+                    self._inflight_reserved = max(0.0, self._inflight_reserved - reserved)
+
+    async def _run_role_inner(self, role, spec, agent, unit, key, result_path, result_rel) -> dict:
         prompt = compose_prompt(
             role=role,
             phase=spec.phase,
@@ -153,12 +206,19 @@ class Runner:
                 if result_path.exists() and _under_results_dir(result_path, self.board):
                     result_path.unlink()  # 후보마다 직전 결과 제거 → 신선도 보장 (#25)
 
-                # 상세 로그: 보낸 프롬프트 (시스템 + 작업)
-                self.board.write_agent_block(
-                    role,
-                    f"PROMPT → [{name}]" + (f" unit={key}" if unit else ""),
-                    "[SYSTEM]\n" + agent.system_prompt + "\n\n[TASK]\n" + prompt,
-                )
+                # 상세 로그: 보낸 프롬프트 (시스템 + 작업).
+                # #3: 전체 프롬프트 본문에는 spec excerpt·PM/PL directives 등 민감 내용이 들어가
+                # .orchestrator/agents 로그에 영구 저장될 수 있다. ORCH_LOG_PROMPTS=0 으로 끄면
+                # 본문 대신 짧은 메모만 남긴다. 기본값(미설정)은 디버깅 편의를 위해 전체 기록 유지.
+                title = f"PROMPT → [{name}]" + (f" unit={key}" if unit else "")
+                if _log_prompt_bodies():
+                    body = "[SYSTEM]\n" + agent.system_prompt + "\n\n[TASK]\n" + prompt
+                else:
+                    body = (
+                        "[prompt body suppressed: ORCH_LOG_PROMPTS=0] "
+                        f"system={len(agent.system_prompt)} chars, task={len(prompt)} chars"
+                    )
+                self.board.write_agent_block(role, title, body)
                 # 후보가 예외를 던져도 다음 후보로 폴오버 (전체 role 을 죽이지 않는다)
                 try:
                     res = await self._run_with_retries(get_backend(name), req, role, key)
@@ -180,6 +240,8 @@ class Runner:
                     )
                 if res.tokens:
                     await self.board.agent_update(role, tokens_add=res.tokens)
+                if res.warning:  # 백엔드 경고(예: SDK 예산 캡 미적용)를 보드/리포트에 표면화
+                    await self.board.add_warning(f"{role} [{name}]: {res.warning}")
                 if res.ok:
                     break
                 if i < len(candidates) - 1:

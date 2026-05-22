@@ -126,8 +126,18 @@ class ClaudeSDKBackend(Backend):
         dropped: list[str] = []
         options = _make_options(ClaudeAgentOptions, dropped=dropped, **kwargs)
 
-        # #113: SDK 호환성 때문에 예산 옵션이 떨어졌으면 조용히 진행하지 말고 노트로 표면화한다.
+        # #21(#113): 사용자가 명시적으로 req.budget 을 지정했는데 설치된 SDK 가 max_budget_usd
+        # 인자를 받지 못해 떨어졌으면, 조용히 진행하지 않는다. 텍스트 노트 + 구조화된
+        # RoleResult.warning 양쪽으로 표면화해 호출자/로그/리포트에서 반드시 보이게 한다.
+        # (budget is None 인 정상 경로는 영향 없음 — budget_dropped 가 항상 False)
         budget_dropped = req.budget is not None and "max_budget_usd" in dropped
+        budget_warning = (
+            f"requested per-call budget cap ${req.budget} was NOT enforced: installed "
+            f"claude-agent-sdk rejected max_budget_usd; role ran WITHOUT a per-call cap "
+            f"(cumulative budget is still enforced by the runner)"
+            if budget_dropped
+            else None
+        )
 
         state = {"final": "", "cost": None, "model": req.model, "tokens": None}
 
@@ -178,6 +188,7 @@ class ClaudeSDKBackend(Backend):
                 cost_usd=state["cost"],
                 model=state["model"],
                 tokens=state["tokens"],
+                warning=budget_warning,
             )
         except Exception as e:
             return RoleResult(
@@ -187,6 +198,7 @@ class ClaudeSDKBackend(Backend):
                 cost_usd=state["cost"],
                 model=state["model"],
                 tokens=state["tokens"],
+                warning=budget_warning,
             )
         return RoleResult(
             ok=True,
@@ -194,4 +206,5 @@ class ClaudeSDKBackend(Backend):
             cost_usd=state["cost"],
             model=state["model"],
             tokens=state["tokens"],
+            warning=budget_warning,
         )

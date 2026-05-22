@@ -184,6 +184,16 @@ class RunConfig:
         if self.max_units is not None:
             mu = _coerce_int(self.max_units, 0)
             self.max_units = mu if mu > 0 else None  # 0/음수/이상값 → 제한 없음
+        # poll_interval 을 안전 하한으로 클램프 (#33). 웹은 poll_interval=0 을 허용하는데,
+        # 0/음수/비-숫자/이상값이 그대로 _supervise 의 asyncio.wait_for 로 들어가면 PM/PL 감독이
+        # tight busy-loop 를 돌며 CPU 를 태우고 비싼 LLM 호출을 반복한다. 0/음수는 안전 바닥(5초)
+        # 으로, 그 외 유효값은 최소 1초로 둔다(정상 큰 값은 그대로 유지).
+        try:
+            pi = float(self.poll_interval)
+        except (TypeError, ValueError):
+            pi = 20.0
+        self.poll_interval = pi if pi > 0 else 5.0
+        self.poll_interval = max(1.0, self.poll_interval)
 
     def backends_for(self, role: str) -> list[str]:
         """역할에 대한 백엔드 후보를 우선순위 순서로 반환 (폴오버용)."""

@@ -34,11 +34,12 @@ def test_gitignore_seeds_orchestrator(tmp_path: Path):
 
 
 def test_scaffold_rewrites_orchestrator_generated_claude_md(tmp_path: Path):
-    # CLAUDE.md/AGENTS.md are orchestrator-generated (embed current stack/spec), so a new
-    # run against a reused dir must (re)write them with the current content (#140/#141).
+    # An orchestrator-generated CLAUDE.md (carries the generated marker) embeds current
+    # stack/spec, so a new run against a reused dir must (re)write it with current content
+    # (#141 refresh). A stale file that still has our marker is ours → refresh it (#40).
     target = tmp_path / "proj"
     target.mkdir()
-    stale = "# stale CLAUDE.md from a previous run\n"
+    stale = "<!-- orchestrator-generated -->\n# stale CLAUDE.md from a previous run\n"
     (target / "CLAUDE.md").write_text(stale, encoding="utf-8")
 
     scaffold(target, "the current spec body", STACK)

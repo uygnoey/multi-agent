@@ -199,8 +199,9 @@ class CodexCLIBackend(Backend):
         ]
         if req.model:
             cmd += ["--model", req.model]
-        # #115/#119: codex exec 에는 per-call budget/turn-limit 플래그가 없다.
-        # req.budget / req.max_turns 강제는 이 백엔드에서 불가 — 누적 예산은 상위에서 처리한다.
+        # #23(#115)/#27(#119): codex exec 에는 per-call budget 플래그도 turn-limit 플래그도 없다
+        # (근본 제약, KEEP-DOCUMENTED). req.budget / req.max_turns 강제는 이 백엔드에서 불가 —
+        # 누적 예산은 상위 runner 가 사전 체크로 처리하고, 긴 세션은 timeout 으로만 통제된다.
         try:
             rc, out, err, timed_out = await run_subprocess(
                 cmd, str(req.cwd), req.timeout, req.live_log_path
@@ -211,8 +212,9 @@ class CodexCLIBackend(Backend):
         if timed_out:
             return RoleResult(ok=False, error=f"codex timed out after {req.timeout}s")
         if rc != 0:
-            # #43: sandbox/login/runtime 진단이 잘리지 않도록 stderr cap 을 크게(4000) 잡는다.
-            return RoleResult(ok=False, error=err.decode(errors="replace")[:4000] or f"exit {rc}")
+            # #6(#43): sandbox/login/runtime 진단의 '끝부분'(마지막 에러 컨텍스트)이 살아남도록
+            # 예전의 head 절단(err[:4000])이 아니라 tail(마지막 4000자, err[-4000:])을 보존한다.
+            return RoleResult(ok=False, error=err.decode(errors="replace")[-4000:] or f"exit {rc}")
 
         final = ""
         if out_path.exists():
