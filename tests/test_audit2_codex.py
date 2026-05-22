@@ -184,9 +184,32 @@ def test_already_fixed_43_stderr_keeps_tail_not_head(tmp_path, monkeypatch):
     assert len(res.error) == 4000
 
 
-def test_already_fixed_115_119_documented_in_source():
-    import inspect
+def test_codex_budget_and_max_turns_are_not_forwarded(tmp_path, monkeypatch):
+    captured = {}
 
-    src = inspect.getsource(codex_cli)
-    # #115 / #119: codex 백엔드는 budget/turn-limit 플래그가 없음을 주석으로 명시
-    assert "budget" in src and "max_turns" in src
+    async def fake_run(cmd, cwd, timeout, log_path=None):
+        captured["cmd"] = cmd
+        return 0, b'{"type":"turn.completed","usage":{}}\n', b"", False
+
+    monkeypatch.setattr(codex_cli, "run_subprocess", fake_run)
+    req = RoleRequest(
+        role="backend-developer",
+        phase="dev",
+        unit={"id": "U1"},
+        system_prompt="sys",
+        prompt="prompt",
+        cwd=tmp_path,
+        allowed_tools=["Read", "Write"],
+        model=None,
+        max_turns=8,
+        budget=4.2,
+        result_path=tmp_path / ".orchestrator" / "results" / "r.json",
+        result_rel=".orchestrator/results/r.json",
+        spec_text="spec",
+    )
+    res = asyncio.run(CodexCLIBackend().run_role(req))
+
+    assert res.ok is True
+    assert "--max-turns" not in captured["cmd"]
+    assert "--max-budget-usd" not in captured["cmd"]
+    assert "--budget" not in captured["cmd"]

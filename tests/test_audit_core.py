@@ -121,7 +121,7 @@ def test_runconfig_bad_int_does_not_raise(tmp_path):
     assert cfg.concurrency == 3
     assert cfg.max_attempts == 2
     assert cfg.retries == 1
-    assert cfg.max_units is None
+    assert cfg.max_units == 1
 
 
 def test_runconfig_clamps_out_of_range():
@@ -352,14 +352,30 @@ def test_render_snapshot_surfaces_failed_units():
 
 
 def test_draw_backends_has_overflow_guard():
-    # _draw_backends 가 화면 높이 경계를 검사하는지 소스 레벨로 확인 (curses 불필요).
-    import inspect
-
     from orchestrator import monitor
 
-    src = inspect.getsource(monitor._draw_backends)
-    assert "last_row" in src and "overflow" in src
-    assert "resize" in src.lower()
+    class _Screen:
+        def __init__(self):
+            self.writes = []
+
+        def getmaxyx(self):
+            return (5, 120)
+
+        def addnstr(self, y, x, text, n, attr=0):
+            self.writes.append((y, x, text[:n], attr))
+
+    old_status = monitor.backend_status
+    monitor.backend_status = lambda: [
+        {"name": f"b{i}", "ok": False, "reason": "missing"} for i in range(20)
+    ]
+    try:
+        screen = _Screen()
+        monitor._draw_backends(screen)
+    finally:
+        monitor.backend_status = old_status
+
+    rendered = "\n".join(str(w[2]) for w in screen.writes)
+    assert "resize terminal" in rendered
 
 
 # ---- #12: expose_team_agents 가 사용자 편집본을 보존 -----------------------

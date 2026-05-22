@@ -144,8 +144,8 @@ def test_add_units_exact_duplicate_raw_still_skipped(tmp_path: Path):
     b = _run(scenario())
     ids = [u["id"] for u in b.units()]
     assert ids == ["U1"]
-    # 동일 raw 중복은 충돌 경고 대상이 아님
-    assert b.snapshot().get("warnings", []) == []
+    # 동일 raw 중복은 충돌 rename 대상은 아니지만 skip 원인은 경고로 남긴다.
+    assert any("duplicate raw id" in w for w in b.snapshot().get("warnings", []))
 
 
 def test_add_units_collision_with_preexisting_id(tmp_path: Path):

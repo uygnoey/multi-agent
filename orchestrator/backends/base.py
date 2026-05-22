@@ -36,6 +36,11 @@ class _BoundedBuffer:
         self.dropped = False  # tail 유지를 위해 앞부분을 버렸는지 (디버깅/검증용)
 
     def append(self, line: bytes) -> None:
+        if len(line) > self._max:
+            line = line[-self._max :]
+            self.dropped = True
+            self._lines.clear()
+            self._size = 0
         self._lines.append(line)
         self._size += len(line)
         while self._size > self._max and len(self._lines) > 1:
@@ -82,26 +87,52 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None):
             f = None
 
     async def _pump(stream, chunks, render):
+        pending = b""
+
+        def _write_rendered(line: bytes) -> None:
+            if f is None:
+                return
+            try:
+                if render is not None:
+                    rendered = render(line)
+                    if rendered:
+                        f.write(rendered if rendered.endswith("\n") else rendered + "\n")
+                        f.flush()
+                else:
+                    f.write(line.decode(errors="replace"))
+                    f.flush()
+            except Exception:
+                pass
+
         while True:
             try:
-                line = await stream.readline()
+                data = await stream.read(65536)
             except Exception:
                 break
-            if not line:
+            if not data:
                 break
-            chunks.append(line)
-            if f is not None:
-                try:
-                    if render is not None:
-                        rendered = render(line)
-                        if rendered:
-                            f.write(rendered if rendered.endswith("\n") else rendered + "\n")
-                            f.flush()
-                    else:
-                        f.write(line.decode(errors="replace"))
+            chunks.append(data)
+            if render is None:
+                _write_rendered(data)
+                continue
+            pending += data
+            while True:
+                pos = pending.find(b"\n")
+                if pos < 0:
+                    break
+                line = pending[: pos + 1]
+                pending = pending[pos + 1 :]
+                _write_rendered(line)
+            if len(pending) > _MAX_STREAM_BYTES:
+                pending = pending[-_MAX_STREAM_BYTES:]
+                if f is not None:
+                    try:
+                        f.write("[stream line truncated]\n")
                         f.flush()
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
+        if render is not None and pending:
+            _write_rendered(pending)
 
     async def _drain_and_wait():
         # #21: stdout/stderr pump 와 proc.wait() 를 한 타임아웃 창 안에 함께 넣는다.

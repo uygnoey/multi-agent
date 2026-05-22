@@ -63,7 +63,8 @@ scaffold → init board → PM/PL continuous supervision (background)
   → Phase B:  frontend ‖ backend ‖ dba   (concurrent per unit) → dev_done
               when dev finishes, test/qa run immediately as a separate task
               (the dev slot is released → development moves to the next unit)
-  → Phase C:  test-engineer → qa   (rework within max_attempts on QA failure) → tested/done
+  → Phase C:  test-engineer → qa
+              skip QA and rework when test-engineer fails; rework within max_attempts on QA failure
   → Phase D:  cicd
   → Phase E:  docs-writer — deliverable docs (ERD, sequence, DB, API, manual, deploy, run, architecture; EN/KO)
   → done after supervisors (PM/PL) shut down gracefully   (done = the moment all agents have stopped)
@@ -85,10 +86,8 @@ pip install -e ".[all]"          # both
 > - **editable install (`pip install -e .`)** — works fully. `FRAMEWORK_ROOT` == repo root, so both dirs are read in place. **(recommended / supported)**
 > - **Docker image** — works fully. `.claude` and `templates` are COPYed to `/app`. **(supported)**
 > - **sdist** — `MANIFEST.in` includes both dirs in the archive (an install from it follows the wheel layout).
-> - **plain wheel (`pip install dev-crew-orchestrator`)** — both dirs' bytes are bundled (`[tool.setuptools.data-files]`)
->   but land under `<prefix>/share/dev-crew-orchestrator/`, which the current `FRAMEWORK_ROOT` (= site-packages) does not
->   auto-scan. Fully automatic discovery would require moving the dirs into the package + switching the loader to
->   `importlib.resources` (a code change), so **for runtime use an editable install or Docker.**
+> - **plain wheel (`pip install dev-crew-orchestrator`)** — both dirs' bytes are bundled and the
+>   runtime loader now falls back to `<prefix>/share/dev-crew-orchestrator/`, so this is supported.
 > **OpenAI backend note (#51):** the `openai-agents` extra (`[openai]`/`[all]`) must install for the
 > OpenAI Agents backend to work. That package can fail to install in some environments — verify real
 > availability with `--check`. mock and the CLI backends (claude-cli/codex) work without this extra.
@@ -191,12 +190,12 @@ python -m orchestrator --web --port 8765 --base-dir ~/agent-runs
 - **Dashboard (no clicking)**: phase · cost (`est.` on subscription) · **tokens** · units ·
   **concurrent-running count** · status (**running / done / stopped**)
 - **Agent cards**: per-role cards with model · cost · tokens · current unit + **embedded live log
-  (prompt · thinking · response streaming)**
+  (prompt · response streaming; thinking is redacted)**
 - **Stop/Rerun**: ■ Stop while running (terminates the process group); ↻ Rerun **only when stopped/done**
 - Outputs are created under `--base-dir` (default `~/agent-runs`)/`<run-id>/`
 - Reads the same data (`board.json` + `agents/<role>.log`) as the TUI, so the displays match
 - ⚠️ Real backends incur cost (subscriptions show a token-derived `est.`) — default is `mock`.
-  When exposing externally, set up auth/firewall yourself
+  When exposing externally, use `WEB_UI_TOKEN` plus firewall/TLS
 
 ## Output location (target)
 
@@ -238,8 +237,8 @@ Run the web UI in a container (mock works instantly without keys):
 
 ```bash
 docker build -t dev-crew .
-docker run --rm -p 8765:8765 -v "$PWD/runs:/data/runs" dev-crew
-# browser: http://localhost:8765
+docker run --rm -e WEB_UI_TOKEN="$(openssl rand -hex 24)" -p 8765:8765 -v "$PWD/runs:/data/runs" dev-crew
+# browser: http://localhost:8765/?token=<that token>
 
 # If the optional SDK backends ([all]: claude-agent-sdk/openai-agents) are mandatory, build in
 # hard mode — the build fails if [all] does not install (default soft mode only warns and continues):
@@ -253,11 +252,11 @@ Production notes:
   an install failure into a **build failure**.
 - **Real backends** (claude-cli/codex/openai-agents/claude-sdk) need each CLI installed/logged-in or an API key.
   Inject keys into the container with `-e OPENAI_API_KEY=… -e ANTHROPIC_API_KEY=…`, or mount the CLI auth directories.
-- ⚠️ **No auth / 0.0.0.0 exposure (#106):** the documented container command (`--host 0.0.0.0`) exposes
-  an **unauthenticated** web UI (run controls + monitoring) on **every network interface** reachable via
-  the published port. The 0.0.0.0 binding is required inside a container, but operators MUST add external
-  protection — an authenticating reverse proxy, a firewall, or loopback-only publishing
-  (`-p 127.0.0.1:8765:8765`). Do not expose it directly on an untrusted network.
+- ⚠️ **Token auth / 0.0.0.0 exposure (#106):** the container binds `--host 0.0.0.0`, so the server
+  fails closed unless `WEB_UI_TOKEN` is set. First visit `http://<host>:8765/?token=<token>`;
+  the token is stored as an HttpOnly cookie and then stripped from the URL. Still do not expose it
+  directly on an untrusted network; use an authenticating reverse proxy/TLS/firewall or loopback-only
+  publishing (`-p 127.0.0.1:8765:8765`).
 - Outputs/run state are created under `/data/runs` (volume).
 - CI: `.github/workflows/ci.yml` runs lint (`ruff check .`) + format check (`ruff format --check .`) +
   tests (`python -m pytest -q`, Python 3.10–3.12 matrix). It uses `python -m pytest` (not bare `pytest`) so the

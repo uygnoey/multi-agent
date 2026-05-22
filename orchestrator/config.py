@@ -17,6 +17,31 @@ def _coerce_int(raw, default: int) -> int:
         return default
 
 
+def _coerce_optional_positive_int(raw) -> int | None:
+    """None/0/음수는 무제한, malformed 값은 안전하게 1개로 제한."""
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, bool):
+            return 1
+        if isinstance(raw, int):
+            iv = raw
+        elif isinstance(raw, float):
+            if not math.isfinite(raw) or not raw.is_integer():
+                return 1
+            iv = int(raw)
+        elif isinstance(raw, str):
+            s = raw.strip()
+            if not re.fullmatch(r"[+-]?\d+", s):
+                return 1
+            iv = int(s)
+        else:
+            return 1
+    except Exception:
+        return 1
+    return iv if iv > 0 else None
+
+
 # 프레임워크 저장소 루트 (이 파일 = orchestrator/config.py)
 # 후방 호환을 위해 그대로 유지: 편집/소스/Docker 설치에서는 이게 곧 저장소 루트다.
 FRAMEWORK_ROOT = Path(__file__).resolve().parent.parent
@@ -104,7 +129,7 @@ class RoleSpec:
     tools: tuple[str, ...]
 
 
-# 10개 역할 (.claude/agents/*.md 의 name 과 1:1)
+# 11개 역할 (.claude/agents/*.md 의 name 과 1:1)
 ROLES: dict[str, RoleSpec] = {
     "project-manager": RoleSpec("project-manager", PHASE_SUPERVISOR, RO_TOOLS),
     "project-leader": RoleSpec("project-leader", PHASE_SUPERVISOR, RO_TOOLS),
@@ -246,8 +271,7 @@ class RunConfig:
         self.max_attempts = max(1, _coerce_int(self.max_attempts, 2))
         self.retries = max(0, _coerce_int(self.retries, 1))
         if self.max_units is not None:
-            mu = _coerce_int(self.max_units, 0)
-            self.max_units = mu if mu > 0 else None  # 0/음수/이상값 → 제한 없음
+            self.max_units = _coerce_optional_positive_int(self.max_units)
         # poll_interval 을 안전 하한으로 클램프 (#33). 웹은 poll_interval=0 을 허용하는데,
         # 0/음수/비-숫자/이상값이 그대로 _supervise 의 asyncio.wait_for 로 들어가면 PM/PL 감독이
         # tight busy-loop 를 돌며 CPU 를 태우고 비싼 LLM 호출을 반복한다. 0/음수는 안전 바닥(5초)
