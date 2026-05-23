@@ -645,10 +645,13 @@ def _make_handler(manager: RunManager, token: str | None = None):
                 return True  # 헤더 토큰 사용/토큰 미설정 — CSRF 대상 아님
             try:
                 parsed = urlparse(origin)
+                o_host = parsed.hostname
+                o_port = parsed.port
+                o_scheme = parsed.scheme
             except Exception:
                 return False
             host = self.headers.get("Host") or ""
-            return self._host_port_eq(parsed.hostname, parsed.port, parsed.scheme, host)
+            return self._host_port_eq(o_host, o_port, o_scheme, host)
 
         @staticmethod
         def _host_port_eq(o_host, o_port, o_scheme: str, host_header: str) -> bool:

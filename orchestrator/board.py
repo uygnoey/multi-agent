@@ -500,7 +500,7 @@ class Board:
             f.write(f"\n{bar}\n{time.strftime('%H:%M:%S')} {title}\n{bar}\n{body}\n")
 
     def agents(self) -> dict:
-        return json.loads(json.dumps(self._data.get("agents", {})))
+        return json.loads(json.dumps(self._data.get("agents", {}), default=str))
 
     def agent_log_tail(self, role: str, n: int = 200) -> str:
         # 쓰기 경로와 동일하게 안전화된 파일명을 사용해 일관되게 읽기
@@ -653,7 +653,7 @@ class Board:
         return [copy.deepcopy(u) for u in self._data.get("units", [])]
 
     def snapshot(self) -> dict:
-        return json.loads(json.dumps(self._data, ensure_ascii=False))
+        return json.loads(json.dumps(self._data, ensure_ascii=False, default=str))
 
     # ---- logs / directives ----
     async def log_event(self, who: str, msg: str) -> None:

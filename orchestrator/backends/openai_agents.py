@@ -12,6 +12,7 @@ pip install openai-agents / 인증 OPENAI_API_KEY.
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import re
 import signal
@@ -435,6 +436,49 @@ def _resolve_under_root(p, root) -> bool:
     return real_p == real_root or real_root in real_p.parents
 
 
+def _is_eloop(err: OSError) -> bool:
+    return getattr(err, "errno", None) == errno.ELOOP
+
+
+def _symlink_target_under_root(p: Path, root: Path) -> Path | None:
+    """Return the fully resolved target if a final symlink still points inside root."""
+    try:
+        target = Path(os.path.realpath(str(p)))
+        real_root = Path(os.path.realpath(str(root)))
+    except Exception:
+        return None
+    if target == real_root or real_root in target.parents:
+        return target
+    return None
+
+
+def _open_inside(path: Path, root: Path, flags: int, mode: int = 0o644) -> int:
+    """Open path with O_NOFOLLOW; if it is an internal symlink, open its resolved target."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        return os.open(str(path), flags | nofollow, mode)
+    except OSError as e:
+        if not _is_eloop(e):
+            raise
+        target = _symlink_target_under_root(path, root)
+        if target is None:
+            raise
+        return os.open(str(target), flags | nofollow, mode)
+
+
+def _read_file_bytes_under_root(path: Path, root: Path, max_bytes: int) -> bytes:
+    fd = _open_inside(path, root, os.O_RDONLY)
+    with os.fdopen(fd, "rb") as fh:
+        return fh.read(max_bytes + 1)
+
+
+def _write_file_bytes_under_root(path: Path, root: Path, data: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = _open_inside(path, root, flags, 0o644)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+
+
 def _resolve_tools(requested, tool_map: dict, read_list_fallback: list) -> list:
     """#2(audit7): 역할의 allowed_tools → 실제 노출할 툴 리스트로 해석한다 (순수 함수, SDK 불필요).
 
@@ -510,16 +554,10 @@ class OpenAIAgentsBackend(Backend):
             # 바이트 단위로 max_read_bytes+1 까지만 읽어, 초과 여부를 비싸지 않게 판정한다.
             # #1(audit7): O_NOFOLLOW 로 최종 컴포넌트가 symlink 면 open 자체를 거부(TOCTOU 차단).
             try:
-                fd = os.open(str(p), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-                try:
-                    with os.fdopen(fd, "rb") as fh:
-                        raw = fh.read(max_read_bytes + 1)
-                except BaseException:
-                    os.close(fd)
-                    raise
+                raw = _read_file_bytes_under_root(p, root, max_read_bytes)
             except OSError as e:
                 # ELOOP: 최종 컴포넌트가 symlink → 명시적 거부 메시지.
-                if getattr(e, "errno", None) == 62 or "symbolic" in str(e).lower():
+                if _is_eloop(e):
                     return f"<path escapes project dir (symlink): {path}>"
                 return f"<read error: {path}: {e}>"
             except Exception as e:
@@ -551,18 +589,11 @@ class OpenAIAgentsBackend(Backend):
                 #   재지정될 수 있으므로, 부모 디렉터리 생성 직후 realpath 를 다시 검사한다.
                 if not _resolve_under_root(p, root):
                     return f"<path escapes project dir: {path}>"
-                # #1(audit7): O_NOFOLLOW 로 최종 컴포넌트가 symlink 면 open 거부(TOCTOU 차단).
+                # #1(audit7): O_NOFOLLOW + 내부 symlink target open 으로 TOCTOU 탈출 차단.
                 data = content.encode("utf-8")
-                flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-                fd = os.open(str(p), flags, 0o644)
-                try:
-                    with os.fdopen(fd, "wb") as fh:
-                        fh.write(data)
-                except BaseException:
-                    os.close(fd)
-                    raise
+                _write_file_bytes_under_root(p, root, data)
             except OSError as e:
-                if getattr(e, "errno", None) == 62 or "symbolic" in str(e).lower():
+                if _is_eloop(e):
                     return f"<path escapes project dir (symlink): {path}>"
                 return f"<write error: {path}: {e}>"
             except Exception as e:
@@ -598,7 +629,12 @@ class OpenAIAgentsBackend(Backend):
                     f"({size} > {_MAX_EDIT_BYTES} bytes); use write_file>"
                 )
             try:
-                content = p.read_text(encoding="utf-8")
+                raw = _read_file_bytes_under_root(p, root, _MAX_EDIT_BYTES)
+                content = raw.decode("utf-8")
+            except OSError as e:
+                if _is_eloop(e):
+                    return f"<path escapes project dir (symlink): {path}>"
+                return f"<read error: {path}: {e}>"
             except Exception as e:
                 return f"<read error: {path}: {e}>"
             try:
@@ -614,16 +650,9 @@ class OpenAIAgentsBackend(Backend):
                 if not _resolve_under_root(p, root):
                     return f"<path escapes project dir: {path}>"
                 data = updated.encode("utf-8")
-                flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-                fd = os.open(str(p), flags, 0o644)
-                try:
-                    with os.fdopen(fd, "wb") as fh:
-                        fh.write(data)
-                except BaseException:
-                    os.close(fd)
-                    raise
+                _write_file_bytes_under_root(p, root, data)
             except OSError as e:
-                if getattr(e, "errno", None) == 62 or "symbolic" in str(e).lower():
+                if _is_eloop(e):
                     return f"<path escapes project dir (symlink): {path}>"
                 return f"<write error: {path}: {e}>"
             except Exception as e:

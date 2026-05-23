@@ -126,7 +126,13 @@ class Scheduler:
                     "scheduler", "architect produced no units; falling back to single core unit"
                 )
                 await self.board.add_units([{"id": "U1", "title": "core", "roles": DEV_ROLES}])
-            await self._checkpoint("orchestrator: design work units")
+            design_paths = [
+                p
+                for o in design_outcomes
+                if not isinstance(o, Exception) and o.get("_ok", True)
+                for p in o.get("artifacts", [])
+            ]
+            await self._checkpoint("orchestrator: design work units", design_paths)
 
             # Phase B/C — unit별 동시 개발 + 완료 시 테스트 트리거
             unit_list = self.board.units()
@@ -205,7 +211,7 @@ class Scheduler:
             await self.board.add_global_artifacts(cicd_out.get("artifacts", []))
             if not cicd_out.get("_ok", True):
                 await self.board.add_warning("cicd failed (배포 파이프라인 산출물 미완)")
-            await self._checkpoint("orchestrator: cicd artifacts")
+            await self._checkpoint("orchestrator: cicd artifacts", cicd_out.get("artifacts", []))
 
             # Phase E — 문서화: 실행 가이드(EN/KO) + 개발 산출물(EN/KO)
             await self.board.set_phase("docs")
@@ -215,8 +221,11 @@ class Scheduler:
             if not docs_out.get("_ok", True):
                 await self.board.add_warning("docs-writer failed (산출물 문서 미완)")
             # 보드 기반 산출물 문서는 백엔드와 무관하게 항상 EN/KO 생성
-            await self.board.add_global_artifacts(self.board.write_deliverables())
-            await self._checkpoint("orchestrator: docs artifacts")
+            deliverables = self.board.write_deliverables()
+            await self.board.add_global_artifacts(deliverables)
+            await self._checkpoint(
+                "orchestrator: docs artifacts", [*docs_out.get("artifacts", []), *deliverables]
+            )
 
             # 모든 작업 완료 → 감독(PM/PL)을 graceful 종료(현재 tick 끝까지 대기, 취소 X).
             # 감독이 다 멈춘 뒤에야 done — done 시점엔 어떤 에이전트도 돌고 있지 않다.
@@ -246,8 +255,8 @@ class Scheduler:
 
         return self.board.snapshot()
 
-    async def _checkpoint(self, message: str) -> None:
-        committed, detail = await self.git.checkpoint(message)
+    async def _checkpoint(self, message: str, paths: list[str] | None = None) -> None:
+        committed, detail = await self.git.checkpoint(message, paths)
         if committed:
             await self.board.log_event("git", f"checkpoint {detail}: {message}")
         elif detail not in ("disabled", "no changes"):
@@ -312,7 +321,13 @@ class Scheduler:
                 await self.board.add_warning(f"{uid}: 개발(dev) 실패 → blocked")
                 return False
             await self.board.set_status(uid, DEV_DONE)
-            await self._checkpoint(f"orchestrator: {uid} dev attempt {attempt}")
+            dev_paths = [
+                p
+                for o in dev_outcomes
+                if not isinstance(o, Exception) and o.get("_ok", True)
+                for p in o.get("artifacts", [])
+            ]
+            await self._checkpoint(f"orchestrator: {uid} dev attempt {attempt}", dev_paths)
             return True
 
     async def _test_unit_safe(self, unit: dict, sem: asyncio.Semaphore) -> None:
@@ -352,7 +367,8 @@ class Scheduler:
         rework = False  # 블록 밖에서 재작업할지 여부 ('fail + 시도 남음')
         async with self._test_sem:
             te = await self.runner.run_role("test-engineer", unit)
-            await self.board.add_artifacts(uid, te.get("artifacts", []))
+            test_paths = list(te.get("artifacts", []))
+            await self.board.add_artifacts(uid, test_paths)
 
             # #18: test-engineer(테스트 작성)가 실패하면 그 산출물 위에서 qa 비용을 쓰지 않는다.
             #      미통과로 표시하고, 시도가 남았으면 dev 부터 재작업해 '고쳐서' 다시 검증한다
@@ -368,13 +384,16 @@ class Scheduler:
                     return
             else:
                 qa = await self.runner.run_role("qa", unit)
-                await self.board.add_artifacts(uid, qa.get("artifacts", []))
+                qa_paths = list(qa.get("artifacts", []))
+                await self.board.add_artifacts(uid, qa_paths)
                 # test-engineer 가 성공한 경우에만 qa 를 돌렸으므로, 통과 판정은 qa 결과만 본다.
                 passed = qa.get("_ok", True) and qa.get("status") != "failed"
                 await self.board.set_test_status(uid, "pass" if passed else "fail")
                 if passed:
                     await self.board.set_status(uid, DONE)
-                    await self._checkpoint(f"orchestrator: {uid} verified")
+                    await self._checkpoint(
+                        f"orchestrator: {uid} verified", [*test_paths, *qa_paths]
+                    )
                     return
                 if attempt < self.cfg.max_attempts:
                     rework = True
