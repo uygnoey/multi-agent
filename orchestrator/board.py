@@ -258,6 +258,11 @@ class Board:
             # 이번 호출에서 본 raw id(문자열화) 집합: 동일 raw 의 재투입은 진짜 중복 → skip.
             # str() 로 키를 만들어 dict/list/숫자 같은 비정상 입력에도 해시 안전하다.
             seen_raw: set[str] = set()
+            # id_map: dep 해석용 raw/canonical id → '최종' id 매핑. 기존 unit 은 항등 매핑 seed.
+            # (충돌-rename 으로 둘째 unit 이 U-1-2 가 돼도, 그 unit 을 가리키는 dep 가 첫 unit
+            #  (U-1)에 잘못 묶이지 않도록 raw id 까지 최종 id 로 정확히 remap.)
+            id_map: dict[str, str] = {e: e for e in existing}
+            accepted: list[tuple[str, dict]] = []  # 1차에서 확정된 (최종 id, 원본 unit)
             for u in units:
                 raw_id = u.get("id")
                 raw_key = str(raw_id)
@@ -292,10 +297,23 @@ class Board:
                     uid = new_uid
                 existing.add(uid)
                 added += 1
-                # deps/roles 정규화: list→문자열들, scalar→[scalar], dict/None→[] (이상값 방어)
-                # deps 도 unit id 와 동일하게 _safe_unit_id 로 안전화해야 sanitize 된
-                # id("U/1"→"U-1")와 매칭됨. 안전화 후 빈 항목은 drop.
-                deps = [d for d in (_safe_unit_id(x) for x in _norm_str_list(u.get("deps"))) if d]
+                # raw id·최종 id 둘 다로 이 unit 을 찾게 한다(canonical 키는 첫 소유자 우선).
+                id_map.setdefault(raw_key, uid)
+                id_map.setdefault(uid, uid)
+                accepted.append((uid, u))
+            # 2차: 모든 최종 id 가 확정된 뒤 deps 를 해석한다(앞/뒤 순서·충돌-rename 무관하게 정확).
+            for uid, u in accepted:
+                # deps/roles 정규화: list→문자열들, scalar→[scalar], dict/None→[] (이상값 방어).
+                # dep 해석 우선순위: ① raw/최종 id 정확 매치 → ② canonical(_safe_unit_id) 매치 →
+                # ③ 알 수 없는 dep 는 기존처럼 _safe_unit_id 결과로 보존. 빈 항목은 drop.
+                deps = [
+                    r
+                    for r in (
+                        id_map.get(str(x)) or id_map.get(_safe_unit_id(x)) or _safe_unit_id(x)
+                        for x in _norm_str_list(u.get("deps"))
+                    )
+                    if r
+                ]
                 roles_raw = _norm_str_list(u.get("roles"))
                 self._data["units"].append(
                     {

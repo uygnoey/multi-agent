@@ -12,6 +12,7 @@ TUI(monitor.py)와 동일한 데이터 소스(`<project-dir>/.orchestrator/board
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import json
 import math
@@ -25,7 +26,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from .backends import backend_status, resolve
 from .board import _tail_lines
@@ -34,14 +35,18 @@ from .monitor import _read_agent_log, _read_board
 
 MAX_BODY_BYTES = 4 * 1024 * 1024  # 요청 바디 상한 (메모리 고갈 방지)
 MAX_SPEC_BYTES = 1024 * 1024  # 기획서 텍스트 상한
-_COOKIE_VALUE_RE = re.compile(r"^[A-Za-z0-9._~+/=-]+$")
 
 
 def _token_equal(provided: str, expected: str) -> bool:
-    try:
-        return bool(provided) and hmac.compare_digest(provided, expected)
-    except TypeError:
+    # hmac.compare_digest 는 non-ascii str 을 거부한다(공백/특수문자는 OK 지만 한글 등은 TypeError).
+    # 따라서 원문을 직접 비교하지 않고 UTF-8 바이트의 SHA-256 다이제스트를 상수시간 비교한다.
+    # 다이제스트는 항상 같은 길이라 compare_digest 의 상수시간 보장이 유지되고, non-ascii 토큰도
+    # 안전하게 인증된다(예전엔 non-ascii WEB_UI_TOKEN 이 무조건 인증 실패했음).
+    if not provided or not expected:
         return False
+    p = hashlib.sha256(provided.encode("utf-8")).digest()
+    e = hashlib.sha256(expected.encode("utf-8")).digest()
+    return hmac.compare_digest(p, e)
 
 
 def _read_events(orch_dir, n: int = 300) -> str:
@@ -587,7 +592,8 @@ def _make_handler(manager: RunManager, token: str | None = None):
             for part in (self.headers.get("Cookie", "") or "").split(";"):
                 k, _, val = part.strip().partition("=")
                 if k == "token" and val:
-                    return val
+                    # 쿠키 값은 set 시 percent-encode 되므로 비교 전에 원복한다(아무 토큰이나 round-trip).
+                    return unquote(val)
             return ""
 
         def _authed(self) -> bool:
@@ -699,11 +705,13 @@ def _make_handler(manager: RunManager, token: str | None = None):
                 extra = None
                 if auth_token:
                     qt = (q.get("token") or [""])[0]
-                    if _token_equal(qt, auth_token) and _COOKIE_VALUE_RE.fullmatch(qt):
+                    if _token_equal(qt, auth_token):
                         # #10: HttpOnly 로 JS/XSS 의 쿠키 탈취를 막고 SameSite=Strict 로 cross-site
                         #      전송을 차단한다. TLS 종단 프록시가 X-Forwarded-Proto=https 를 주면
-                        #      Secure 도 붙인다.
-                        extra = [("Set-Cookie", f"token={qt}; {self._cookie_attrs()}")]
+                        #      Secure 도 붙인다. 토큰에 쿠키-불가 문자(공백/;/non-ascii)가 있어도
+                        #      percent-encode 해 항상 유효한 쿠키로 심는다(=불가문자 시 401 루프 방지).
+                        cookie_val = quote(qt, safe="")
+                        extra = [("Set-Cookie", f"token={cookie_val}; {self._cookie_attrs()}")]
                         # query token 은 브라우저 히스토리/리퍼러에 남을 수 있으므로 쿠키 설정 즉시
                         # 깨끗한 URL 로 이동시킨다. API 토큰 인증은 그대로 유지된다.
                         self._redirect("/", extra)

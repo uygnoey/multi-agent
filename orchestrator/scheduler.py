@@ -80,6 +80,9 @@ class Scheduler:
 
         # 상시 감독 (백그라운드 태스크)
         sup_tasks = [asyncio.create_task(self._supervise(r)) for r in SUPERVISOR_ROLES]
+        # test/qa 백그라운드 태스크. finally 에서 정리해야 하므로 try 밖에서 미리 바인딩한다
+        # (try 안에서 예외가 gather 도달 전에 나도 finally 가 NameError 없이 정리 가능).
+        test_tasks: list[asyncio.Task] = []
 
         try:
             # Phase A — 설계 + 테스트시트 병렬
@@ -153,7 +156,6 @@ class Scheduler:
                 f"Phase B/C: {len(unit_list)} unit(s), concurrency={self.cfg.concurrency}",
             )
             sem = asyncio.Semaphore(max(1, self.cfg.concurrency))  # 0/음수면 hang → 최소 1
-            test_tasks: list[asyncio.Task] = []
 
             async def pipeline(unit: dict) -> None:
                 uid = unit["id"]
@@ -239,10 +241,14 @@ class Scheduler:
             await self.board.set_phase("failed" if still_broken else "done")
         finally:
             self._stop.set()
-            for t in sup_tasks:
+            # sup_tasks 뿐 아니라 test/qa 백그라운드(test_tasks)도 반드시 정리한다. 정상
+            # 경로에선 test_tasks 가 위에서 await 완료돼 cancel 이 무해하나, gather 도달 전
+            # 예외/외부 cancel 경로에선 정리 안 하면 고아 태스크가 report 이후 board 를 mutate.
+            pending = [*sup_tasks, *test_tasks]
+            for t in pending:
                 t.cancel()
-            if sup_tasks:
-                await asyncio.gather(*sup_tasks, return_exceptions=True)
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
             # (예외 경로 등) running 으로 남은 에이전트 정리
             for role, a in self.board.agents().items():
                 if a.get("status") == "running":

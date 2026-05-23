@@ -363,20 +363,47 @@ def _num(value, fallback: float = 0.0) -> float:
     return result
 
 
+def _coerce_board_schema(data: dict) -> dict:
+    """손상/비정상 타입의 board 필드를 안전한 기본형으로 보정한다(소비자 크래시 방지).
+
+    board.json 은 외부(에이전트/디스크)에서 갱신되므로 agents 가 dict 가 아니거나 units/
+    artifacts 가 list 가 아닌 손상 상태가 들어올 수 있다. webui(/api/state·/api/agent)와
+    monitor(render_snapshot·TUI detail/list·artifacts) 가 .values()/.get()/iter 로 접근하므로
+    여기서 한 번 보정해 AttributeError/TypeError 크래시를 막는다.
+    """
+    if not isinstance(data.get("agents", {}), dict):
+        data["agents"] = {}
+    raw_units = data.get("units")
+    if raw_units is not None and not isinstance(raw_units, list):
+        data["units"] = []
+    elif isinstance(raw_units, list):
+        units = [u for u in raw_units if isinstance(u, dict)]
+        for u in units:
+            if not isinstance(u.get("artifacts", []), list):
+                u["artifacts"] = []
+        data["units"] = units
+    if not isinstance(data.get("artifacts", []), list):
+        data["artifacts"] = []
+    return data
+
+
 def _read_board(orch_dir: Path) -> dict:
     """board.json 을 읽는다. 파일 없음과 손상을 구분한다 (#70).
 
     - 파일 없음(아직 run 시작 전): {}  → 대기 화면
     - 파일은 있으나 파싱 불가(상태 손상): {"_corrupt": True}  → 명확한 손상 표시
+    - 파싱은 되지만 필드 타입이 손상된 경우: _coerce_board_schema 로 안전 보정.
     """
     p = orch_dir / "board.json"
     if not p.exists():
         return {}
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {"_corrupt": True}
     except Exception:
         return {"_corrupt": True}
+    if not isinstance(data, dict):
+        return {"_corrupt": True}
+    return _coerce_board_schema(data)
 
 
 def _read_agent_log(orch_dir: Path, role: str, n: int = 500) -> str:
@@ -592,7 +619,7 @@ def _draw_artifacts(stdscr, board: dict, orch_dir: Path, scroll: int) -> int:
     for u in units:
         arts = u.get("artifacts", [])
         if arts:
-            body.append(f"[ {u['id']} — {u.get('title', '')} ]  ({u.get('status')})")
+            body.append(f"[ {u.get('id', '?')} — {u.get('title', '')} ]  ({u.get('status')})")
             body += [f"  {proj}/{a}" for a in arts]
             body.append("")
     if len(body) <= 2:
