@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .config import AGENTS_DIR, DEV_TOOLS
+from .config import AGENTS_DIR, DEV_TOOLS, ROLES
 
 
 @dataclass
@@ -64,7 +64,12 @@ def _as_tools(value) -> list[str]:
 def load_agent(role: str) -> AgentDef:
     path = AGENTS_DIR / f"{role}.md"
     if not path.exists():
-        return AgentDef(role, role, list(DEV_TOOLS), None, f"You are the {role} agent.")
+        # fail-open 방지: 정의 파일이 없을 때 무조건 DEV_TOOLS(Read·Write·Edit·Bash)를 주면
+        # read-only 여야 할 supervisor(PM/PL = RO_TOOLS)가 쓰기/실행 권한을 얻는 권한 상승이 된다
+        # (패키징 누락 등으로 .md 가 없을 때). 역할이 ROLES 에 정의돼 있으면 그 역할이 선언한
+        # tools 를 폴백으로 쓰고(= supervisor 는 RO_TOOLS), 모르는 역할만 DEV_TOOLS 로 둔다.
+        default_tools = list(ROLES[role].tools) if role in ROLES else list(DEV_TOOLS)
+        return AgentDef(role, role, default_tools, None, f"You are the {role} agent.")
     fm, body = _split_frontmatter(path.read_text(encoding="utf-8"))
     meta = _parse_meta(fm)
     tools = _as_tools(meta.get("tools"))
