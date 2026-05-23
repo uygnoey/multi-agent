@@ -121,7 +121,8 @@ python -m orchestrator --spec examples/specs/sample-spec.md --project-dir /tmp/d
 | `--distribute` | 역할들을 풀에 라운드로빈 **분산**(4종 동시 가동) |
 | `--cross-check` | 역할을 풀에 **번갈아 교차** 배정(핀한 역할은 그대로) → 두 모델이 섞여 상호 검증 |
 | `--role-backend ROLE=B1[,B2,...]` | 역할별 백엔드(우선순위 리스트) override (반복 가능) |
-| `--delegate` | 역할 세션이 팀원을 네이티브 서브에이전트로 위임 호출 (Claude 백엔드) |
+| `--delegate` | 역할 세션에 팀원 위임 맥락 제공. Claude는 네이티브 Task, Codex는 별도 역할 세션 협업 컨텍스트 |
+| `--full-access` | 백엔드에 머신 전체 권한 허용. 기본은 프로젝트 폴더 workspace 권한 |
 | `--mock` | 모든 역할을 mock 으로 (무비용) |
 | `--concurrency N` | 동시 처리 unit 수 (기본 3) |
 | `--max-units N` | 처리할 unit 수 상한 |
@@ -207,6 +208,8 @@ python -m orchestrator --web --port 8765 --base-dir ~/agent-runs
 - **웹 보안**: 경로 traversal 차단(run id 를 base_dir 로 한정·role 검증), 요청 바디 크기 상한
 - **결과 계약**: 감독(PM/PL) 외 역할은 결과 JSON 미작성/깨짐을 실패로 처리(성공 오탐 방지)
 - 세션별 `max_turns`·예산, 전역 동시성 세마포어, `--max-units`, 경로 스코프(타깃 cwd 한정)
+- `codex` 기본 실행은 `--sandbox workspace-write`로 프로젝트 workspace 권한을 쓰고,
+  `--full-access`를 명시할 때만 `danger-full-access`를 전달한다.
 - ⚠️ `openai-agents` 백엔드의 `run_bash`(shell)는 cwd 만 타깃일 뿐 FS 경계를 강제하지 않는다
   (allowed_tools 로 Bash 권한 역할만 노출). 강한 격리가 필요하면 **Docker 컨테이너**로 실행할 것
 - ⚠️ **의존성-설치 금지 = 프롬프트 한정(#48)**: 템플릿(`CLAUDE.md`/`AGENTS.md`)은 "의존성 설치/번들

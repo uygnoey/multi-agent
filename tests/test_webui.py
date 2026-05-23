@@ -23,11 +23,12 @@ def test_build_command_flags():
             "concurrency": 4,
             "mock": True,
             "delegate": True,
+            "full_access": True,
             "max_units": 2,
             "max_attempts": 3,
         },
     )
-    assert "--mock" in cmd and "--delegate" in cmd
+    assert "--mock" in cmd and "--delegate" in cmd and "--full-access" in cmd
     assert cmd[cmd.index("--backend") + 1] == "claude-cli"
     assert cmd[cmd.index("--max-units") + 1] == "2"
     assert cmd[cmd.index("--concurrency") + 1] == "4"

@@ -237,8 +237,9 @@ def test_codex_removes_transcript_and_sums_usage(tmp_path, monkeypatch):
     captured = {}
 
     async def fake_run(cmd, cwd, timeout, log_path=None):
-        captured["out_path"] = Path(cmd[cmd.index("-o") + 1])
-        captured["out_path"].write_text("transcript", encoding="utf-8")
+        captured["cmd"] = cmd
+        captured["out_path"] = Path(cmd[cmd.index("--output-last-message") + 1])
+        captured["out_path"].write_text("final answer", encoding="utf-8")
         out = (
             b'{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}\n'
             b'{"type":"turn.completed","usage":{"input_tokens":3,"cached_input_tokens":1,"output_tokens":4}}\n'
@@ -266,4 +267,37 @@ def test_codex_removes_transcript_and_sums_usage(tmp_path, monkeypatch):
     res = asyncio.run(CodexCLIBackend().run_role(req))
     assert res.ok is True
     assert res.tokens == 10
+    assert res.final_message == "final answer"
+    assert "--output-last-message" in captured["cmd"]
     assert not captured["out_path"].exists()
+
+
+def test_codex_full_access_uses_danger_sandbox(tmp_path, monkeypatch):
+    captured = {}
+
+    async def fake_run(cmd, cwd, timeout, log_path=None):
+        captured["cmd"] = cmd
+        return 0, b'{"type":"turn.completed","usage":{}}\n', b"", False
+
+    import orchestrator.backends.codex_cli as codex_cli
+
+    monkeypatch.setattr(codex_cli, "run_subprocess", fake_run)
+    req = RoleRequest(
+        role="backend-developer",
+        phase="dev",
+        unit={},
+        system_prompt="sys",
+        prompt="prompt",
+        cwd=tmp_path,
+        allowed_tools=[],
+        model="gpt-5.5",
+        max_turns=1,
+        budget=None,
+        result_path=tmp_path / ".orchestrator" / "results" / "r.json",
+        result_rel=".orchestrator/results/r.json",
+        spec_text="spec",
+        full_access=True,
+    )
+    res = asyncio.run(CodexCLIBackend().run_role(req))
+    assert res.ok is True
+    assert captured["cmd"][captured["cmd"].index("--sandbox") + 1] == "danger-full-access"

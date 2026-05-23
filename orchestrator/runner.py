@@ -95,9 +95,11 @@ class Runner:
 
     def _build_req(self, role, spec, unit, agent, prompt, result_path, result_rel, backend_name):
         allowed_tools = agent.tools or list(spec.tools)
-        delegate = self.cfg.delegate and backend_name in DELEGATION_CAPABLE
+        delegate = self.cfg.delegate and (
+            backend_name in DELEGATION_CAPABLE or backend_name == "codex"
+        )
         teammates = self._build_teammates(role) if delegate else []
-        if delegate and DELEGATION_TOOL not in allowed_tools:
+        if delegate and backend_name in DELEGATION_CAPABLE and DELEGATION_TOOL not in allowed_tools:
             allowed_tools = [*allowed_tools, DELEGATION_TOOL]
         # cfg 모델 미지정 시 frontmatter 의 per-agent model 을 fallback 으로 사용 (#93/#94).
         # agent.model 은 load_agent 에서 이미 'inherit'→None 정규화됨.
@@ -119,6 +121,7 @@ class Runner:
             timeout=self.cfg.session_timeout,
             live_log_path=self.board.agents_dir / f"{role}.log",
             delegate=delegate,
+            full_access=self.cfg.full_access,
             teammates=teammates,
         )
 

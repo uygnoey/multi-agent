@@ -247,6 +247,8 @@ class RoleRequest:
     timeout: float | None = None  # 백엔드 호출(서브프로세스/세션) 최대 시간(초)
     live_log_path: Path | None = None  # 실시간 스트리밍 로그 파일 (per-agent)
     delegate: bool = False
+    # True면 백엔드가 제공하는 machine-wide 권한 모드 사용. 기본은 project workspace 권한.
+    full_access: bool = False
     # 위임 가능 팀원 정의: [{name, description, prompt, tools, model}]
     teammates: list[dict] = field(default_factory=list)
 

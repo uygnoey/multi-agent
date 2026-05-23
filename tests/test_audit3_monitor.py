@@ -60,7 +60,9 @@ def test_is_zombie_returns_false_for_self():
 
 
 def test_rerun_argv_allows_known_flags():
-    ok, _ = _validate_rerun_argv(["--spec", "spec.md", "--project-dir", "out", "--mock"])
+    ok, _ = _validate_rerun_argv(
+        ["--spec", "spec.md", "--project-dir", "out", "--mock", "--full-access"]
+    )
     assert ok is True
 
 

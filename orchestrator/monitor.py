@@ -257,6 +257,7 @@ _STORE_TRUE_RERUN_FLAGS = frozenset(
         "--distribute",
         "--cross-check",
         "--delegate",
+        "--full-access",
         "--mock",
     }
 )

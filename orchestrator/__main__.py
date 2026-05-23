@@ -86,7 +86,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument(
         "--delegate",
         action="store_true",
-        help="역할 세션이 팀원을 네이티브 서브에이전트로 위임 호출 (Claude 백엔드)",
+        help="역할 세션에 팀원 위임 맥락을 제공 (Claude=네이티브 Task, Codex=협업 프롬프트)",
+    )
+    p.add_argument(
+        "--full-access",
+        action="store_true",
+        help="백엔드에 머신 전체 권한을 허용 (기본은 프로젝트 폴더 workspace 권한)",
     )
     p.add_argument("--max-attempts", type=int, default=2, help="unit별 dev→test→qa 재작업 횟수")
     p.add_argument("--retries", type=int, default=1, help="역할 호출 전이성 실패 재시도 횟수")
@@ -183,6 +188,7 @@ def build_config(a: argparse.Namespace) -> RunConfig:
         poll_interval=a.poll_interval,
         mock=a.mock,
         delegate=a.delegate,
+        full_access=a.full_access,
         max_attempts=a.max_attempts,
         retries=a.retries,
         session_timeout=(a.timeout if a.timeout and a.timeout > 0 else None),

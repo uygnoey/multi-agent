@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from orchestrator.agents import _norm_model
+from orchestrator.agents import AgentDef, _norm_model
 from orchestrator.backends.base import RoleResult
 from orchestrator.board import Board
 from orchestrator.config import RO_TOOLS, ROLES, RunConfig
@@ -285,6 +285,22 @@ def test_build_teammates_inherit_becomes_none(tmp_path, sample_spec_path):
     assert mates  # backend-developer → dba teammate
     for m in mates:
         assert m["model"] is None  # 'inherit' 가 모델명으로 새지 않음
+
+
+def test_codex_delegate_passes_teammates_without_task_tool(tmp_path, sample_spec_path):
+    cfg = _cfg(tmp_path, sample_spec_path, delegate=True, full_access=True)
+    board = Board(cfg.project_dir)
+    asyncio.run(board.init("s", {}))
+    runner = Runner(cfg, board)
+    spec = ROLES["backend-developer"]
+    agent = AgentDef("backend-developer", "d", list(spec.tools), None, "sys")
+    req = runner._build_req(
+        "backend-developer", spec, {"id": "U1"}, agent, "p", Path("r"), "r", "codex"
+    )
+    assert req.delegate is True
+    assert req.teammates
+    assert "Task" not in req.allowed_tools
+    assert req.full_access is True
 
 
 # ---- #112: 누적 예산 enforcement (모든 백엔드 공통) -------------------------

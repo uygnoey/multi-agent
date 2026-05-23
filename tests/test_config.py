@@ -43,6 +43,7 @@ def test_runconfig_defaults():
     assert cfg.poll_interval == 20.0
     assert cfg.mock is False
     assert cfg.delegate is False
+    assert cfg.full_access is False
     assert cfg.max_attempts == 2
     assert cfg.retries == 1
 

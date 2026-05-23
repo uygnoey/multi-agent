@@ -165,6 +165,95 @@ def codex_cost(model: str, input_tokens: int, cached_input_tokens: int, output_t
     return round(cost, 6)
 
 
+def _coerce_usage_value(value) -> int | None:
+    try:
+        iv = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0, iv)
+
+
+def _usage_from_jsonl(out: bytes) -> dict[str, int]:
+    """Sum Codex per-turn usage events from ``codex exec --json``.
+
+    Current Codex JSON streams expose per-turn usage on each ``turn.completed``
+    event. GitHub/openai-codex issue threads from the Codex maintainers and
+    users describe the shape as per-turn usage, so summing completed turns is
+    the least surprising accounting for a multi-turn exec session.
+    """
+    usage: dict[str, int] = {}
+    for line in out.splitlines():
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        if o.get("type") != "turn.completed" or not isinstance(o.get("usage"), dict):
+            continue
+        for k, v in o["usage"].items():
+            iv = _coerce_usage_value(v)
+            if iv is None:
+                continue
+            usage[k] = usage.get(k, 0) + iv
+    return usage
+
+
+def _visible_tokens(usage: dict[str, int]) -> int | None:
+    if usage.get("total_tokens"):
+        return usage["total_tokens"]
+    total = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+    return total or None
+
+
+def _read_last_message(path: Path, max_chars: int = 8000) -> str:
+    """Read Codex ``--output-last-message`` output with a bounded in-memory cap."""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read(max_chars + 1)
+    except Exception:
+        return ""
+    if len(text) > max_chars:
+        return text[:max_chars].rstrip() + "\n<... final message truncated>"
+    return text
+
+
+def _codex_teammate_context(req: RoleRequest) -> str:
+    if not req.delegate or not req.teammates:
+        return ""
+    lines = [
+        "## Codex collaboration context",
+        "This Codex CLI version has no native Task/subagent tool. The orchestrator runs",
+        "roles as separate Codex sessions and shares state through .orchestrator artifacts.",
+        "Use these teammate definitions as coordination context; do not claim you directly",
+        "called a teammate. If another role must act, write clear notes/blockers/artifacts",
+        "in your required result JSON so the orchestrator can schedule or surface it.",
+        "",
+        "Available teammate roles:",
+    ]
+    for t in req.teammates:
+        tools = ", ".join(str(x) for x in t.get("tools") or [])
+        desc = str(t.get("description") or "").strip()
+        lines.append(f"- {t.get('name', '?')}: {desc or 'no description'}; tools=[{tools}]")
+    return "\n".join(lines)
+
+
+def _codex_execution_context(req: RoleRequest) -> str:
+    access = "danger-full-access (machine-wide)" if req.full_access else "workspace-write"
+    lines = [
+        "## Codex execution context",
+        f"- allowed_tools from orchestrator: {req.allowed_tools}",
+        f"- filesystem access mode: {access}",
+        f"- result JSON path: {req.result_rel}",
+        "- shared board: .orchestrator/board.json",
+        "- PM/PL directives: .orchestrator/directives.md",
+        "- agent logs: .orchestrator/agents/",
+        "- Stay within the project unless full-access is explicitly enabled.",
+    ]
+    team = _codex_teammate_context(req)
+    if team:
+        lines += ["", team]
+    return "\n".join(lines)
+
+
 class CodexCLIBackend(Backend):
     name = "codex"
 
@@ -175,7 +264,11 @@ class CodexCLIBackend(Backend):
         return True, "binary present (auth NOT verified: codex login 또는 CODEX_API_KEY)"
 
     async def run_role(self, req: RoleRequest) -> RoleResult:
-        prompt = f"[SYSTEM ROLE INSTRUCTIONS]\n{req.system_prompt}\n\n[TASK]\n{req.prompt}"
+        prompt = (
+            f"[SYSTEM ROLE INSTRUCTIONS]\n{req.system_prompt}\n\n"
+            f"{_codex_execution_context(req)}\n\n"
+            f"[TASK]\n{req.prompt}"
+        )
         key = req.unit.get("id", "global") if isinstance(req.unit, dict) else "global"
         # #108: unit id 는 board 에서 slug 처리되지만, 여기서도 방어적으로 경로 구분자를 제거해
         # codex transcript 가 .orchestrator/results 밖으로 탈출하지 못하도록 한다.
@@ -195,9 +288,9 @@ class CodexCLIBackend(Backend):
             "--cd",
             str(req.cwd),
             "--sandbox",
-            "workspace-write",
+            "danger-full-access" if req.full_access else "workspace-write",
             "--json",
-            "-o",
+            "--output-last-message",
             str(out_path),
             "--skip-git-repo-check",
         ]
@@ -225,45 +318,14 @@ class CodexCLIBackend(Backend):
 
             final = ""
             if out_path.exists():
-                try:
-                    with out_path.open("r", encoding="utf-8", errors="replace") as fh:
-                        final = fh.read(2000)
-                except Exception:
-                    pass
-            # codex 는 USD 를 안 주므로 turn.completed 의 usage(토큰)로 비용을 추정 계산.
-            #
-            # #5(audit7) ASSUMPTION/RISK: 아래는 모든 turn.completed 이벤트의 usage 를 '합산'한다.
-            # 이는 각 이벤트의 usage 가 그 턴의 '델타(per-turn delta)'라는 가정에 의존한다. 만약
-            # codex 가 usage 를 '누적 합계(cumulative running-total)'로 매 이벤트마다 다시
-            # 보고한다면 이 합산은 토큰/비용을 과대 계산(over-count)한다. 스키마가 불확실해 수식을
-            # 함부로 바꾸지 않는다(섣부른 변경은 정확한 경우를 오히려 망친다). 두 해석은 단조
-            # 비감소(monotonic non-decreasing) 시퀀스에서 사실상 구분 불가라 자동 판별도
-            # 신뢰할 수 없다.
-            # TODO(audit7 #5): codex --json 스키마에서 turn.completed.usage 가 per-turn delta
-            #   인지 cumulative 인지 공식 문서/실측으로 확정하고, cumulative 면 마지막 이벤트
-            #   값만 채택하도록 바꾼다. 그 전까지는 per-turn delta 가정으로 합산을 유지한다(동작
-            #   변경 없음).
-            # 견고성: 모든 값은 기존처럼 max(0, int(...)) 로 강제해 음수/비정수/오버플로 입력을
-            #   안전하게 처리한다(가드 유지).
-            usage: dict[str, int] = {}
-            for line in out.splitlines():
-                try:
-                    o = json.loads(line)
-                except Exception:
-                    continue
-                if o.get("type") == "turn.completed" and isinstance(o.get("usage"), dict):
-                    for k, v in o["usage"].items():
-                        try:
-                            iv = int(v)
-                        except (TypeError, ValueError):
-                            continue
-                        # per-turn delta 가정 합산(위 ASSUMPTION 참고). 음수/비정수는 가드.
-                        usage[k] = usage.get(k, 0) + max(0, iv)
+                final = _read_last_message(out_path)
+            # codex exec --json reports per-turn usage on turn.completed; sum turns.
+            usage = _usage_from_jsonl(out)
             model = req.model or _codex_default_model()
             inp = usage.get("input_tokens", 0)
             cached = usage.get("cached_input_tokens", 0)
             out_t = usage.get("output_tokens", 0)
-            tokens = (inp + out_t) or None
+            tokens = _visible_tokens(usage)
             cost = codex_cost(model, inp, cached, out_t) if usage else None
             return RoleResult(
                 ok=True,

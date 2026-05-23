@@ -253,6 +253,7 @@ class RunConfig:
     poll_interval: float = 20.0
     mock: bool = False
     delegate: bool = False  # allow role sessions to call teammates as subagents
+    full_access: bool = False  # machine-wide backend access; default is project workspace access
     max_attempts: int = 2  # dev→test→qa rework attempts per unit
     retries: int = 1  # transient backend-failure retries per role call
     retry_backoff: float = 2.0  # seconds, exponential

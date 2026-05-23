@@ -13,9 +13,13 @@ from orchestrator.backends.base import RoleRequest
 from orchestrator.backends.codex_cli import (
     CodexCLIBackend,
     _codex_default_model,
+    _codex_teammate_context,
     _price_for,
+    _read_last_message,
     _root_model_from_text,
     _sanitize_key,
+    _usage_from_jsonl,
+    _visible_tokens,
     codex_cost,
 )
 
@@ -213,3 +217,48 @@ def test_codex_budget_and_max_turns_are_not_forwarded(tmp_path, monkeypatch):
     assert "--max-turns" not in captured["cmd"]
     assert "--max-budget-usd" not in captured["cmd"]
     assert "--budget" not in captured["cmd"]
+
+
+def test_usage_from_jsonl_sums_per_turn_and_clamps_bad_values():
+    out = (
+        b'{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":2,'
+        b'"output_tokens":5,"total_tokens":15}}\n'
+        b'{"type":"turn.completed","usage":{"input_tokens":3,"cached_input_tokens":-4,'
+        b'"output_tokens":"7","total_tokens":10}}\n'
+        b'{"type":"turn.completed","usage":{"input_tokens":"bad","output_tokens":1.2}}\n'
+    )
+    usage = _usage_from_jsonl(out)
+    assert usage["input_tokens"] == 13
+    assert usage["cached_input_tokens"] == 2
+    assert usage["output_tokens"] == 13
+    assert usage["total_tokens"] == 25
+    assert _visible_tokens(usage) == 25
+
+
+def test_read_last_message_is_bounded(tmp_path):
+    p = tmp_path / "last.txt"
+    p.write_text("x" * 12, encoding="utf-8")
+    assert _read_last_message(p, max_chars=5) == "xxxxx\n<... final message truncated>"
+
+
+def test_codex_teammate_context_documents_non_native_delegate(tmp_path):
+    req = RoleRequest(
+        role="backend-developer",
+        phase="dev",
+        unit={"id": "U1"},
+        system_prompt="sys",
+        prompt="prompt",
+        cwd=tmp_path,
+        allowed_tools=["Read", "Write"],
+        model=None,
+        max_turns=8,
+        budget=None,
+        result_path=tmp_path / ".orchestrator" / "results" / "r.json",
+        result_rel=".orchestrator/results/r.json",
+        spec_text="spec",
+        delegate=True,
+        teammates=[{"name": "dba", "description": "Database role", "tools": ["Read"]}],
+    )
+    ctx = _codex_teammate_context(req)
+    assert "no native Task/subagent tool" in ctx
+    assert "dba" in ctx
