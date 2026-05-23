@@ -231,6 +231,20 @@ class CodexCLIBackend(Backend):
                 except Exception:
                     pass
             # codex 는 USD 를 안 주므로 turn.completed 의 usage(토큰)로 비용을 추정 계산.
+            #
+            # #5(audit7) ASSUMPTION/RISK: 아래는 모든 turn.completed 이벤트의 usage 를 '합산'한다.
+            # 이는 각 이벤트의 usage 가 그 턴의 '델타(per-turn delta)'라는 가정에 의존한다. 만약
+            # codex 가 usage 를 '누적 합계(cumulative running-total)'로 매 이벤트마다 다시
+            # 보고한다면 이 합산은 토큰/비용을 과대 계산(over-count)한다. 스키마가 불확실해 수식을
+            # 함부로 바꾸지 않는다(섣부른 변경은 정확한 경우를 오히려 망친다). 두 해석은 단조
+            # 비감소(monotonic non-decreasing) 시퀀스에서 사실상 구분 불가라 자동 판별도
+            # 신뢰할 수 없다.
+            # TODO(audit7 #5): codex --json 스키마에서 turn.completed.usage 가 per-turn delta
+            #   인지 cumulative 인지 공식 문서/실측으로 확정하고, cumulative 면 마지막 이벤트
+            #   값만 채택하도록 바꾼다. 그 전까지는 per-turn delta 가정으로 합산을 유지한다(동작
+            #   변경 없음).
+            # 견고성: 모든 값은 기존처럼 max(0, int(...)) 로 강제해 음수/비정수/오버플로 입력을
+            #   안전하게 처리한다(가드 유지).
             usage: dict[str, int] = {}
             for line in out.splitlines():
                 try:
@@ -243,6 +257,7 @@ class CodexCLIBackend(Backend):
                             iv = int(v)
                         except (TypeError, ValueError):
                             continue
+                        # per-turn delta 가정 합산(위 ASSUMPTION 참고). 음수/비정수는 가드.
                         usage[k] = usage.get(k, 0) + max(0, iv)
             model = req.model or _codex_default_model()
             inp = usage.get("input_tokens", 0)

@@ -78,6 +78,28 @@ def _run_alive(orch_dir: Path) -> bool:
     return not _is_zombie(pid)
 
 
+def _leader_leads_group(pid: int, pgid: int | None) -> bool:
+    """리더 pid 가 살아 있고 그 pid 가 pgid 그룹을 이끄는지 재검증 (audit7 PGID 재사용 방어).
+
+    예전 구현은 stop 시작 시 pgid 를 한 번만 캡처한 뒤 수 초에 걸쳐 os.killpg(pgid,...) 를
+    반복했다. 그 사이 원래 그룹 리더가 종료되고 커널이 같은 PGID/PID 를 무관한 새 프로세스
+    그룹에 재할당하면(PID/PGID 재사용), 우리가 보내는 그룹 SIGKILL 이 *엉뚱한* 프로세스
+    그룹을 죽일 수 있다. 따라서 매 os.killpg 직전에:
+      1) os.kill(pid, 0) 으로 리더 pid 가 아직 존재하는지, 그리고
+      2) os.getpgid(pid) == pgid 로 그 pid 가 여전히 같은 그룹을 이끄는지
+    를 확인하고, 둘 다 참일 때만 그룹 시그널을 보낸다.
+
+    pgid 가 None(getpgid 실패)이면 그룹 시그널 자체를 쓰지 않으므로 의미 없다 → False.
+    """
+    if pgid is None:
+        return False
+    try:
+        os.kill(pid, 0)  # signal 0 = 존재/권한 확인 (죽었으면 OSError)
+        return os.getpgid(pid) == pgid
+    except OSError:
+        return False
+
+
 def _stop_run(orch_dir: Path) -> bool:
     """run.pid 프로세스 그룹 종료 (SIGTERM → 확인 → 필요 시 SIGKILL). 웹 stop 과 동일 기준.
 
@@ -85,6 +107,13 @@ def _stop_run(orch_dir: Path) -> bool:
     run 상태(board.json 등)를 쓰는 중인데도 _run_alive 가 False 가 되어 TUI 가 "stopped"
     로 표시되는 불일치가 생긴다. 웹 UI(webui.RunManager.stop)처럼, SIGTERM 후 실제 종료를
     "확인"한 뒤에만(또는 SIGKILL 폴백 후) pidfile 을 제거한다.
+
+    audit7(PID/PGID 재사용 방어): pgid 를 시작 시 한 번 캡처해 수 초간 os.killpg 를 반복하면,
+    그 사이 리더가 죽고 커널이 같은 PGID 를 재사용할 때 무관한 새 프로세스 그룹을 죽일 수
+    있다. 그래서 매 그룹 시그널 직전에 _leader_leads_group() 으로 "원래 리더가 아직 그 그룹을
+    이끄는지" 재검증하고, 리더가 사라진 순간(ProcessLookupError) 그룹 시그널을 *완전히 중단*
+    한다 — 재사용됐을 수 있는 pgid 에 마지막 blanket SIGKILL 을 보내지 않는다. 리더가 살아
+    있는 동안만 per-process 폴백(os.kill(pid,...))을 유지한다.
 
     TUI 루프를 막지 않도록 동기 작업은 SIGTERM 전송 1회뿐이고, 종료 확인·SIGKILL 에스컬레
     이션·pidfile 제거는 데몬 스레드에서 처리한다. stop 이 시작되면 True 를 반환한다.
@@ -102,8 +131,15 @@ def _stop_run(orch_dir: Path) -> bool:
         pgid = None
 
     def _kill(sig):
+        # audit7: 그룹 시그널은 원래 리더가 그 그룹을 아직 이끌 때만 보낸다(PGID 재사용 방어).
+        #         리더가 사라졌으면 그룹 시그널을 보내지 않는다(재사용된 pgid 오살 방지) —
+        #         리더가 죽은 마당에 보낼 per-process 폴백도 없으므로 조용히 무시.
         try:
-            os.killpg(pgid, sig) if pgid is not None else os.kill(pid, sig)
+            if _leader_leads_group(pid, pgid):
+                os.killpg(pgid, sig)
+            elif pgid is None:
+                # 애초에 그룹 정보를 못 얻은 경우에만 per-process 폴백(리더 생존 시에만 의미).
+                os.kill(pid, sig)
         except Exception:
             pass
 
@@ -115,6 +151,18 @@ def _stop_run(orch_dir: Path) -> bool:
         except OSError:
             return False
         return not _is_zombie(pid)
+
+    def _sweep_stragglers():
+        # audit5 #1/#3 복원: 리더가 종료된 뒤에도 SIGTERM 을 무시한 채 그룹에 남은 자식을
+        # 마지막으로 그룹 SIGKILL 로 일소한다. 그룹이 비어있지 않은 한 커널은 그 pgid 를
+        # 재사용하지 않으므로(잔존 자식이 곧 '우리 그룹'이라는 증거), 이 sweep 은 우리 그룹만
+        # 친다. 그룹이 이미 비었으면 ESRCH 로 무해. — 잔존 자식 reap(audit5)과 audit7 wait-phase
+        # 가드의 절충. (완전한 stale-pidfile/PID 재사용 방어는 start-time 검증 필요 — 후속 과제.)
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except Exception:
+                pass
 
     def _remove_pidfile():
         try:
@@ -128,22 +176,19 @@ def _stop_run(orch_dir: Path) -> bool:
         # SIGTERM 후 graceful 종료를 최대 ≈4초 기다린다(0.1초 간격 폴링). 죽으면 즉시 제거.
         for _ in range(40):
             if not _alive():
-                # #3: 부모(run.pid) 가 graceful 종료해도 SIGTERM 을 무시한 채 그룹에 남은
-                #     자식(부모만 먼저 죽은 child-only 잔존)이 있을 수 있다. pid 생존만 보면
-                #     놓치므로, 마지막에 그룹 SIGKILL 로 한 번 더 쓸어 잔존 자식을 일소한다
-                #     (그룹이 이미 비었으면 무해 — _kill 은 try/except).
-                _kill(signal.SIGKILL)
+                _sweep_stragglers()  # #3: 리더 사후 SIGTERM-무시 잔존 자식 일소
                 _remove_pidfile()
                 return
             time.sleep(0.1)
         # SIGTERM 을 트랩(graceful)해 안 죽는 경우 강제 종료. SIGKILL 은 비동기라 즉시 죽지
         # 않을 수 있어 잠깐 사멸을 확인한 뒤(좀비 reap 포함) pidfile 을 제거한다 — 어떤
         # 경우에도 최종적으로 pidfile 은 반드시 제거되어 "running" 잔상이 남지 않게 한다.
-        _kill(signal.SIGKILL)
+        _kill(signal.SIGKILL)  # 리더 생존 중 → 그룹 강제 종료(audit7 가드 통과)
         for _ in range(20):  # ≈1초: SIGKILL 후 커널 teardown 대기
             if not _alive():
                 break
             time.sleep(0.05)
+        _sweep_stragglers()  # 리더 종료 후 남은 자식까지 일소
         _remove_pidfile()
 
     _kill(signal.SIGTERM)

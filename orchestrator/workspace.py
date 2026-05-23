@@ -10,10 +10,11 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
-from .config import AGENTS_DIR, TEMPLATES_DIR
+from .config import AGENTS_DIR, FRAMEWORK_ROOT, TEMPLATES_DIR
 
 _GITIGNORE_SEED = ".orchestrator/\n__pycache__/\nnode_modules/\n.venv/\n*.db\n"
 
@@ -65,15 +66,38 @@ def expose_team_agents(project_dir: Path) -> int:
 
 
 def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
-    project_dir = Path(project_dir)
+    # 위험한 타깃 가드: scaffold 는 project_dir 에 mkdir(parents=True) 한 뒤 .orchestrator/,
+    # .gitignore, CLAUDE.md, AGENTS.md, spec.md 를 기록한다. 사용자가 실수로 파일시스템
+    # 루트(/), 홈 디렉터리(~) 자체, 또는 오케스트레이터 저장소 루트(FRAMEWORK_ROOT)를
+    # 가리키면 기존 파일을 오염시킬 수 있으므로 거부한다. ~의 하위 디렉터리는 정상
+    # 타깃이므로 허용한다(홈 자체만 거부). 의도적으로 위 경로에 스캐폴딩하려면 환경변수
+    # ORCH_ALLOW_UNSAFE_PROJECT_DIR=1 로 우회할 수 있다.
+    project_dir = Path(project_dir).expanduser().resolve()
+    if os.environ.get("ORCH_ALLOW_UNSAFE_PROJECT_DIR") != "1":
+        unsafe = {
+            Path(project_dir.anchor).resolve() if project_dir.anchor else None,
+            Path.home().expanduser().resolve(),
+            FRAMEWORK_ROOT.resolve(),
+        }
+        unsafe.discard(None)
+        if project_dir in unsafe:
+            raise ValueError(
+                f"위험한 project_dir 거부: {project_dir} (파일시스템 루트·홈 디렉터리·"
+                "프레임워크 저장소 루트에는 스캐폴딩하지 않습니다). "
+                "정말 의도했다면 ORCH_ALLOW_UNSAFE_PROJECT_DIR=1 을 설정하세요."
+            )
+
     project_dir.mkdir(parents=True, exist_ok=True)
 
     orch = project_dir / ".orchestrator"
     (orch / "results").mkdir(parents=True, exist_ok=True)
     (orch / "qa").mkdir(parents=True, exist_ok=True)
     # .orchestrator/spec.md 는 사용자 파일이 아니라 오케스트레이터 내부 상태다. 재사용 디렉터리에
-    # 새 spec 을 돌리면 이전 값이 stale 해지므로 항상 현재 내용으로 (재)기록한다 (#140).
-    (orch / "spec.md").write_text(spec_text, encoding="utf-8")
+    # 새 spec 을 돌리면 이전 값이 stale 해지므로 현재 내용으로 (재)기록한다 (#140).
+    # 단, spec_text 가 비어있거나 공백뿐이면 기록을 건너뛴다: 빈 값으로 덮어쓰면 이전에 있던
+    # 정상 spec 을 파괴하기 때문이다(재사용 디렉터리 보호). 기존 파일이 있으면 그대로 보존한다.
+    if spec_text and spec_text.strip():
+        (orch / "spec.md").write_text(spec_text, encoding="utf-8")
 
     stack_str = _fmt_stack(stack)
     for fname in ("CLAUDE.md", "AGENTS.md"):
@@ -96,7 +120,9 @@ def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
         # (#141 refresh). 마커가 없으면(사용자가 직접 쓴 것) → 덮어쓰지 않고 보존 (#40).
         if target.exists():
             existing = target.read_text(encoding="utf-8", errors="replace")
-            if _GEN_MARKER not in existing:
+            # 마커가 본문 *맨 앞*에 있어야만 우리 생성물로 인정한다. 단순 부분일치(in)는
+            # 마커 문자열을 본문 중간에 우연히 포함한 사용자 파일까지 덮어쓰는 오인을 부른다.
+            if not existing.lstrip().startswith(_GEN_MARKER):
                 print(f"[scaffold] {fname} 은 사용자 작성으로 판단되어 보존합니다 (덮어쓰지 않음)")
                 continue
         target.write_text(content, encoding="utf-8")

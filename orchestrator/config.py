@@ -265,13 +265,22 @@ class RunConfig:
     distribute: bool = False
     # True 면 미핀 역할을 풀에 번갈아(교차) 배정 → 두 모델이 섞여 상호 검증. distribute 보다 우선.
     cross_check: bool = False
+    # 백엔드 정규화(__post_init__) 중 발생한 경고(알 수 없는 이름 드롭/폴백). 보존만, raise 안 함.
+    backend_warnings: list[str] = field(default_factory=list)
 
     def __post_init__(self):
         # 숫자 옵션을 안전 범위로 정규화 (CLI/웹 어디서 와도 crash/hang/오작동 방지; 웹과 동작 일치)
         # 라이브러리 호출부가 잘못된 값을 줘도 raw ValueError 가 아니라 기본값으로 안전화 (#37)
-        self.concurrency = max(1, _coerce_int(self.concurrency, 3))
-        self.max_attempts = max(1, _coerce_int(self.max_attempts, 2))
-        self.retries = max(0, _coerce_int(self.retries, 1))
+        #
+        # 하한뿐 아니라 상한(upper clamp)도 둔다: 프로그래매틱 호출부가 병적으로 큰 값을 주면
+        # OOM / 무한정 작업 스폰 / 사실상 hang 으로 이어질 수 있으므로 합리적 상한으로 클램프한다.
+        #   - concurrency: 동시 역할 세션 수. 64 면 어떤 머신에서도 과한 상한 → OOM/스레드폭증 방지.
+        #   - max_attempts: unit별 dev→test→qa 재작업 횟수. 20 회면 무한 재작업을 막는 충분한 상한.
+        #   - retries: 역할 호출 전이성 실패 재시도 횟수. 20 회 상한으로 폭주 방지.
+        # (정상값 concurrency=3 / max_attempts=2 / retries=1 등은 그대로 보존된다.)
+        self.concurrency = min(64, max(1, _coerce_int(self.concurrency, 3)))
+        self.max_attempts = min(20, max(1, _coerce_int(self.max_attempts, 2)))
+        self.retries = min(20, max(0, _coerce_int(self.retries, 1)))
         if self.max_units is not None:
             self.max_units = _coerce_optional_positive_int(self.max_units)
         # poll_interval 을 안전 하한으로 클램프 (#33). 웹은 poll_interval=0 을 허용하는데,
@@ -288,6 +297,9 @@ class RunConfig:
             pi = 20.0
         self.poll_interval = pi if pi > 0 else 5.0
         self.poll_interval = max(1.0, self.poll_interval)
+        # 유한하지만 병적으로 큰 값(예: 1e308)은 감독 폴링을 사실상 무력화한다(다음 폴까지 수년).
+        # 1시간(3600초) 상한으로 클램프해 PM/PL 감독이 항상 합리적 주기로 동작하게 한다.
+        self.poll_interval = min(3600.0, self.poll_interval)
         # (#8) budget: NaN/Inf 는 비교를 무력화한다(예: committed >= nan 은 항상 False 라 예산
         # enforcement 가 조용히 꺼진다). 비유한/비-숫자 예산은 None(예산 없음)으로 정규화해
         # "깨진 예산 = 예산 없음" 을 명시적으로 만든다. 웹 검증과 더불어 방어적 2중 가드.
@@ -312,13 +324,60 @@ class RunConfig:
                 if not math.isfinite(tv) or tv <= 0:
                     tv = None
         self.session_timeout = tv
+        # retry_backoff: 지수 백오프 기준 초(sec). 비유한(NaN/Inf)/비-숫자/음수는 기본 2.0 으로.
+        # 러너는 min(retry_backoff * 2**i, 60.0) 으로 캡을 두지만, 기준값 자체도 60초 상한으로
+        # 클램프해 (예: 1e9 같은 병적인 큰 값이) 첫 재시도부터 비정상 대기를 만들지 않게 한다.
         try:
             rb = float(self.retry_backoff)
         except (TypeError, ValueError):
             rb = 2.0
         if not math.isfinite(rb) or rb < 0:
             rb = 2.0
-        self.retry_backoff = rb
+        self.retry_backoff = min(60.0, rb)
+        # 백엔드 이름 검증/정규화: 프로그래매틱 RunConfig 구성에서도 CLI 와 동일하게 별칭을
+        # 정식 이름으로 풀고, VALID_BACKENDS 에 없는 알 수 없는 이름은 안전화한다. RunConfig 구성은
+        # 절대 raise 하지 않으므로(웹/라이브러리 호출부가 죽지 않게) 예외 대신 sanitize 한다.
+        #   - 우선순위 리스트(backend_priority / role_priority 값): 알 수 없는 이름 드롭, 경고 보존.
+        #   - default_backend / role_backend 값: 알 수 없으면 DEFAULT_BACKEND 로 폴백.
+        # mock 및 별칭(claude-code, openai-sdk 등)은 resolve 를 거쳐 그대로 유효하게 유지된다.
+        self._sanitize_backends()
+
+    def _sanitize_backends(self) -> None:
+        """백엔드 이름 별칭 해소 + 알 수 없는 이름 경고 (raise/드롭/치환 없음).
+
+        알려진 이름은 정식명으로 정규화(별칭 해소)하고, 알 수 없는 이름은 *그대로 두되* 경고만
+        남긴다. 드롭/치환하면 (a) fake 백엔드를 주입하는 테스트나 (b) 런타임에 monkeypatch 된
+        레지스트리가 깨진다. 알 수 없는 이름은 어차피 runner._candidates/available() 가 안전하게
+        skip/실패로 처리하므로, config 는 조기 '경고'만 제공하고 실제 동작은 바꾸지 않는다.
+        """
+        # backends 패키지는 config 를 import 하므로 최상위 import 는 순환 → 지연 import.
+        try:
+            from .backends import resolve as _resolve
+        except Exception:  # noqa: BLE001
+
+            def _resolve(name: str) -> str:
+                return name
+
+        warnings: list[str] = []
+
+        def norm(name):
+            """알려진 이름은 정식명으로 정규화, 알 수 없으면 원본 유지 + 경고."""
+            try:
+                resolved = _resolve(str(name).strip())
+            except Exception:  # noqa: BLE001
+                resolved = str(name).strip()
+            if resolved not in VALID_BACKENDS:
+                warnings.append(f"알 수 없는 백엔드(런타임에서 skip/실패로 처리): {name!r}")
+            return resolved
+
+        self.default_backend = norm(self.default_backend)
+        self.backend_priority = [norm(n) for n in (self.backend_priority or [])]
+        self.role_priority = {
+            role: [norm(n) for n in names] for role, names in (self.role_priority or {}).items()
+        }
+        self.role_backend = {role: norm(n) for role, n in (self.role_backend or {}).items()}
+        # 정규화 과정에서 발생한 경고를 보존(웹/CLI 에서 노출 가능). raise 하지 않는다.
+        self.backend_warnings = warnings
 
     def backends_for(self, role: str) -> list[str]:
         """역할에 대한 백엔드 후보를 우선순위 순서로 반환 (폴오버용)."""

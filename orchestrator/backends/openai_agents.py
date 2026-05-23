@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -140,6 +141,10 @@ _OPENAI_FALLBACK_PRICING = {
     "o4-mini": (1.1, 4.4),
 }
 
+# #7(audit7): model 키 뒤에 붙는 날짜 스냅샷 접미사: '-2024', '-2024-08', '-2024-08-06' 등.
+# codex_cli 와 동일한 규칙으로, dated 스냅샷명을 base 모델로 매핑할 때만 쓴다.
+_OPENAI_DATE_SUFFIX = re.compile(r"^-\d{4}(?:-\d{2}){0,2}$")
+
 
 def _openai_pricing() -> dict:
     """OPENAI_PRICING_FILE(있으면) → 코드 fallback. 값은 [input, output] (1M 토큰당 USD)."""
@@ -161,15 +166,39 @@ def _openai_pricing() -> dict:
     return dict(_OPENAI_FALLBACK_PRICING)
 
 
-def _estimate_openai_cost(model: str | None, in_tokens: int, out_tokens: int):
-    """#8: 모델 단가 × 토큰으로 추정 비용(USD). 모델 미지정/단가표 미등록이면 None.
+def _openai_price_for(model: str | None):
+    """#7(audit7): 모델명에 맞는 단가 (input, output) 를 찾는다. 없으면 None.
 
-    정확매칭만 인정한다(임의 prefix 매칭은 알 수 없는 변형을 오과금할 수 있음).
+    ① 정확 매칭 우선('gpt-4o-mini' 는 'gpt-4o' 가 아니라 'gpt-4o-mini' 로만 매칭).
+    ② 날짜 접미사만 붙은 dated 스냅샷('gpt-4o-2024-08-06')은 base 모델('gpt-4o')로 매핑.
+       codex_cli._price_for 와 동일한 규칙 — dated snapshot 이름이 비용 추정에서 누락돼
+       cost 가 None 으로 떨어지던 문제를 막는다. (긴 키 우선 매칭으로 'gpt-4o-mini' 같은
+       더 구체적인 base 가 'gpt-4o' 보다 먼저 시도된다.)
+    ③ 그 외 알 수 없는 변형은 None(허위 비용 날조 금지).
     """
     m = (model or "").lower().strip()
     if not m:
         return None
-    p = _openai_pricing().get(m)
+    pricing = _openai_pricing()
+    # ① 정확 매칭
+    if m in pricing:
+        return pricing[m]
+    # ② 날짜 접미사 dated 스냅샷만 base 모델로 인정 (긴 키 우선)
+    for key in sorted(pricing, key=len, reverse=True):
+        if m.startswith(key) and _OPENAI_DATE_SUFFIX.match(m[len(key) :]):
+            return pricing[key]
+    # ③ 알 수 없는 변형 → 추정치 없음
+    return None
+
+
+def _estimate_openai_cost(model: str | None, in_tokens: int, out_tokens: int):
+    """#8: 모델 단가 × 토큰으로 추정 비용(USD). 모델 미지정/단가표 미등록이면 None.
+
+    정확 매칭을 우선하되, 날짜 스냅샷 접미사('-YYYY-MM-DD')만 붙은 dated 모델명은
+    base 모델 단가로 폴백한다(#7, audit7) — codex_cli 와 동일. 임의 prefix 매칭은 하지
+    않으므로 알 수 없는 변형을 오과금하지 않는다.
+    """
+    p = _openai_price_for(model)
     if not p:
         return None
     in_price, out_price = p
@@ -387,6 +416,48 @@ def _format_dir_listing(names: list[str], cap: int = _MAX_LIST_ENTRIES) -> str:
     return "\n".join(head) + f"\n... ({remaining} more)"
 
 
+# #1(audit7): symlink TOCTOU 방어용 순수 헬퍼.
+# _safe() 가 resolve 시점에 root 안임을 확인하더라도, resolve 와 실제 open/write 사이에
+# (같은 세션 run_bash 가 만든) symlink 가 경로를 root 밖으로 재지정할 수 있다. 그래서 실제
+# 파일 접근 직전에 os.path.realpath(p) 를 root(역시 재-resolve) 기준으로 다시 검사한다.
+# os.O_NOFOLLOW 까지 함께 쓰면 최종 컴포넌트가 symlink 면 open 자체가 거부된다(아래 read/write).
+def _resolve_under_root(p, root) -> bool:
+    """p 의 realpath 가 root(재-resolve) 안(또는 root 자신)이면 True. 탈출하면 False.
+
+    순수 함수(SDK 불필요): TOCTOU 윈도우를 닫기 위해 syscall 직전에 다시 호출한다.
+    중간 컴포넌트 symlink 까지 풀어 비교하므로 디렉터리 symlink 우회도 막는다.
+    """
+    try:
+        real_p = Path(os.path.realpath(str(p)))
+        real_root = Path(os.path.realpath(str(root)))
+    except Exception:
+        return False
+    return real_p == real_root or real_root in real_p.parents
+
+
+def _resolve_tools(requested, tool_map: dict, read_list_fallback: list) -> list:
+    """#2(audit7): 역할의 allowed_tools → 실제 노출할 툴 리스트로 해석한다 (순수 함수, SDK 불필요).
+
+    핵심 규칙(권한 상승 방지): read/list 폴백은 allowed_tools 가 애초에 비어/미지정일 때만
+    적용한다. allowlist 가 비어있지 않은데(예: ["Bash"]) 옵트아웃 등으로 결과 툴셋이 빈 경우,
+    빈 채로 둔다 — 읽기 권한을 요청하지 않은 역할에 read/list 를 몰래 주입하지 않는다.
+
+    - tool_map: 도구명 → [tool, ...] (Bash 옵트아웃이면 tool_map['Bash'] 는 빈 리스트).
+    - read_list_fallback: allowlist 가 비어/미지정일 때만 쓰는 안전 폴백([read_file, list_dir]).
+    """
+    requested = list(requested or [])
+    resolved: list = []
+    for t in requested:
+        for fn in tool_map.get(t, []):
+            if fn not in resolved:
+                resolved.append(fn)
+    if not resolved and not requested:
+        # allowlist 가 애초에 비어/미지정 → 안전 폴백(읽기/목록만, bash 제외).
+        return list(read_list_fallback)
+    # allowlist 가 비어있지 않은데 옵트아웃 등으로 빈 결과 → 폴백 없이 빈 채로(권한 상승 방지).
+    return resolved
+
+
 class OpenAIAgentsBackend(Backend):
     name = "openai-agents"
 
@@ -426,14 +497,31 @@ class OpenAIAgentsBackend(Backend):
         @function_tool
         def read_file(path: str) -> str:
             """파일 내용을 읽는다 (타깃 디렉터리 한정, 최대 ~200KB — 초과분은 절단)."""
-            p = _safe(path)
+            try:
+                p = _safe(path)
+            except ValueError as e:
+                return f"<{e}>"
             if not p.exists():
                 return f"<no file: {path}>"
+            # #1(audit7): syscall 직전 realpath 재검사 — _safe 이후 symlink 가 끼어들어도 탈출 차단.
+            if not _resolve_under_root(p, root):
+                return f"<path escapes project dir: {path}>"
             # #35: 거대 파일을 통째로 메모리에 올린 뒤 자르면 200KB 상한이 메모리를 못 막는다.
             # 바이트 단위로 max_read_bytes+1 까지만 읽어, 초과 여부를 비싸지 않게 판정한다.
+            # #1(audit7): O_NOFOLLOW 로 최종 컴포넌트가 symlink 면 open 자체를 거부(TOCTOU 차단).
             try:
-                with open(p, "rb") as fh:
-                    raw = fh.read(max_read_bytes + 1)
+                fd = os.open(str(p), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                try:
+                    with os.fdopen(fd, "rb") as fh:
+                        raw = fh.read(max_read_bytes + 1)
+                except BaseException:
+                    os.close(fd)
+                    raise
+            except OSError as e:
+                # ELOOP: 최종 컴포넌트가 symlink → 명시적 거부 메시지.
+                if getattr(e, "errno", None) == 62 or "symbolic" in str(e).lower():
+                    return f"<path escapes project dir (symlink): {path}>"
+                return f"<read error: {path}: {e}>"
             except Exception as e:
                 return f"<read error: {path}: {e}>"
             truncated = len(raw) > max_read_bytes
@@ -448,12 +536,37 @@ class OpenAIAgentsBackend(Backend):
 
             Write 툴 전용(전체 내용 전송). 부분 수정은 edit_file(Edit) 을 사용한다.
             """
-            p = _safe(path)
+            try:
+                p = _safe(path)
+            except ValueError as e:
+                return f"<{e}>"
             # #123: 비정상적으로 거대한 content 는 거부한다.
             if len(content.encode("utf-8")) > max_write_bytes:
                 return f"<write rejected: content exceeds {max_write_bytes} bytes>"
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(content, encoding="utf-8")
+            # #3(audit7): mkdir/write 를 try 로 감싸 권한/디스크 오류가 SDK 러너로 raise 되지 않고
+            #   read_file 처럼 '<write error: ...>' 문자열로 반환되게 한다.
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                # #1(audit7): mkdir(parents=True) 와 실제 쓰기 사이에 symlink 가 끼어 root 밖으로
+                #   재지정될 수 있으므로, 부모 디렉터리 생성 직후 realpath 를 다시 검사한다.
+                if not _resolve_under_root(p, root):
+                    return f"<path escapes project dir: {path}>"
+                # #1(audit7): O_NOFOLLOW 로 최종 컴포넌트가 symlink 면 open 거부(TOCTOU 차단).
+                data = content.encode("utf-8")
+                flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+                fd = os.open(str(p), flags, 0o644)
+                try:
+                    with os.fdopen(fd, "wb") as fh:
+                        fh.write(data)
+                except BaseException:
+                    os.close(fd)
+                    raise
+            except OSError as e:
+                if getattr(e, "errno", None) == 62 or "symbolic" in str(e).lower():
+                    return f"<path escapes project dir (symlink): {path}>"
+                return f"<write error: {path}: {e}>"
+            except Exception as e:
+                return f"<write error: {path}: {e}>"
             return f"wrote {path} ({len(content)} bytes)"
 
         @function_tool
@@ -464,9 +577,15 @@ class OpenAIAgentsBackend(Backend):
             여러 번 등장하면 모호하므로 거부한다(더 많은 문맥을 포함하도록 안내). 전체
             생성/덮어쓰기는 write_file(Write) 을 쓴다.
             """
-            p = _safe(path)
+            try:
+                p = _safe(path)
+            except ValueError as e:
+                return f"<{e}>"
             if not p.exists():
                 return f"<no file: {path}>"
+            # #1(audit7): syscall 직전 realpath 재검사 — _safe 이후 symlink 가 끼어들어도 탈출 차단.
+            if not _resolve_under_root(p, root):
+                return f"<path escapes project dir: {path}>"
             # #3: read_text() 로 통째 올리기 전에 크기를 먼저 검사 — 거대 파일은 메모리를
             # 폭주시키므로 로드하지 않고 거부한다(편집은 유일성 치환 위해 전체 내용 필요).
             try:
@@ -489,15 +608,40 @@ class OpenAIAgentsBackend(Backend):
             # #123: 치환 후 비정상적으로 거대해지면 거부한다.
             if len(updated.encode("utf-8")) > max_write_bytes:
                 return f"<edit rejected: result exceeds {max_write_bytes} bytes>"
-            p.write_text(updated, encoding="utf-8")
+            # #1(audit7): 쓰기 직전 다시 realpath 검사 + O_NOFOLLOW 로 최종 컴포넌트 symlink 거부.
+            # #3(audit7): write 실패(권한/디스크)도 SDK 러너로 raise 되지 않고 에러 문자열로 반환.
+            try:
+                if not _resolve_under_root(p, root):
+                    return f"<path escapes project dir: {path}>"
+                data = updated.encode("utf-8")
+                flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+                fd = os.open(str(p), flags, 0o644)
+                try:
+                    with os.fdopen(fd, "wb") as fh:
+                        fh.write(data)
+                except BaseException:
+                    os.close(fd)
+                    raise
+            except OSError as e:
+                if getattr(e, "errno", None) == 62 or "symbolic" in str(e).lower():
+                    return f"<path escapes project dir (symlink): {path}>"
+                return f"<write error: {path}: {e}>"
+            except Exception as e:
+                return f"<write error: {path}: {e}>"
             return f"edited {path} ({len(updated)} bytes)"
 
         @function_tool
         def list_dir(path: str = ".") -> str:
             """디렉터리 목록 (타깃 디렉터리 한정, 정렬 후 최대 ~500개 — 초과는 '... (N more)')."""
-            p = _safe(path)
+            try:
+                p = _safe(path)
+            except ValueError as e:
+                return f"<{e}>"
             if not p.exists():
                 return f"<no dir: {path}>"
+            # #1(audit7): 목록 직전 realpath 재검사 — symlink 로 root 밖을 들여다보지 못하게.
+            if not _resolve_under_root(p, root):
+                return f"<path escapes project dir: {path}>"
             try:
                 names = [x.name + ("/" if x.is_dir() else "") for x in p.iterdir()]
             except Exception as e:
@@ -535,13 +679,10 @@ class OpenAIAgentsBackend(Backend):
         # #1: ORCH_OPENAI_ALLOW_BASH 가 꺼져 있으면 Bash 역할이라도 run_bash 를 노출하지 않는다.
         if not _bash_enabled():
             tool_map["Bash"] = []
-        tools: list = []
-        for t in req.allowed_tools or []:
-            for fn in tool_map.get(t, []):
-                if fn not in tools:
-                    tools.append(fn)
-        if not tools:  # 안전 폴백: 읽기/목록만 (bash 제외)
-            tools = [read_file, list_dir]
+        # #2(audit7): 폴백(읽기/목록)은 allowed_tools 가 애초에 비어/미지정일 때만 적용한다.
+        # allowlist 가 비어있지 않은데(예: ["Bash"]) bash 옵트아웃으로 빈 결과가 되면, read/list
+        # 를 몰래 주입하지 않고 빈 채로 둔다 — 읽기를 요청하지 않은 역할에 권한 상승 금지.
+        tools = _resolve_tools(req.allowed_tools, tool_map, [read_file, list_dir])
 
         kwargs = dict(name=req.role, instructions=req.system_prompt, tools=tools)
         if req.model:
