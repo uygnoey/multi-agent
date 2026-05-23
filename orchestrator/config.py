@@ -254,6 +254,7 @@ class RunConfig:
     mock: bool = False
     delegate: bool = False  # allow role sessions to call teammates as subagents
     full_access: bool = False  # machine-wide backend access; default is project workspace access
+    auto_commit: bool = True  # create checkpoint commits inside the generated project
     max_attempts: int = 2  # dev→test→qa rework attempts per unit
     retries: int = 1  # transient backend-failure retries per role call
     retry_backoff: float = 2.0  # seconds, exponential

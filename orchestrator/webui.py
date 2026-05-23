@@ -261,6 +261,8 @@ def build_command(py: str, spec_path: Path, project_dir: Path, opts: dict) -> li
         cmd.append("--delegate")
     if opts.get("full_access"):
         cmd.append("--full-access")
+    if opts.get("auto_commit") is False:
+        cmd.append("--no-auto-commit")
     # #38: max_units/max_attempts 도 손상값을 관대하게 변환. max_units 는 0/음수면 "전체"로
     #      간주해 플래그를 생략(폴백 0). max_attempts 는 기본 2 로 폴백.
     if _coerce_int(opts.get("max_units"), 0) > 0:
@@ -1085,6 +1087,7 @@ INDEX_HTML = r"""<!doctype html>
       <label style="margin:0"><input type="checkbox" id="mock"/> mock (무비용 · 선택한 실제 백엔드 무시)</label>
       <label style="margin:0"><input type="checkbox" id="delegate"/> delegate (팀 위임)</label>
       <label style="margin:0"><input type="checkbox" id="fullAccess"/> full-access (머신 전체 권한)</label>
+      <label style="margin:0"><input type="checkbox" id="autoCommit" checked/> auto-commit (단계별 git)</label>
       <label style="margin:0"><input type="checkbox" id="distribute"/> distribute (풀 분산)</label>
       <label style="margin:0"><input type="checkbox" id="crossCheck"/> cross-check (교차 검증)</label>
       <span style="flex:1"></span>
@@ -1174,7 +1177,8 @@ async function startRun(){
       max_attempts:raw("maxAttempts"),
       poll_interval:raw("pollInterval"),timeout:raw("timeout"),
       retries:raw("retries"),budget:raw("budget"),model:raw("model"),
-      mock:$("mock").checked,delegate:$("delegate").checked,full_access:$("fullAccess").checked};
+      mock:$("mock").checked,delegate:$("delegate").checked,full_access:$("fullAccess").checked,
+      auto_commit:$("autoCommit").checked};
     const r=await fetch("/api/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
     const j=await r.json();
     if(j.error){$("launchMsg").textContent="오류: "+j.error;return}

@@ -123,6 +123,7 @@ python -m orchestrator --spec examples/specs/sample-spec.md --project-dir /tmp/d
 | `--role-backend ROLE=B1[,B2,...]` | 역할별 백엔드(우선순위 리스트) override (반복 가능) |
 | `--delegate` | 역할 세션에 팀원 위임 맥락 제공. Claude는 네이티브 Task, Codex는 별도 역할 세션 협업 컨텍스트 |
 | `--full-access` | 백엔드에 머신 전체 권한 허용. 기본은 프로젝트 폴더 workspace 권한 |
+| `--no-auto-commit` | 생성 프로젝트의 단계별 git checkpoint commit 비활성화 |
 | `--mock` | 모든 역할을 mock 으로 (무비용) |
 | `--concurrency N` | 동시 처리 unit 수 (기본 3) |
 | `--max-units N` | 처리할 unit 수 상한 |
@@ -210,6 +211,8 @@ python -m orchestrator --web --port 8765 --base-dir ~/agent-runs
 - 세션별 `max_turns`·예산, 전역 동시성 세마포어, `--max-units`, 경로 스코프(타깃 cwd 한정)
 - `codex` 기본 실행은 `--sandbox workspace-write`로 프로젝트 workspace 권한을 쓰고,
   `--full-access`를 명시할 때만 `danger-full-access`를 전달한다.
+- 생성 프로젝트에는 기본적으로 git repo/checkpoint commit 을 만든다. scaffold, design, unit dev,
+  unit verified, cicd, docs 단계에서 변경이 있을 때만 커밋하며 `--no-auto-commit`으로 끌 수 있다.
 - ⚠️ `openai-agents` 백엔드의 `run_bash`(shell)는 cwd 만 타깃일 뿐 FS 경계를 강제하지 않는다
   (allowed_tools 로 Bash 권한 역할만 노출). 강한 격리가 필요하면 **Docker 컨테이너**로 실행할 것
 - ⚠️ **의존성-설치 금지 = 프롬프트 한정(#48)**: 템플릿(`CLAUDE.md`/`AGENTS.md`)은 "의존성 설치/번들

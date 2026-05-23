@@ -26,6 +26,7 @@ from .board import (
     Board,
 )
 from .config import DESIGN_ROLES, DEV_ROLES, SUPERVISOR_ROLES, RunConfig
+from .gitcheckpoints import GitCheckpointer
 from .runner import Runner
 
 # 기본 스택은 특정 도메인(web 등)을 가정하지 않는다 — 아키텍트가 spec 을 보고 실제 스택을
@@ -38,6 +39,7 @@ class Scheduler:
         self.cfg = cfg
         self.board = Board(cfg.project_dir)
         self.runner = Runner(cfg, self.board)
+        self.git = GitCheckpointer(cfg.project_dir, enabled=cfg.auto_commit)
         self._stop = asyncio.Event()
         # test/qa 동시성 캡: dev 와 별개로 test-engineer+qa 호출을 묶는 세마포어.
         # dev 슬롯(sem)만 캡되어 있고 test/qa 는 unit 마다 자유 태스크로 떠서, unit 이 많으면
@@ -50,6 +52,7 @@ class Scheduler:
         workspace.scaffold(self.cfg.project_dir, spec_text, DEFAULT_STACK)
         self.board.spec_text = spec_text
         await self.board.init(spec_text, DEFAULT_STACK)
+        await self._checkpoint("orchestrator: scaffold project")
 
         # 생존 확인용 PID 파일 (웹 서버 재시작에도 running 상태를 정확히 판단)
         pid_file = self.board.orch_dir / "run.pid"
@@ -123,6 +126,7 @@ class Scheduler:
                     "scheduler", "architect produced no units; falling back to single core unit"
                 )
                 await self.board.add_units([{"id": "U1", "title": "core", "roles": DEV_ROLES}])
+            await self._checkpoint("orchestrator: design work units")
 
             # Phase B/C — unit별 동시 개발 + 완료 시 테스트 트리거
             unit_list = self.board.units()
@@ -201,6 +205,7 @@ class Scheduler:
             await self.board.add_global_artifacts(cicd_out.get("artifacts", []))
             if not cicd_out.get("_ok", True):
                 await self.board.add_warning("cicd failed (배포 파이프라인 산출물 미완)")
+            await self._checkpoint("orchestrator: cicd artifacts")
 
             # Phase E — 문서화: 실행 가이드(EN/KO) + 개발 산출물(EN/KO)
             await self.board.set_phase("docs")
@@ -211,6 +216,7 @@ class Scheduler:
                 await self.board.add_warning("docs-writer failed (산출물 문서 미완)")
             # 보드 기반 산출물 문서는 백엔드와 무관하게 항상 EN/KO 생성
             await self.board.add_global_artifacts(self.board.write_deliverables())
+            await self._checkpoint("orchestrator: docs artifacts")
 
             # 모든 작업 완료 → 감독(PM/PL)을 graceful 종료(현재 tick 끝까지 대기, 취소 X).
             # 감독이 다 멈춘 뒤에야 done — done 시점엔 어떤 에이전트도 돌고 있지 않다.
@@ -239,6 +245,13 @@ class Scheduler:
                 pass
 
         return self.board.snapshot()
+
+    async def _checkpoint(self, message: str) -> None:
+        committed, detail = await self.git.checkpoint(message)
+        if committed:
+            await self.board.log_event("git", f"checkpoint {detail}: {message}")
+        elif detail not in ("disabled", "no changes"):
+            await self.board.log_event("git", f"checkpoint skipped: {detail}")
 
     def _rerun_argv(self) -> list[str]:
         """rerun.json 에 저장할 argv 를 만든다 (--spec/--project-dir 는 절대경로로 정규화).
@@ -299,6 +312,7 @@ class Scheduler:
                 await self.board.add_warning(f"{uid}: 개발(dev) 실패 → blocked")
                 return False
             await self.board.set_status(uid, DEV_DONE)
+            await self._checkpoint(f"orchestrator: {uid} dev attempt {attempt}")
             return True
 
     async def _test_unit_safe(self, unit: dict, sem: asyncio.Semaphore) -> None:
@@ -360,6 +374,7 @@ class Scheduler:
                 await self.board.set_test_status(uid, "pass" if passed else "fail")
                 if passed:
                     await self.board.set_status(uid, DONE)
+                    await self._checkpoint(f"orchestrator: {uid} verified")
                     return
                 if attempt < self.cfg.max_attempts:
                     rework = True

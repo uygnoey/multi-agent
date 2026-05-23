@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from orchestrator.config import RunConfig
 from orchestrator.scheduler import Scheduler
@@ -59,3 +63,42 @@ def test_full_mock_run_persists_board_and_report(tmp_path: Path, sample_spec_pat
     # Every unit id should appear in the report table.
     for u in snap["units"]:
         assert u["id"] in report_text
+
+
+def test_full_mock_run_creates_git_checkpoint_commits(
+    tmp_path: Path, sample_spec_path: Path, monkeypatch
+):
+    if not shutil.which("git"):
+        pytest.skip("git executable not available")
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "dev-crew-orchestrator")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "dev-crew-orchestrator@brillianttiger.io")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "dev-crew-orchestrator")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "dev-crew-orchestrator@brillianttiger.io")
+    project_dir = tmp_path / "demo"
+    _run(sample_spec_path, project_dir)
+
+    log = subprocess.run(
+        ["git", "-C", str(project_dir), "log", "--format=%s"],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.splitlines()
+
+    assert "orchestrator: scaffold project" in log
+    assert "orchestrator: design work units" in log
+    assert "orchestrator: cicd artifacts" in log
+    assert "orchestrator: docs artifacts" in log
+    assert any(line.endswith(" verified") for line in log)
+
+
+def test_auto_commit_can_be_disabled(tmp_path: Path, sample_spec_path: Path):
+    project_dir = tmp_path / "demo"
+    cfg = RunConfig(
+        spec_path=sample_spec_path.resolve(),
+        project_dir=project_dir,
+        mock=True,
+        poll_interval=600.0,
+        auto_commit=False,
+    )
+    asyncio.run(Scheduler(cfg).run())
+    assert not (project_dir / ".git").exists()

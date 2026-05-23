@@ -93,6 +93,11 @@ def parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help="백엔드에 머신 전체 권한을 허용 (기본은 프로젝트 폴더 workspace 권한)",
     )
+    p.add_argument(
+        "--no-auto-commit",
+        action="store_true",
+        help="생성 프로젝트의 단계별 git checkpoint commit 을 비활성화",
+    )
     p.add_argument("--max-attempts", type=int, default=2, help="unit별 dev→test→qa 재작업 횟수")
     p.add_argument("--retries", type=int, default=1, help="역할 호출 전이성 실패 재시도 횟수")
     p.add_argument(
@@ -189,6 +194,7 @@ def build_config(a: argparse.Namespace) -> RunConfig:
         mock=a.mock,
         delegate=a.delegate,
         full_access=a.full_access,
+        auto_commit=not a.no_auto_commit,
         max_attempts=a.max_attempts,
         retries=a.retries,
         session_timeout=(a.timeout if a.timeout and a.timeout > 0 else None),
