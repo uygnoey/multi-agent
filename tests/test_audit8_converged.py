@@ -318,3 +318,37 @@ def test_token_with_cookie_unsafe_chars_roundtrips(make_server):
     resp2 = conn2.getresponse()
     resp2.read()
     assert resp2.status == 200, "round-trip 쿠키로 인증되어야 함(401 루프 아님)"
+
+
+def test_token_equal_supports_non_ascii():
+    # 예전엔 hmac.compare_digest 가 non-ascii str 을 거부해 무조건 False(인증 불가)였다.
+    from orchestrator.webui import _token_equal
+
+    assert _token_equal("토큰값🔑", "토큰값🔑") is True
+    assert _token_equal("토큰값🔑", "다른값") is False
+    assert _token_equal("", "x") is False
+    assert _token_equal("x", "") is False
+    assert _token_equal("ascii-tok", "ascii-tok") is True
+
+
+def test_non_ascii_token_authenticates_and_roundtrips(make_server):
+    # non-ascii WEB_UI_TOKEN 도 ?token= 인증 → 303 + 쿠키 → 쿠키 인증 200 까지 동작.
+    token = "한국어토큰🔑"
+    s = make_server(token=token)
+
+    conn = http.client.HTTPConnection("127.0.0.1", s["port"])
+    conn.request("GET", "/?token=" + quote(token, safe=""))
+    resp = conn.getresponse()
+    resp.read()
+    assert resp.status == 303
+    cookie_pair = (resp.getheader("Set-Cookie") or "").split(";", 1)[0]
+    assert cookie_pair.startswith("token=")
+    raw = cookie_pair[len("token=") :]
+    raw.encode("ascii")  # 쿠키 값은 percent-encode 되어 순수 ASCII 여야 한다(헤더 안전)
+    assert unquote(raw) == token
+
+    conn2 = http.client.HTTPConnection("127.0.0.1", s["port"])
+    conn2.request("GET", "/api/state", headers={"Cookie": cookie_pair})
+    resp2 = conn2.getresponse()
+    resp2.read()
+    assert resp2.status == 200

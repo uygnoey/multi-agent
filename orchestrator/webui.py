@@ -12,6 +12,7 @@ TUI(monitor.py)와 동일한 데이터 소스(`<project-dir>/.orchestrator/board
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import json
 import math
@@ -37,10 +38,15 @@ MAX_SPEC_BYTES = 1024 * 1024  # 기획서 텍스트 상한
 
 
 def _token_equal(provided: str, expected: str) -> bool:
-    try:
-        return bool(provided) and hmac.compare_digest(provided, expected)
-    except TypeError:
+    # hmac.compare_digest 는 non-ascii str 을 거부한다(공백/특수문자는 OK 지만 한글 등은 TypeError).
+    # 따라서 원문을 직접 비교하지 않고 UTF-8 바이트의 SHA-256 다이제스트를 상수시간 비교한다.
+    # 다이제스트는 항상 같은 길이라 compare_digest 의 상수시간 보장이 유지되고, non-ascii 토큰도
+    # 안전하게 인증된다(예전엔 non-ascii WEB_UI_TOKEN 이 무조건 인증 실패했음).
+    if not provided or not expected:
         return False
+    p = hashlib.sha256(provided.encode("utf-8")).digest()
+    e = hashlib.sha256(expected.encode("utf-8")).digest()
+    return hmac.compare_digest(p, e)
 
 
 def _read_events(orch_dir, n: int = 300) -> str:
