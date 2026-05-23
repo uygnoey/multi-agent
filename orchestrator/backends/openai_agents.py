@@ -15,8 +15,10 @@ import asyncio
 import errno
 import os
 import re
+import shutil
 import signal
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -313,8 +315,58 @@ def _kill_process_group(proc, grace: float = 2.0) -> None:
             pass
 
 
-def _run_bash_command(command: str, cwd: str, timeout: float, max_capture: int) -> str:
+def _macos_sandbox_profile(root: str) -> str:
+    """macOS sandbox-exec 용 'workspace-write' 프로파일: read/exec/network 는 허용하되 쓰기는
+    프로젝트 루트(+시스템 임시 디렉터리)로 제한한다. codex 의 --sandbox workspace-write 와 동급."""
+
+    def esc(p: str) -> str:
+        return p.replace("\\", "\\\\").replace('"', '\\"')
+
+    writable = [root, "/private/tmp", "/private/var/folders", "/tmp", "/var/tmp", "/dev"]
+    allows = "\n".join(f'  (subpath "{esc(p)}")' for p in writable)
+    return f"(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*\n{allows}\n)\n"
+
+
+def _bash_command_spec(command: str, root: str, full_access: bool) -> tuple[list[str], str]:
+    """run_bash 권한 2-tier 의 argv/경고를 결정한다(부수효과는 which 조회뿐).
+
+    - full_access=True  → 격리 없이 머신 전역으로 실행(진짜 컴퓨터 전체 접근, --full-access).
+    - full_access=False → 프로젝트 폴더 밖 '쓰기'를 막는 OS 샌드박스로 감싼다(기본 정책).
+        · macOS: sandbox-exec(workspace-write 프로파일)
+        · Linux: bwrap(전체 ro-bind + 루트/tmp 만 rw) 가 있으면 사용
+        · 둘 다 없으면 best-effort 로 그대로 실행하되 경고 note 를 출력에 접두한다.
+    반환: (argv, note). note 가 비어있지 않으면 경계 강제가 불가능했음을 뜻한다.
+    """
+    base = ["/bin/sh", "-c", command]
+    if full_access:
+        return base, ""
+    if sys.platform == "darwin" and shutil.which("sandbox-exec"):
+        return ["sandbox-exec", "-p", _macos_sandbox_profile(root), *base], ""
+    if sys.platform.startswith("linux") and shutil.which("bwrap"):
+        return [
+            "bwrap",
+            "--ro-bind", "/", "/",
+            "--dev", "/dev",
+            "--proc", "/proc",
+            "--bind", root, root,
+            "--bind", "/tmp", "/tmp",
+            "--die-with-parent",
+            *base,
+        ], ""
+    return base, (
+        "[warn] FS 샌드박스 미사용: 이 플랫폼에 sandbox-exec/bwrap 가 없어 프로젝트 폴더 쓰기 "
+        "제한을 강제하지 못했습니다(best-effort). 진짜 격리는 컨테이너/OS 레벨에서만 가능.\n"
+    )
+
+
+def _run_bash_command(
+    command: str, cwd: str, timeout: float, max_capture: int, full_access: bool = False
+) -> str:
     """#2/#3: 셸 명령을 wall-clock 타임아웃·바운디드 버퍼·프로세스그룹 종료로 실행.
+
+    권한 2-tier(확정 설계): 기본(full_access=False)은 프로젝트 폴더 밖 쓰기를 막는 OS
+    샌드박스로 감싸 실행하고, full_access=True(--full-access)면 가두지 않고 머신 전역으로
+    실행한다. argv/머신선택은 _bash_command_spec 가 결정한다.
 
     - start_new_session=True 로 새 프로세스 그룹을 만들어 자식까지 그룹째 정리한다(#3).
     - 백그라운드 스레드가 stdout 을 max_capture 까지만 보관(초과는 drop)하며 계속 소비해
@@ -324,10 +376,10 @@ def _run_bash_command(command: str, cwd: str, timeout: float, max_capture: int) 
     """
     proc = None
     cap = _BashCapture(max_capture)
+    argv, sandbox_note = _bash_command_spec(command, cwd, full_access)
     try:
         proc = subprocess.Popen(
-            command,
-            shell=True,
+            argv,
             cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,  # stdout+stderr 를 한 스트림으로 합쳐 순서 보존
@@ -359,11 +411,12 @@ def _run_bash_command(command: str, cwd: str, timeout: float, max_capture: int) 
         # 드레인 스레드가 EOF 까지 마무리하도록 잠깐 join (kill 후엔 곧 끝난다).
         drainer.join(timeout=2.0)
 
-        body = cap.text()[:4000]
-        note = "\n<... output truncated>" if cap.truncated and len(body) >= 4000 else ""
+        out = cap.text()[:4000]
+        trunc = "\n<... output truncated>" if cap.truncated and len(out) >= 4000 else ""
+        body = f"{sandbox_note}{out}{trunc}"
         if timed_out:
-            return f"[timeout]\n{body}{note}"
-        return f"[exit {rc}]\n{body}{note}"
+            return f"[timeout]\n{body}"
+        return f"[exit {rc}]\n{body}"
     except Exception as e:
         _kill_process_group(proc)
         return f"<bash error: {e}>"
@@ -468,7 +521,17 @@ def _open_inside(path: Path, root: Path, flags: int, mode: int = 0o644) -> int:
 
 def _read_file_bytes_under_root(path: Path, root: Path, max_bytes: int) -> bytes:
     fd = _open_inside(path, root, os.O_RDONLY)
-    with os.fdopen(fd, "rb") as fh:
+    # 디렉터리 대상이면 os.fdopen(fd,"rb") 가 fd 인계 전에 IsADirectoryError 로 실패해
+    # with 가 닫지 못한 fd 가 누수된다 → fdopen 성공 전 예외에서 fd 를 명시적으로 닫는다.
+    try:
+        fh = os.fdopen(fd, "rb")
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    with fh:
         return fh.read(max_bytes + 1)
 
 
@@ -550,6 +613,9 @@ class OpenAIAgentsBackend(Backend):
             # #1(audit7): syscall 직전 realpath 재검사 — _safe 이후 symlink 가 끼어들어도 탈출 차단.
             if not _resolve_under_root(p, root):
                 return f"<path escapes project dir: {path}>"
+            # 디렉터리/특수파일은 읽기 대상이 아니다(디렉터리면 open 후 fd 누수 위험) → 명시적 거부.
+            if not p.is_file():
+                return f"<not a file: {path}>"
             # #35: 거대 파일을 통째로 메모리에 올린 뒤 자르면 200KB 상한이 메모리를 못 막는다.
             # 바이트 단위로 max_read_bytes+1 까지만 읽어, 초과 여부를 비싸지 않게 판정한다.
             # #1(audit7): O_NOFOLLOW 로 최종 컴포넌트가 symlink 면 open 자체를 거부(TOCTOU 차단).
@@ -617,6 +683,9 @@ class OpenAIAgentsBackend(Backend):
             # #1(audit7): syscall 직전 realpath 재검사 — _safe 이후 symlink 가 끼어들어도 탈출 차단.
             if not _resolve_under_root(p, root):
                 return f"<path escapes project dir: {path}>"
+            # 디렉터리/특수파일은 편집 대상이 아니다(디렉터리면 read 시 fd 누수 위험) → 명시적 거부.
+            if not p.is_file():
+                return f"<not a file: {path}>"
             # #3: read_text() 로 통째 올리기 전에 크기를 먼저 검사 — 거대 파일은 메모리를
             # 폭주시키므로 로드하지 않고 거부한다(편집은 유일성 치환 위해 전체 내용 필요).
             try:
@@ -686,16 +755,20 @@ class OpenAIAgentsBackend(Backend):
         def run_bash(command: str) -> str:
             """셸 명령 실행 (cwd=타깃).
 
-            주의(#1/#16): shell=True 이며 cwd 만 설정한다. 셸 자체는 FS 경계를 강제하지 않으므로
-            절대경로/상위참조로 타깃 밖 파일 접근이 가능하다 — 진짜 격리는 in-process 로 불가능한
-            근본 제약(KEEP-DOCUMENTED; 진짜 샌드박스는 컨테이너/OS 레벨에서만 가능). 노출 자체는
-            역할의 allowed_tools(Bash) + 환경변수 ORCH_OPENAI_ALLOW_BASH(기본 활성)로 제어된다.
+            권한 2-tier(확정 설계): 기본은 프로젝트 폴더 밖 '쓰기'를 막는 OS 샌드박스
+            (macOS sandbox-exec / Linux bwrap)로 감싸 실행한다 — 프로젝트 폴더 안에서는 자유롭게
+            읽기/쓰기/실행하되 타깃 밖 파일은 변조할 수 없다. req.full_access(--full-access)면
+            샌드박스 없이 머신 전역으로 실행한다(진짜 컴퓨터 전체 접근). 샌드박스 도구가 없는
+            플랫폼에서는 best-effort 로 실행하되 출력에 [warn] 경고를 접두한다. 노출 자체는 역할의
+            allowed_tools(Bash) + 환경변수 ORCH_OPENAI_ALLOW_BASH(기본 활성)로 제어된다.
 
             #2: 출력이 전혀 없는 silent 명령(sleep 100 등)도 wall-clock 타임아웃되고, #3: 셸이
             spawn 한 자식까지 프로세스 그룹째 종료된다(고아/좀비 방지). 정상 종료는 ``[exit N]``,
             타임아웃은 ``[timeout]`` 접두로 반환한다.
             """
-            return _run_bash_command(command, str(root), bash_timeout, max_bash_capture)
+            return _run_bash_command(
+                command, str(root), bash_timeout, max_bash_capture, req.full_access
+            )
 
         # 역할의 allowed_tools 만 노출 (다른 백엔드의 --allowedTools 와 동일한 격리).
         # #13: Edit → edit_file(진짜 부분 패치). Write → write_file(전체 덮어쓰기).
