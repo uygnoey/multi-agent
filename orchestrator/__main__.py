@@ -20,6 +20,28 @@ from .config import (
 from .scheduler import Scheduler
 
 
+def _port(raw: str) -> int:
+    """--port 검증: 1..65535 범위 정수만 허용 (RunConfig 우회 → serve 직행이므로 여기서 방어)."""
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"포트는 정수여야 합니다: {raw!r}") from None
+    if not (1 <= v <= 65535):
+        raise argparse.ArgumentTypeError(f"포트는 1..65535 범위여야 합니다: {v}")
+    return v
+
+
+def _pos_float(raw: str) -> float:
+    """--interval 검증: 유한하고 0 보다 큰 실수만 허용 (RunConfig 를 우회해 run_tui 로 직행)."""
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"양의 실수여야 합니다: {raw!r}") from None
+    if not math.isfinite(v) or v <= 0:
+        raise argparse.ArgumentTypeError(f"0 보다 큰 유한한 값이어야 합니다: {raw!r}")
+    return v
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="orchestrator",
@@ -83,7 +105,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument(
         "--interval",
-        type=float,
+        type=_pos_float,
         default=1.0,
         help="--watch 모니터 TUI 의 갱신 주기(초). 기본 1.0",  # #16
     )
@@ -92,7 +114,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help="웹 UI 서버 실행 (브라우저에서 기획서 업로드·실행·모니터링)",
     )
-    p.add_argument("--port", type=int, default=8765, help="--web 포트 (기본 8765)")
+    p.add_argument("--port", type=_port, default=8765, help="--web 포트 (기본 8765, 1..65535)")
     p.add_argument("--host", default="127.0.0.1", help="--web 바인드 호스트")
     p.add_argument(
         "--base-dir", type=Path, help="--web 실행 결과 베이스 디렉터리 (기본 ~/agent-runs)"

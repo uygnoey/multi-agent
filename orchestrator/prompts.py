@@ -80,7 +80,10 @@ def compose_prompt(
             parts.append("## Spec excerpt\n" + spec_excerpt[:1500])
 
     if recent_events:
-        parts.append("## Recent events\n" + recent_events)
+        # directives([-2000:])·spec_excerpt([:1500]) 와 마찬가지로 길이 상한을 둔다.
+        # 이벤트 로그는 무한정 커질 수 있어 캡이 없으면 프롬프트가 비대해진다.
+        # 최근 ~2000자만 싣는다.
+        parts.append("## Recent events\n" + recent_events[-2000:])
 
     parts.append("## Instruction\n" + _ROLE_INSTRUCTION.get(role, "Perform your role."))
 
@@ -99,22 +102,34 @@ def compose_prompt(
             "- Write and edit source files only; QA runs the tests."
         )
 
-    parts.append(
-        "## Completion report (required)\n"
-        f"When done, write your result as JSON to `{result_rel}`. Schema:\n"
-        "```json\n"
-        '{"status": "done", "artifacts": ["relative/path", ...], "notes": ["..."], '
-        '"blockers": [], "units": []}\n'
-        "```\n"
-        "- `status` MUST be one of: `done`, `failed`, `blocked` "
-        "(use `failed`/`blocked` when the work could not be completed, and list reasons "
-        "in `blockers`).\n"
-        "- `artifacts` MUST be project-relative paths (e.g. `backend/app/api.py`). "
-        "Do NOT use absolute paths (no leading `/`, no `C:\\`) or `..` parent-traversal; "
-        "list only files you actually created or edited.\n"
-        "- Architect only: include a `units` array of "
-        '[{"id","title","description","deps":[],"roles":[]}]. '
-        "Each `id` MUST be a simple slug (letters, digits, `-`/`_`; no spaces, slashes, "
-        "or `..`), and `deps` MUST reference such ids."
-    )
+    # 감독자(project-manager/project-leader)는 읽기전용(RO_TOOLS, Write 없음)이고 러너도 이들의
+    # 결과 파일을 요구하지 않는다(출력 자체를 보드 지시사항으로 캡처). 따라서 결과 JSON 작성을
+    # 지시하면 모순이 되므로, 감독자에게는 파일을 쓰지 말고 지침/지시사항을 산문으로
+    # 응답하라고 안내한다.
+    if role in ("project-manager", "project-leader"):
+        parts.append(
+            "## Output\n"
+            "You are a read-only supervisor: do NOT write any files (no result JSON, no "
+            f"`{result_rel}`). Respond directly with your guidance/directive as prose — "
+            "it is captured as a board directive for the team."
+        )
+    else:
+        parts.append(
+            "## Completion report (required)\n"
+            f"When done, write your result as JSON to `{result_rel}`. Schema:\n"
+            "```json\n"
+            '{"status": "done", "artifacts": ["relative/path", ...], "notes": ["..."], '
+            '"blockers": [], "units": []}\n'
+            "```\n"
+            "- `status` MUST be one of: `done`, `failed`, `blocked` "
+            "(use `failed`/`blocked` when the work could not be completed, and list reasons "
+            "in `blockers`).\n"
+            "- `artifacts` MUST be project-relative paths (e.g. `backend/app/api.py`). "
+            "Do NOT use absolute paths (no leading `/`, no `C:\\`) or `..` parent-traversal; "
+            "list only files you actually created or edited.\n"
+            "- Architect only: include a `units` array of "
+            '[{"id","title","description","deps":[],"roles":[]}]. '
+            "Each `id` MUST be a simple slug (letters, digits, `-`/`_`; no spaces, slashes, "
+            "or `..`), and `deps` MUST reference such ids."
+        )
     return "\n\n".join(parts)

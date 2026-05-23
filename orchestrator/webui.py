@@ -355,6 +355,12 @@ class RunManager:
         """run 의 프로세스 그룹을 종료. SIGTERM(유예) 후 SIGKILL(강제)로 확실히 종료.
 
         오케스트레이터가 SIGTERM 을 트랩(graceful)해 안 죽는 경우가 있어 SIGKILL 폴백 필수.
+
+        audit7(PID/PGID 재사용 방어): pgid 를 시작 시 한 번 캡처해 수 초간 os.killpg 를 반복하면,
+        그 사이 그룹 리더가 죽고 커널이 같은 PGID 를 무관한 새 프로세스 그룹에 재할당할 때
+        엉뚱한 그룹을 죽일 수 있다. 그래서 매 그룹 시그널 직전에 리더가 아직 그 그룹을 이끄는지
+        재검증(_leader_leads_group)하고, 리더가 사라진 순간 그룹 시그널을 완전히 중단한다 —
+        마지막 blanket 그룹 SIGKILL 도 보내지 않는다.
         """
         pid = None
         orch = self.project_dir(run_id) / ".orchestrator"
@@ -375,11 +381,31 @@ class RunManager:
         except Exception:
             pgid = None
 
+        def _leader_alive() -> bool:
+            # audit7: 그룹 시그널 직전, 원래 리더 pid 가 아직 살아있고(우리가 띄운 자식이면
+            #         poll() 로 좀비를 reap) 그 pid 가 여전히 같은 그룹을 이끄는지 재검증한다.
+            #         tracked child 면 proc.poll() 을 liveness 의 1차 기준으로 쓴다(좀비 reap).
+            if proc is not None and hasattr(proc, "poll"):
+                try:
+                    if proc.poll() is not None:  # 이미 종료(우리 자식) → 리더 사라짐
+                        return False
+                except Exception:
+                    pass
+            try:
+                os.kill(pid, 0)  # signal 0 = 존재 확인 (죽었으면 OSError)
+                return os.getpgid(pid) == pgid if pgid is not None else True
+            except OSError:
+                return False
+
         def _kill(sig):
+            # audit7: 그룹 시그널은 원래 리더가 그 그룹을 아직 이끌 때만 보낸다(PGID 재사용 방어).
+            #         리더가 사라졌으면(또는 그룹 정보 부재) per-process 폴백만, 그것도 리더 생존
+            #         확인 시에만 — 재사용됐을 수 있는 pgid 에는 어떤 시그널도 보내지 않는다.
             try:
                 if pgid is not None:
-                    os.killpg(pgid, sig)
-                else:
+                    if _leader_alive():
+                        os.killpg(pgid, sig)
+                elif _leader_alive():
                     os.kill(pid, sig)
             except Exception:
                 pass
@@ -407,6 +433,17 @@ class RunManager:
             except Exception:
                 pass
 
+        def _sweep_stragglers():
+            # audit5 #1/#3 복원: 리더 종료 후 SIGTERM 무시 잔존 자식을 그룹 SIGKILL 로 일소.
+            # 그룹이 비어있지 않은 한 pgid 는 재사용 불가(잔존 자식이 '우리 그룹'의 증거)라 우리
+            # 그룹만 친다(비었으면 ESRCH 무해). 완전한 stale-pidfile/PID 재사용 방어는 start-time
+            # 검증이 필요 — 후속 과제. (audit7 wait-phase 가드 + audit5 reap 의 절충.)
+            if pgid is not None:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except Exception:
+                    pass
+
         # #13: pidfile 을 즉시 지우면 프로세스가 아직 살아 run 상태를 쓰는 중인데도
         #      UI/monitor 가 stopped 로 보인다. SIGTERM 후 실제 종료를 "확인"한 뒤에만
         #      pidfile 을 제거한다. 요청 스레드를 길게 막지 않도록 짧게(≈0.5초)만 동기 확인하고,
@@ -414,10 +451,7 @@ class RunManager:
         _kill(signal.SIGTERM)
         for _ in range(10):  # ≈0.5초: 대부분의 프로세스는 SIGTERM 으로 즉시 종료
             if not _alive():
-                # #3: 부모가 graceful 종료해도 SIGTERM 을 무시한 채 그룹에 남은 자식(부모만
-                #     먼저 죽은 child-only 잔존)이 있을 수 있다. pid 생존만 보면 놓치므로 마지막에
-                #     그룹 SIGKILL 로 한 번 더 쓸어 잔존 자식을 일소한다(그룹 비면 무해).
-                _kill(signal.SIGKILL)
+                _sweep_stragglers()  # #3: 리더 사후 SIGTERM-무시 잔존 자식 일소
                 _remove_pidfile()
                 return True
             time.sleep(0.05)
@@ -426,18 +460,19 @@ class RunManager:
             # 남은 시간(최대 ≈3.5초) graceful 종료를 더 기다린다(0.1초 간격 폴링).
             for _ in range(35):
                 if not _alive():
-                    _kill(signal.SIGKILL)  # #3: 잔존 자식 일소(그룹 SIGKILL 스윕)
+                    _sweep_stragglers()  # #3: 리더 사후 잔존 자식 일소
                     _remove_pidfile()
                     return
                 time.sleep(0.1)
             # 트랩 대비 강제 종료. SIGKILL 은 비동기라 즉시 죽지 않을 수 있으니 잠깐 사멸을
             # 확인한 뒤(있다면 좀비 reap 포함) pidfile 을 제거한다. #135: 어떤 경우에도
             # 최종적으로 pidfile 은 반드시 제거되어 "running" 잔상이 남지 않게 한다.
-            _kill(signal.SIGKILL)
+            _kill(signal.SIGKILL)  # 리더 생존 중 → 그룹 강제 종료(audit7 가드 통과)
             for _ in range(20):  # ≈1초: SIGKILL 후 커널 teardown 대기
                 if not _alive():
                     break
                 time.sleep(0.05)
+            _sweep_stragglers()  # 리더 종료 후 남은 자식까지 일소
             _remove_pidfile()
 
         threading.Thread(target=_supervise, daemon=True).start()
@@ -498,6 +533,12 @@ def _make_handler(manager: RunManager, token: str | None = None):
     auth_token = (token if token is not None else os.environ.get("WEB_UI_TOKEN", "")).strip()
 
     class Handler(BaseHTTPRequestHandler):
+        # audit7(slow-loris 방어): BaseHTTPRequestHandler 는 이 클래스 속성 timeout 을
+        #   소켓 read 타임아웃으로 설정한다(setup() 에서 self.connection.settimeout(self.timeout)).
+        #   미설정(None)이면 헤더/바디 read 가 무한정 블록돼 느린 클라이언트가
+        #   ThreadingHTTPServer 워커 스레드를 영구 점유한다. 30초 상한을 둔다.
+        timeout = 30
+
         def log_message(self, *args):  # quiet
             pass
 
@@ -565,21 +606,72 @@ def _make_handler(manager: RunManager, token: str | None = None):
                 attrs += "; Secure"
             return attrs
 
-        # ---- #9: CSRF/Origin 방어 ----
+        # ---- #9 / audit7: CSRF/Origin 방어 ----
+        def _is_cookie_only_auth(self) -> bool:
+            """이 요청이 쿠키만으로 인증됐는지(= Authorization/X-Auth-Token 헤더 없음) 판별.
+
+            브라우저는 자동으로 쿠키를 실어 보내므로 쿠키 인증 요청이 CSRF 의 표적이 된다.
+            반대로 Authorization/X-Auth-Token 헤더는 비-브라우저(curl 등)가 명시적으로 붙여야
+            하므로 CSRF 로 위조되지 않는다 → 그런 요청은 Origin 없이도 진행을 허용한다.
+            """
+            auth = self.headers.get("Authorization", "") or ""
+            if auth.startswith("Bearer ") and auth[len("Bearer ") :].strip():
+                return False
+            if (self.headers.get("X-Auth-Token") or "").strip():
+                return False
+            return True
+
         def _origin_ok(self) -> bool:
             """상태변경 POST 의 cross-origin 요청 차단(쿠키 인증을 켜도 CSRF 막기).
 
-            Origin 헤더가 없으면(curl 등 비-브라우저) 허용하고, 있으면 host 가 요청 Host 와
-            일치할 때만 허용한다(same-origin). 브라우저 SPA 는 same-origin 이라 통과한다.
+            audit7 강화:
+            - host 비교를 정규화한다(대소문자 무시 + 기본 포트 보정) — Origin 의 host:port 를
+              Host 헤더와 비교.
+            - 토큰이 설정돼 있고 이 요청이 *쿠키로만* 인증된 경우(헤더 토큰 없음)에는, 상태변경
+              POST 에 일치하는 Origin 을 *반드시* 요구한다(Origin 부재 시 fail-open 금지) —
+              브라우저가 쿠키를 자동 전송하므로 CSRF 표적이기 때문.
+            - Authorization/X-Auth-Token 헤더로 인증하는 비-브라우저 클라이언트(쿠키 없음)는
+              Origin 없이도 진행을 허용한다(CSRF 로 위조 불가).
             """
             origin = self.headers.get("Origin")
             if not origin:
-                return True  # 비-브라우저(Origin 없음) — CSRF 대상 아님
+                # Origin 부재: 쿠키-only 인증(토큰 설정 시)이면 차단(CSRF 표적), 그 외는 허용.
+                if auth_token and self._is_cookie_only_auth():
+                    return False
+                return True  # 헤더 토큰 사용/토큰 미설정 — CSRF 대상 아님
             try:
-                origin_host = urlparse(origin).netloc
+                parsed = urlparse(origin)
             except Exception:
                 return False
-            return bool(origin_host) and origin_host == (self.headers.get("Host") or "")
+            host = self.headers.get("Host") or ""
+            return self._host_port_eq(parsed.hostname, parsed.port, parsed.scheme, host)
+
+        @staticmethod
+        def _host_port_eq(o_host, o_port, o_scheme: str, host_header: str) -> bool:
+            """Origin 의 (host, port) 가 Host 헤더의 (host, port) 와 같은지 정규화 비교한다.
+
+            - host 는 대소문자 무시.
+            - 포트가 명시되지 않으면 scheme 의 기본 포트(http=80/https=443)로 보정해 비교한다
+              (예: Origin "http://Host" ≡ Host "host:80").
+            """
+            if not o_host:
+                return False
+            default_port = 443 if (o_scheme or "").lower() == "https" else 80
+            o_port = o_port if o_port is not None else default_port
+            # Host 헤더를 host/port 로 분해 ("host" 또는 "host:port"; IPv6 "[::1]:port" 대응).
+            h = host_header.strip()
+            if h.startswith("["):  # IPv6 리터럴
+                end = h.find("]")
+                h_host = h[1:end] if end != -1 else h
+                rest = h[end + 1 :] if end != -1 else ""
+                h_port_s = rest[1:] if rest.startswith(":") else ""
+            else:
+                h_host, _, h_port_s = h.partition(":")
+            try:
+                h_port = int(h_port_s) if h_port_s else default_port
+            except ValueError:
+                return False
+            return o_host.lower() == h_host.lower() and o_port == h_port
 
         def _require_same_origin(self) -> bool:
             """cross-origin 이면 403 을 보내고 True 를 반환(호출부는 곧장 return)."""
@@ -694,11 +786,13 @@ def _make_handler(manager: RunManager, token: str | None = None):
             if u.path not in ("/api/run", "/api/stop", "/api/rerun"):
                 self._json({"error": "not found"}, 404)
                 return
-            # #9: 상태변경 POST 는 cross-origin 요청을 먼저 차단한다(쿠키 인증 CSRF 방어).
-            if self._require_same_origin():
-                return
-            # #17: 모든 POST 는 run 제어(/api/run·stop·rerun)이므로 토큰 인증을 강제한다.
+            # #17: run 제어(/api/run·stop·rerun)는 토큰 인증을 먼저 강제한다(무토큰/오토큰 → 401).
+            #      (origin 보다 먼저: 자격증명 없는 요청은 CSRF 판정 이전에 명확히 401 로 거부.)
             if self._require_auth():
+                return
+            # #9: 인증을 통과해도 cross-origin / 쿠키-only(Origin 부재) 상태변경 POST 는 차단한다
+            #     (쿠키 자동전송을 악용한 CSRF 방어). 헤더 토큰 인증 비-브라우저 요청은 통과.
+            if self._require_same_origin():
                 return
             try:
                 length = int(self.headers.get("Content-Length", 0) or 0)
@@ -1141,7 +1235,7 @@ async function tick(){
     // #23: 응답 객체를 보존해 status/에러 본문을 검사한다(조용히 삼키지 않음).
     const r=await fetch("/api/state?run="+encodeURIComponent(CUR));
     const s=await r.json();
-    if(s&&s.error){showErr("상태 조회 오류: "+s.error+(r.status===401?" — URL 에 ?token=… 를 추가하세요":""));return}
+    if(s&&s.error){showErr("상태 조회 오류: "+s.error+(r.status===401?" — 인증 필요: 먼저 /?token=<TOKEN> 으로 한 번 접속해 인증 쿠키를 설정하면 대시보드가 동작합니다":""));return}
     showErr("");  // 성공 시 이전 오류 제거
     const b=s.board||{};const ag=b.agents||{};const proj=s.project_dir||"";
     const units=Array.isArray(b.units)?b.units:[];

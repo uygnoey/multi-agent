@@ -39,6 +39,11 @@ class Scheduler:
         self.board = Board(cfg.project_dir)
         self.runner = Runner(cfg, self.board)
         self._stop = asyncio.Event()
+        # test/qa 동시성 캡: dev 와 별개로 test-engineer+qa 호출을 묶는 세마포어.
+        # dev 슬롯(sem)만 캡되어 있고 test/qa 는 unit 마다 자유 태스크로 떠서, unit 이 많으면
+        # 동시 백엔드 세션이 폭증할 수 있었다(과금/리소스). concurrency 에서 크기를 끌어와
+        # test/qa 병렬도도 같은 상한으로 제한한다(0/음수 방어는 RunConfig 가 이미 함).
+        self._test_sem = asyncio.Semaphore(max(1, self.cfg.concurrency))
 
     async def run(self) -> dict:
         spec_text = self.cfg.spec_path.read_text(encoding="utf-8")
@@ -304,46 +309,84 @@ class Scheduler:
             await self.board.set_status(unit["id"], FAILED, f"test pipeline error: {e}")
             await self.board.add_warning(f"{unit['id']}: test/qa 파이프라인 예외: {e}")
 
+    def _broken_deps(self, unit: dict) -> list[str]:
+        """unit 의 deps 중 현재 FAILED/BLOCKED 인 dep id 들을 반환 (경량 재검증용).
+
+        _wait_for_deps 처럼 대기/타임아웃을 하지 않고, 스냅샷 한 번으로 '지금 깨진 dep' 만
+        본다. 재작업(rework) 직전 호출해, 의존성이 그사이 무너졌으면 망가진 베이스 위에서
+        다시 개발하지 않도록 한다.
+        """
+        deps = unit.get("deps") or []
+        if not deps:
+            return []
+        units = {u["id"]: u for u in self.board.units()}
+        return [d for d in deps if units.get(d, {}).get("status") in (FAILED, BLOCKED)]
+
     async def _test_unit(self, unit: dict, sem: asyncio.Semaphore, attempt: int) -> None:
         """unit 개발 완료 직후 test-engineer → qa 를 실행 (개발 슬롯 비점유).
 
         QA 실패 시 max_attempts 내에서 개발 슬롯을 다시 잡아 재작업 후 재검증.
+
+        test/qa 백엔드 호출은 _test_sem 으로 동시성을 캡한다(dev 슬롯과 별개). rework 는
+        _develop_unit 가 dev 슬롯(sem)을 다시 잡으므로, 데드락을 피하려고 _test_sem 을 먼저
+        풀고 나서(아래 'with' 블록 밖에서) rework 를 수행한다(두 세마포어를 중첩 점유하지 않음).
         """
         uid = unit["id"]
         await self.board.set_status(uid, TESTING)
-        te = await self.runner.run_role("test-engineer", unit)
-        await self.board.add_artifacts(uid, te.get("artifacts", []))
 
-        # #18: test-engineer(테스트 작성)가 실패하면 그 산출물 위에서 qa 비용을 쓰지 않는다.
-        #      미통과로 표시하고, 시도가 남았으면 dev 부터 재작업해 '고쳐서' 다시 검증한다
-        #      (단순 중단이 아니라 rework 경로 — "실패 → 버그픽스 → 재검증").
-        te_ok = te.get("_ok", True) and te.get("status") != "failed"
-        if not te_ok:
-            await self.board.log_event(uid, "test-engineer 실패 → qa 건너뜀(비용 절감)")
-            await self.board.set_test_status(uid, "fail")
-            if attempt < self.cfg.max_attempts:
-                await self.board.log_event(uid, f"test 작성 실패 → 재작업 (attempt {attempt + 1})")
-                if await self._develop_unit(unit, sem, attempt + 1):
-                    await self._test_unit(unit, sem, attempt + 1)
+        # ---- test/qa 본작업: _test_sem 으로 동시성 캡 (이 블록 안에서만 점유) ----
+        rework = False  # 블록 밖에서 재작업할지 여부 ('fail + 시도 남음')
+        async with self._test_sem:
+            te = await self.runner.run_role("test-engineer", unit)
+            await self.board.add_artifacts(uid, te.get("artifacts", []))
+
+            # #18: test-engineer(테스트 작성)가 실패하면 그 산출물 위에서 qa 비용을 쓰지 않는다.
+            #      미통과로 표시하고, 시도가 남았으면 dev 부터 재작업해 '고쳐서' 다시 검증한다
+            #      (단순 중단이 아니라 rework 경로 — "실패 → 버그픽스 → 재검증").
+            te_ok = te.get("_ok", True) and te.get("status") != "failed"
+            if not te_ok:
+                await self.board.log_event(uid, "test-engineer 실패 → qa 건너뜀(비용 절감)")
+                await self.board.set_test_status(uid, "fail")
+                if attempt < self.cfg.max_attempts:
+                    rework = True
+                else:
+                    await self.board.set_status(uid, FAILED, "test-engineer failed after retries")
                     return
-            await self.board.set_status(uid, FAILED, "test-engineer failed after retries")
-            return
+            else:
+                qa = await self.runner.run_role("qa", unit)
+                await self.board.add_artifacts(uid, qa.get("artifacts", []))
+                # test-engineer 가 성공한 경우에만 qa 를 돌렸으므로, 통과 판정은 qa 결과만 본다.
+                passed = qa.get("_ok", True) and qa.get("status") != "failed"
+                await self.board.set_test_status(uid, "pass" if passed else "fail")
+                if passed:
+                    await self.board.set_status(uid, DONE)
+                    return
+                if attempt < self.cfg.max_attempts:
+                    rework = True
+                else:
+                    await self.board.set_status(uid, FAILED, "QA failed after retries")
+                    return
 
-        qa = await self.runner.run_role("qa", unit)
-        await self.board.add_artifacts(uid, qa.get("artifacts", []))
-
-        # test-engineer 가 성공한 경우에만 qa 를 돌렸으므로, 통과 판정은 qa 결과만 본다.
-        passed = qa.get("_ok", True) and qa.get("status") != "failed"
-        await self.board.set_test_status(uid, "pass" if passed else "fail")
-        if passed:
-            await self.board.set_status(uid, DONE)
+        # ---- rework: _test_sem 점유를 푼 뒤 수행 (dev 슬롯과 중첩 점유 회피) ----
+        if not rework:
             return
-        if attempt < self.cfg.max_attempts:
-            await self.board.log_event(uid, f"QA failed → 재작업 (attempt {attempt + 1})")
-            if await self._develop_unit(unit, sem, attempt + 1):
-                await self._test_unit(unit, sem, attempt + 1)
-                return
-        await self.board.set_status(uid, FAILED, "QA failed after retries")
+        # 재작업 전 의존성 재검증: 검증/대기 동안 dep 이 FAILED/BLOCKED 로 무너졌다면
+        # 망가진 베이스 위에서 다시 개발하지 않는다. 이 unit 을 BLOCKED 로 두고 중단한다.
+        broken = self._broken_deps(unit)
+        if broken:
+            await self.board.log_event(
+                uid, f"rework 중단: 의존성이 failed/blocked 로 무너짐 → blocked: {broken}"
+            )
+            await self.board.set_status(uid, BLOCKED, f"rework aborted: deps broken {broken}")
+            await self.board.add_warning(f"{uid}: 재작업 직전 의존성 붕괴 → blocked: {broken}")
+            return
+        await self.board.log_event(uid, f"재검증 통과 → 재작업 (attempt {attempt + 1})")
+        if await self._develop_unit(unit, sem, attempt + 1):
+            await self._test_unit(unit, sem, attempt + 1)
+            return
+        # 재개발이 실패하면 _develop_unit 이 이미 BLOCKED 로 두지만, '재시도 후 실패' 의미를
+        # 명확히 남기도록 FAILED 로 마무리한다(기존 동작 유지: rework dev 실패 → failed).
+        await self.board.set_status(uid, FAILED, "rework dev failed after retries")
 
     async def _wait_for_deps(self, unit: dict, timeout: float | None = None) -> bool:
         """deps 가 모두 완료되면 True. 실패/blocked dep 이 있으면 즉시 False(패스트페일).
@@ -380,18 +423,8 @@ class Scheduler:
                 return False
             if all(units.get(d, {}).get("status") in TERMINAL_OK for d in pending):
                 return True
-            # 진행 신호: dep 상태 + 에이전트 활동(updated_at). 변하면 작업이 살아있다는 뜻.
-            # updated_at 은 '의존 unit 을 작업 중인' 에이전트로 한정한다(관련 없는 PM/PL·다른
-            # unit 활동이 idle 타이머를 리셋해 stall 실패를 지연/방해하지 않도록). 관련 에이전트가
-            # 없으면(아직 시작 전 등) 전체로 폴백해 견고성을 유지한다.
-            agents = self.board.agents()
-            pending_set = set(pending)
-            scoped = [a for a in agents.values() if a.get("current_unit") in pending_set]
-            relevant = scoped if scoped else list(agents.values())
-            sig = (
-                tuple(units.get(d, {}).get("status") for d in pending),
-                round(max((a.get("updated_at", 0.0) for a in relevant), default=0.0), 1),
-            )
+            # 진행 신호 계산은 _dep_progress_sig 로 위임한다. 변하면 작업이 살아있다는 뜻.
+            sig = self._dep_progress_sig(pending, units, self.board.agents())
             if sig != prev_sig:
                 prev_sig, idle = sig, 0.0  # 진행 있음 → 리셋 (살아있으면 막지 않음)
             else:
@@ -404,6 +437,34 @@ class Scheduler:
                     return False
             last_check = time.monotonic()
             await asyncio.sleep(1.0)
+
+    def _dep_progress_sig(self, pending: list[str], units: dict, agents: dict) -> tuple:
+        """미완료 dep 들의 '진행 신호' 시그니처. 값이 바뀌면 작업이 살아있다는 뜻이다.
+
+        진행 신호의 핵심은 idle 타이머를 언제 리셋하느냐다. 두 경우로 나눈다.
+
+        1) dep unit 을 직접 작업 중인 에이전트(scoped: current_unit ∈ pending)가 있으면,
+           그 에이전트들의 updated_at 을 신호에 포함한다 — 실제로 살아있으니 stall 로 죽이지 않는다.
+        2) scoped 에이전트가 없으면(아무도 이 dep 을 잡고 있지 않음), 신호를 dep unit '자체의
+           상태'로만 한정한다(상태 + notes 누적). 전체 에이전트(updated_at)로 폴백하지 않는다 —
+           PM/PL 감독은 매 poll tick 마다 updated_at 을 갱신하므로, 전체 폴백을 쓰면 dep 가 진짜로
+           멈춰 있어도 PM/PL tick 이 idle 타이머를 계속 리셋해 stall 타임아웃이 영영 발화하지 않는다
+           (이게 이번 수정 대상 버그). dep 자체 상태/notes 만 보면 무관한 PM/PL tick 이 stall 을
+           방해하지 못하고, 진짜 멈춘 dep 은 timeout 에 도달해 False(→ BLOCKED) 가 된다.
+        """
+        status_sig = tuple(units.get(d, {}).get("status") for d in pending)
+        pending_set = set(pending)
+        scoped = [a for a in agents.values() if a.get("current_unit") in pending_set]
+        if scoped:
+            # 기존 동작 유지: dep 을 작업 중인 에이전트의 updated_at 을 진행 신호로 사용.
+            return (
+                status_sig,
+                round(max(a.get("updated_at", 0.0) for a in scoped), 1),
+            )
+        # scoped 에이전트 없음 → dep unit 자체의 상태/진행(notes)만으로 신호 구성.
+        # (status 가 안 바뀌어도 notes 가 늘면 진행이 있는 것으로 본다. 전체 에이전트 활동은 무시.)
+        notes_sig = tuple(len(units.get(d, {}).get("notes") or ()) for d in pending)
+        return (status_sig, notes_sig)
 
     async def _supervise(self, role: str) -> None:
         """PM/PL 상시 감독: 매 tick 마다 1-shot 리뷰 → 디렉티브 기록.

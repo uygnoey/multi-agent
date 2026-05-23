@@ -10,6 +10,7 @@ import asyncio
 import copy
 import json
 import math
+import os
 import re
 import time
 from pathlib import Path
@@ -195,9 +196,34 @@ class Board:
 
     # ---- persistence ----
     def _flush(self) -> None:
+        # board.json 은 단일 진실원본(single source of truth)이다. temp→rename 의 원자성만으로는
+        # 부족하다: write 후 fsync 없이 크래시/정전이 나면 atomic rename 에도 불구하고 board.json 이
+        # 0바이트/부분 파일로 남아 영속성 공백(durability gap)이 생긴다. 따라서:
+        #   1) tmp 를 실제 파일핸들로 열어 본문을 쓰고 flush()+os.fsync(fd) 로 디스크에 강제 반영,
+        #   2) 그 다음 atomic 하게 replace,
+        #   3) best-effort 로 상위 디렉터리 fd 도 fsync 해 rename 메타데이터를 영속화한다.
+        # default=str: set/bytes/커스텀 객체 같은 비-직렬화 값(예: 살균되지 않은
+        # title/description/stack/message)이 _data 에 들어와도 TypeError 로 단일 writer 를
+        # 죽이지 않고 문자열로 격하시킨다. (안 그러면 in-memory 상태는 변형됐는데 영속화는 실패해
+        # 디버전스가 나고 이후 모든 변형도 실패한다.)
         tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(self.path)
+        payload = json.dumps(self._data, ensure_ascii=False, indent=2, default=str)
+        with tmp.open("w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())  # tmp 본문을 디스크에 강제 반영 (rename 전 내구성 확보)
+        tmp.replace(self.path)  # 원자적 교체 유지
+        # rename(디렉터리 엔트리 변경)을 영속화하려면 상위 디렉터리도 fsync 해야 한다. 단,
+        # 일부 플랫폼/파일시스템(예: Windows)은 디렉터리 fd-fsync 를 지원하지 않으므로 best-effort.
+        try:
+            dir_fd = os.open(str(self.path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            # 디렉터리 fsync 미지원 플랫폼/디렉터리는 조용히 건너뛴다 (atomic rename 자체는 유지됨).
+            pass
 
     async def init(self, spec_text: str, stack: dict) -> None:
         async with self._lock:

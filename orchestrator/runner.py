@@ -189,70 +189,98 @@ class Runner:
         res: RoleResult | None = None
         chosen = candidates[0]
         role_cost = 0.0
+        # 바깥 try 는 마지막 안전망(safety net)일 뿐이다. 후보 처리는 후보별 안쪽 try/except 로
+        # 감싸므로, 한 후보를 처리하다 발생한 예기치 못한 예외(백엔드 호출이 아니라
+        # write_agent_block/add_cost/agent_update/결과 로깅 등에서 난 것)는 그 후보만 실패로 보고
+        # 다음 후보로 폴오버한다. (백엔드 호출 자체의 예외는 이미 _run_with_retries 안에서
+        # RoleResult 로 흡수된다.) 예전에는 전체 for 가 하나의 try 안에 있어, 백엔드가 아닌
+        # 처리 단계에서 한 번 예외가 나면 남은 폴오버 후보를 건너뛰고 role 전체가 죽었다.
         try:
             for i, name in enumerate(candidates):
                 chosen = name
-                req = self._build_req(
-                    role, spec, unit, agent, prompt, result_path, result_rel, name
-                )
-                team = f" +team={[m['name'] for m in req.teammates]}" if req.teammates else ""
-                fo = f" (failover {i + 1}/{len(candidates)})" if i else ""
-                await self.board.log_event(
-                    role, f"start [{name}]" + (f" unit={key}" if unit else "") + team + fo
-                )
-                await self.board.agent_update(
-                    role,
-                    status="running",
-                    unit=key,
-                    backend=name,
-                    call=True,
-                    activity="▶ " + (f"unit={key} " if unit else "") + f"[{name}]{team}{fo}",
-                )
-                if result_path.exists() and _under_results_dir(result_path, self.board):
-                    result_path.unlink()  # 후보마다 직전 결과 제거 → 신선도 보장 (#25)
-
-                # 상세 로그: 보낸 프롬프트 (시스템 + 작업).
-                # #3: 전체 프롬프트 본문에는 spec excerpt·PM/PL directives 등 민감 내용이 들어가
-                # .orchestrator/agents 로그에 영구 저장될 수 있다. ORCH_LOG_PROMPTS=0 으로 끄면
-                # 본문 대신 짧은 메모만 남긴다. 기본값(미설정)은 디버깅 편의를 위해 전체 기록 유지.
-                title = f"PROMPT → [{name}]" + (f" unit={key}" if unit else "")
-                if _log_prompt_bodies():
-                    body = "[SYSTEM]\n" + agent.system_prompt + "\n\n[TASK]\n" + prompt
-                else:
-                    body = (
-                        "[prompt body suppressed: ORCH_LOG_PROMPTS=0] "
-                        f"system={len(agent.system_prompt)} chars, task={len(prompt)} chars"
+                try:
+                    req = self._build_req(
+                        role, spec, unit, agent, prompt, result_path, result_rel, name
                     )
-                self.board.write_agent_block(role, title, body)
-                # 후보가 예외를 던져도 다음 후보로 폴오버 (전체 role 을 죽이지 않는다)
-                res = await self._run_with_retries(get_backend(name), req, role, key)
-                # 상세 로그: 받은 결과. board.write_agent_block 가 본문을 ~20000자로 절단하므로
-                # spec/directives/대용량 출력이 로그를 무한히 키우지 않음 (#31/#32). 단, spec 내
-                # 민감정보는 여전히 .orchestrator/agents 로그에 (절단된 형태로) 남을 수 있음.
-                self.board.write_agent_block(
-                    role,
-                    f"RESULT ← [{name}] ok={res.ok}",
-                    res.final_message or res.error or "(no output)",
-                )
-                if res.cost_usd:
-                    role_cost += res.cost_usd
-                    await self.board.add_cost(res.cost_usd)
+                    team = f" +team={[m['name'] for m in req.teammates]}" if req.teammates else ""
+                    fo = f" (failover {i + 1}/{len(candidates)})" if i else ""
+                    await self.board.log_event(
+                        role, f"start [{name}]" + (f" unit={key}" if unit else "") + team + fo
+                    )
                     await self.board.agent_update(
-                        role, cost_add=res.cost_usd, cost_est=res.cost_estimated
+                        role,
+                        status="running",
+                        unit=key,
+                        backend=name,
+                        call=True,
+                        activity="▶ " + (f"unit={key} " if unit else "") + f"[{name}]{team}{fo}",
                     )
-                if res.tokens:
-                    await self.board.agent_update(role, tokens_add=res.tokens)
-                if res.warning:  # 백엔드 경고(예: SDK 예산 캡 미적용)를 보드/리포트에 표면화
-                    await self.board.add_warning(f"{role} [{name}]: {res.warning}")
-                if res.ok:
-                    break
-                if i < len(candidates) - 1:
-                    nxt = candidates[i + 1]
-                    await self.board.log_event(role, f"failover [{name}]→[{nxt}]: {res.error}")
-                    await self.board.agent_update(role, activity=f"↪ failover [{name}]→[{nxt}]")
-        except Exception as e:  # 예기치 못한 오류라도 절대 전파 금지 (gather 형제 취소 방지)
+                    if result_path.exists() and _under_results_dir(result_path, self.board):
+                        result_path.unlink()  # 후보마다 직전 결과 제거 → 신선도 보장 (#25)
+
+                    # 상세 로그: 보낸 프롬프트 (시스템 + 작업).
+                    # #3: 전체 프롬프트 본문에는 spec excerpt·PM/PL directives 등 민감 내용이 들어가
+                    # .orchestrator/agents 로그에 영구 저장될 수 있다. ORCH_LOG_PROMPTS=0
+                    # 으로 끄면 본문 대신 짧은 메모만 남긴다. 기본값은 디버깅 편의로 전체 기록.
+                    title = f"PROMPT → [{name}]" + (f" unit={key}" if unit else "")
+                    if _log_prompt_bodies():
+                        body = "[SYSTEM]\n" + agent.system_prompt + "\n\n[TASK]\n" + prompt
+                    else:
+                        body = (
+                            "[prompt body suppressed: ORCH_LOG_PROMPTS=0] "
+                            f"system={len(agent.system_prompt)} chars, task={len(prompt)} chars"
+                        )
+                    self.board.write_agent_block(role, title, body)
+                    # 후보가 예외를 던져도 다음 후보로 폴오버 (전체 role 을 죽이지 않는다)
+                    res = await self._run_with_retries(get_backend(name), req, role, key)
+                    # 상세 로그: 받은 결과. board.write_agent_block 가 본문을 ~20000자로 절단하므로
+                    # spec/directives/대용량 출력이 로그를 무한히 키우지 않음 (#31/#32). 단, spec 내
+                    # 민감정보는 여전히 .orchestrator/agents 로그에 (절단된 형태로) 남을 수 있음.
+                    self.board.write_agent_block(
+                        role,
+                        f"RESULT ← [{name}] ok={res.ok}",
+                        res.final_message or res.error or "(no output)",
+                    )
+                    if res.cost_usd:
+                        role_cost += res.cost_usd
+                        await self.board.add_cost(res.cost_usd)
+                        await self.board.agent_update(
+                            role, cost_add=res.cost_usd, cost_est=res.cost_estimated
+                        )
+                    if res.tokens:
+                        await self.board.agent_update(role, tokens_add=res.tokens)
+                    if res.warning:  # 백엔드 경고(예: SDK 예산 캡 미적용)를 보드/리포트에 표면화
+                        await self.board.add_warning(f"{role} [{name}]: {res.warning}")
+                    if res.ok:
+                        break
+                    if i < len(candidates) - 1:
+                        nxt = candidates[i + 1]
+                        await self.board.log_event(role, f"failover [{name}]→[{nxt}]: {res.error}")
+                        await self.board.agent_update(role, activity=f"↪ failover [{name}]→[{nxt}]")
+                except Exception as e:
+                    # 이 후보를 처리하는 도중(백엔드 호출이 아닌 단계 — 로깅/비용/agent_update 등)에
+                    # 예기치 못한 예외가 났다. 그 후보만 실패로 보고 다음 후보로 폴오버한다
+                    # (남은 후보를 건너뛰고 role 전체를 죽이지 않는다).
+                    res = RoleResult(ok=False, error=f"runner error: {e}")
+                    try:
+                        await self.board.log_event(role, f"error [{name}]: {e}")
+                    except Exception:
+                        pass  # 로깅 실패도 폴오버 진행을 막지 않는다
+                    if i < len(candidates) - 1:
+                        try:
+                            await self.board.agent_update(
+                                role, activity=f"↪ failover [{name}] (error: {e})"
+                            )
+                        except Exception:
+                            pass
+                    continue  # 다음 후보 시도
+        # 바깥 안전망: 예기치 못한 오류도 절대 전파 금지(형제 gather 취소 방지).
+        except Exception as e:
             res = RoleResult(ok=False, error=f"runner error: {e}")
-            await self.board.log_event(role, f"error [{chosen}]: {e}")
+            try:
+                await self.board.log_event(role, f"error [{chosen}]: {e}")
+            except Exception:
+                pass
 
         if res is None:
             res = RoleResult(ok=False, error="no backend candidate")
