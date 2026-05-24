@@ -168,7 +168,7 @@ def test_runconfig_clamps_numeric_options(tmp_path, sample_spec_path):
         retries=-5,
         max_units=0,
     )
-    assert cfg.concurrency == 1 and cfg.max_attempts == 1 and cfg.retries == 0
+    assert cfg.concurrency == 1 and cfg.max_attempts == 0 and cfg.retries == 0
     assert cfg.max_units is None  # 0/음수 → 제한 없음
     assert (
         RunConfig(spec_path=sample_spec_path, project_dir=tmp_path / "q", max_units=-1).max_units

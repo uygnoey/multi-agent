@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from orchestrator import runner as runner_mod
 from orchestrator.agents import AgentDef, _norm_model
 from orchestrator.backends.base import RoleResult
 from orchestrator.board import Board
@@ -91,6 +92,19 @@ def test_run_role_does_not_delete_outside_results(tmp_path, sample_spec_path, mo
     assert sentinel.exists()  # results 밖 파일은 삭제 로직이 건드리지 않음
 
 
+def test_run_role_setup_exception_returns_failed_outcome(tmp_path, sample_spec_path, monkeypatch):
+    cfg = _cfg(tmp_path, sample_spec_path, mock=True, retries=0)
+    board = Board(cfg.project_dir)
+    asyncio.run(board.init("s", {}))
+    monkeypatch.setattr(runner_mod, "load_agent", lambda role: (_ for _ in ()).throw(OSError("x")))
+
+    out = asyncio.run(Runner(cfg, board).run_role("backend-developer", {"id": "U1"}))
+
+    assert out["_ok"] is False
+    assert out["status"] == "failed"
+    assert "setup/preflight" in out["blockers"][0]
+
+
 # ---- #31/#32: write_agent_block 본문 절단(보드) 확인 -------------------------
 
 
@@ -119,7 +133,7 @@ def test_runconfig_bad_int_does_not_raise(tmp_path):
         max_units="bad",  # type: ignore[arg-type]
     )
     assert cfg.concurrency == 3
-    assert cfg.max_attempts == 2
+    assert cfg.max_attempts == 0
     assert cfg.retries == 1
     assert cfg.max_units == 1
 
@@ -134,7 +148,7 @@ def test_runconfig_clamps_out_of_range():
         max_units=0,
     )
     assert cfg.concurrency == 1
-    assert cfg.max_attempts == 1
+    assert cfg.max_attempts == 0
     assert cfg.retries == 0
     assert cfg.max_units is None
 

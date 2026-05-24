@@ -42,6 +42,7 @@ _ROLE_INSTRUCTION = {
 _MAX_UNIT_TITLE_CHARS = 200
 _MAX_UNIT_DESCRIPTION_CHARS = 1500
 _MAX_UNIT_DEPS_CHARS = 500
+_MAX_REPAIR_CONTEXT_CHARS = 2500
 
 
 def _clip(value, limit: int) -> str:
@@ -102,6 +103,17 @@ def compose_prompt(
         # 최근 ~2000자만 싣는다.
         parts.append("## Recent events\n" + recent_events[-2000:])
 
+    repair_context = unit.get("repair_context") if isinstance(unit, dict) else None
+    if repair_context:
+        parts.append(
+            "## Previous verification failure to fix\n"
+            + _clip(repair_context, _MAX_REPAIR_CONTEXT_CHARS)
+            + "\n\n"
+            "Use this QA/test feedback as the primary repair target. If it says the failure is "
+            "in the test harness or configuration, fix the test/config instead of changing "
+            "working production code just to satisfy a broken test."
+        )
+
     parts.append("## Instruction\n" + _ROLE_INSTRUCTION.get(role, "Perform your role."))
 
     if role == "qa":
@@ -109,7 +121,21 @@ def compose_prompt(
             "## Constraints (cost & environment)\n"
             "- You MAY run the existing test suite to verify; "
             "install test deps only if missing, once.\n"
-            "- Do NOT build production bundles or start long-running servers."
+            "- Do NOT build production bundles or start long-running servers.\n"
+            "- When failing, classify the root cause in the result JSON using "
+            "`failure_kind` (`source_bug`, `test_harness`, `test_config`, `dependency_env`, "
+            "or `unknown`), `repair_owner` (role that should fix it), and "
+            "`repair_instruction` (concrete next edit)."
+        )
+    elif role == "test-engineer":
+        parts.append(
+            "## Test repair guidance\n"
+            "- If this is a repair pass, first fix broken tests/test configuration reported by QA "
+            "before adding new tests.\n"
+            "- Tests must be runnable from the project commands they declare. Avoid brittle timing "
+            "assertions and framework forward-reference patterns that fail independently of source "
+            "behavior.\n"
+            "- Run the relevant tests when feasible and report the exact command/result."
         )
     elif role not in ("project-manager", "project-leader"):
         parts.append(
@@ -136,7 +162,8 @@ def compose_prompt(
             f"When done, write your result as JSON to `{result_rel}`. Schema:\n"
             "```json\n"
             '{"status": "done", "artifacts": ["relative/path", ...], "notes": ["..."], '
-            '"blockers": [], "units": []}\n'
+            '"blockers": [], "units": [], '
+            '"failure_kind": null, "repair_owner": null, "repair_instruction": null}\n'
             "```\n"
             "- `status` MUST be one of: `done`, `failed`, `blocked` "
             "(use `failed`/`blocked` when the work could not be completed, and list reasons "

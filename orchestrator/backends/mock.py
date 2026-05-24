@@ -98,7 +98,8 @@ class MockBackend(Backend):
             )
             status = "tested"
         elif role == "qa" and unit:
-            write(f".orchestrator/qa/{unit['id']}.log", f"QA mock: {unit['id']} PASS\n")
+            qid = _ident(unit["id"], prefix="qa")
+            write(f".orchestrator/qa/{qid}.log", f"QA mock: {unit['id']} PASS\n")
             status = "tested"
         elif role == "cicd":
             write(

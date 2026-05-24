@@ -236,3 +236,46 @@ def test_rework_proceeds_when_deps_ok(tmp_path, sample_spec_path):
 
     reworked = asyncio.run(scenario())
     assert reworked == [2], "dep 정상이면 qa 실패 시 attempt 2 로 재작업해야 함"
+
+
+def test_qa_test_harness_failure_routes_to_test_engineer_repair(tmp_path, sample_spec_path):
+    """QA가 test/config 결함을 보고하면 다음 dev 재작업 전에 test-engineer 수리를 먼저 보낸다."""
+
+    async def scenario():
+        sched = Scheduler(_cfg(tmp_path, sample_spec_path, max_attempts=2))
+        await sched.board.init("spec", {})
+        await sched.board.add_units([{"id": "U1", "title": "t"}])
+
+        qa_calls = 0
+        repair_contexts: list[str | None] = []
+
+        async def fake(role, unit=None):
+            nonlocal qa_calls
+            if role == "test-engineer":
+                repair_contexts.append(unit.get("repair_context") if unit else None)
+                return {"_ok": True, "status": "done", "artifacts": ["tests/test_u1.py"]}
+            if role == "qa":
+                qa_calls += 1
+                if qa_calls == 1:
+                    return {
+                        "_ok": False,
+                        "status": "failed",
+                        "artifacts": [],
+                        "failure_kind": "test_harness",
+                        "repair_owner": "test-engineer",
+                        "repair_instruction": "move Payload model to module scope",
+                        "blockers": ["pytest forward-ref failure"],
+                    }
+                return {"_ok": True, "status": "done", "artifacts": []}
+            return {"_ok": True, "status": "done", "artifacts": []}
+
+        sched.runner.run_role = fake
+        unit = sched.board.units()[0]
+        await sched._test_unit(unit, asyncio.Semaphore(1), 1)
+        return sched.board, repair_contexts
+
+    board, repair_contexts = asyncio.run(scenario())
+
+    assert repair_contexts[0] is None
+    assert repair_contexts[1] and "move Payload model" in repair_contexts[1]
+    assert board.units()[0]["status"] == DONE

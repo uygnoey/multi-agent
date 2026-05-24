@@ -171,15 +171,15 @@ def test_run_rejects_zero_concurrency(server):
     assert "concurrency must be >= 1" in j["error"]
 
 
-def test_run_rejects_zero_max_attempts(server):
-    """#12: max_attempts 는 >=1 정수 검증 유지 — 0 은 400."""
+def test_run_accepts_zero_max_attempts_as_until_fixed(server):
+    """max_attempts=0 은 사람 없는 완주 모드: 고쳐질 때까지 수리."""
     code, j = _post(
         server["base"],
         "/api/run",
         {"spec_text": "# s", "backend": "mock", "max_attempts": 0},
     )
-    assert code == 400, j
-    assert "max_attempts must be >= 1" in j["error"]
+    assert code == 200, j
+    assert j["run_id"]
 
 
 def test_run_accepts_zero_retries(server):

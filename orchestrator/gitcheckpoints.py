@@ -112,9 +112,23 @@ class GitCheckpointer:
         for chunk in _chunks(paths, 100):
             self._run("reset", "-q", "--", *chunk)
 
+    def _stageable_paths(self, paths: list[str]) -> list[str]:
+        out: list[str] = []
+        for p in paths:
+            full = self.project_dir / p
+            if full.exists():
+                out.append(p)
+                continue
+            # 파일이 status 이후 사라졌더라도 tracked 파일이면 deletion stage 가 필요하다.
+            # untracked 파일이 사라진 경우만 git add pathspec 에러를 피하려고 제외한다.
+            tracked = self._run("ls-files", "--error-unmatch", "--", p)
+            if tracked.returncode == 0:
+                out.append(p)
+        return out
+
     def _checkpoint_sync(self, message: str, paths: list[str] | None = None) -> tuple[bool, str]:
         self._ensure_repo()
-        paths = self._changed_paths(paths)
+        paths = self._stageable_paths(self._changed_paths(paths))
         if not paths:
             return False, "no changes"
         for chunk in _chunks(paths, 100):

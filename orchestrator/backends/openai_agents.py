@@ -423,8 +423,9 @@ def _run_bash_command(
         # 드레인 스레드가 EOF 까지 마무리하도록 잠깐 join (kill 후엔 곧 끝난다).
         drainer.join(timeout=2.0)
 
-        out = cap.text()[:4000]
-        trunc = "\n<... output truncated>" if cap.truncated and len(out) >= 4000 else ""
+        captured = cap.text()
+        out = captured[:4000]
+        trunc = "\n<... output truncated>" if cap.truncated or len(captured) > 4000 else ""
         body = f"{sandbox_note}{out}{trunc}"
         if timed_out:
             return f"[timeout]\n{body}"

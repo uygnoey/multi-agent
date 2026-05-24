@@ -270,11 +270,11 @@ def build_command(py: str, spec_path: Path, project_dir: Path, opts: dict) -> li
     if opts.get("auto_commit") is False:
         cmd.append("--no-auto-commit")
     # #38: max_units/max_attempts 도 손상값을 관대하게 변환. max_units 는 0/음수면 "전체"로
-    #      간주해 플래그를 생략(폴백 0). max_attempts 는 기본 2 로 폴백.
+    #      간주해 플래그를 생략(폴백 0). max_attempts 는 0이면 "고쳐질 때까지" 기본값.
     if _coerce_int(opts.get("max_units"), 0) > 0:
         cmd += ["--max-units", str(_coerce_int(opts.get("max_units"), 0))]
-    if opts.get("max_attempts"):
-        cmd += ["--max-attempts", str(_coerce_int(opts.get("max_attempts"), 2))]
+    if opts.get("max_attempts") not in (None, ""):
+        cmd += ["--max-attempts", str(_coerce_int(opts.get("max_attempts"), 0))]
     # #62: timeout/retries/budget/model 도 있으면 CLI 로 전달 (웹 실행에서도 사용 가능).
     # #38: float()/int() 가 손상값에 raise 하지 않도록 관대하게 변환(변환 불가 시 옵션 생략).
     if opts.get("timeout") not in (None, ""):
@@ -938,12 +938,12 @@ def _make_handler(manager: RunManager, token: str | None = None):
                     if p and resolve(p) not in VALID_BACKENDS:
                         self._json({"error": f"invalid backend for {role}: {p}"}, 400)
                         return
-            # 정수 옵션 검증: int 변환 + 범위. 음수/0/비정상값은 400 으로 거부.
+            # 정수 옵션 검증: int 변환 + 범위. 음수/비정상값은 400 으로 거부.
             # 이 필드들은 CLI/RunConfig 에서도 진짜 int (concurrency/max_units/
-            # max_attempts/retries). retries 만 0 허용(>=0), 나머지는 >=1.
+            # max_attempts/retries). retries/max_attempts 는 0 허용(>=0), 나머지는 >=1.
             for fld in ("concurrency", "max_units", "max_attempts", "retries"):
                 v = data.get(fld)
-                lo = 0 if fld == "retries" else 1
+                lo = 0 if fld in ("retries", "max_attempts") else 1
                 _iv, err = _parse_int_option(v, field=fld, minimum=lo)
                 if err:
                     self._json({"error": err}, 400)
@@ -1093,7 +1093,7 @@ INDEX_HTML = r"""<!doctype html>
         <input type="text" id="backends" placeholder="claude-cli   또는   claude-cli,codex"/></div>
       <div><label>동시성</label><input type="text" id="concurrency" value="3"/></div>
       <div><label>max-units (선택)</label><input type="text" id="maxUnits" placeholder="전체"/></div>
-      <div><label>max-attempts</label><input type="text" id="maxAttempts" value="2"/></div>
+      <div><label>max-attempts</label><input type="text" id="maxAttempts" value="0"/></div>
     </div>
     <div class="row">
       <div><label title="감독(PM/PL) 주기. 웹 기본 600초 — CLI 기본(20초)보다 길게 설정됨. 짧게 하려면 직접 입력.">poll-interval (초, 선택 · 웹 기본 600 / CLI 20)</label><input type="text" id="pollInterval" placeholder="600 (웹 기본)"/></div>
@@ -1203,7 +1203,7 @@ async function startRun(){
       retries:raw("retries"),budget:raw("budget"),model:raw("model"),
       mock:$("mock").checked,delegate:$("delegate").checked,full_access:$("fullAccess").checked,
       auto_commit:$("autoCommit").checked};
-    const r=await fetch("/api/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    const r=await fetchWithTimeout("/api/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)},30000);
     const j=await r.json();
     if(j.error){$("launchMsg").textContent="오류: "+j.error;return}
     await refreshRuns(); selectRun(j.run_id);
@@ -1215,7 +1215,7 @@ async function startRun(){
 }
 async function refreshRuns(){
   let runs=[];
-  try{runs=((await (await fetch("/api/runs")).json()).runs)||[]}catch(e){}
+  try{runs=((await (await fetchWithTimeout("/api/runs",{},15000)).json()).runs)||[]}catch(e){}
   const sel=$("runSel");const prev=CUR;sel.innerHTML="";
   if(!runs.length){const o=document.createElement("option");o.value="";o.text="(실행 없음)";sel.appendChild(o)}
   runs.forEach(r=>{const o=document.createElement("option");o.value=r.id;
@@ -1242,17 +1242,23 @@ function renderPicker(runs){
 async function stopRun(){
   if(!CUR)return;
   if(!confirm("이 run 을 정지할까요?"))return;
-  try{await fetch("/api/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({run:CUR})})}catch(e){}
+  try{await fetchWithTimeout("/api/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({run:CUR})},15000)}catch(e){}
 }
 async function rerunRun(){
   if(!CUR)return;
   let j={};
-  try{j=await (await fetch("/api/rerun",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({run:CUR})})).json()}catch(e){}
+  try{j=await (await fetchWithTimeout("/api/rerun",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({run:CUR})},30000)).json()}catch(e){}
   if(j.run_id){await refreshRuns();selectRun(j.run_id)}else if(j.error){alert("재실행 오류: "+j.error)}
 }
 
 function statusDot(s){return '<span class="dot'+(s==="running"?" run":"")+'"></span>'}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+async function fetchWithTimeout(url, opts={}, ms=30000){
+  const ctrl=new AbortController();
+  const t=setTimeout(()=>ctrl.abort(),ms);
+  try{return await fetch(url,{...opts,signal:ctrl.signal})}
+  finally{clearTimeout(t)}
+}
 // #136: 손상된 board.json 의 비숫자 cost/tokens(문자열/null/객체)가 와도 toFixed/
 //       toLocaleString 이 throw 해 tick() 의 catch 가 이를 삼키고 대시보드가 조용히
 //       멈추는 것을 막는다. Number(...) 가 NaN 이면 0 으로 강제한다.
@@ -1264,7 +1270,7 @@ async function tick(){
   if(!CUR)return;
   try{
     // #23: 응답 객체를 보존해 status/에러 본문을 검사한다(조용히 삼키지 않음).
-    const r=await fetch("/api/state?run="+encodeURIComponent(CUR));
+    const r=await fetchWithTimeout("/api/state?run="+encodeURIComponent(CUR),{},15000);
     const s=await r.json();
     if(s&&s.error){showErr("상태 조회 오류: "+s.error+(r.status===401?" — 인증 필요: 먼저 /?token=<TOKEN> 으로 한 번 접속해 인증 쿠키를 설정하면 대시보드가 동작합니다":""));return}
     showErr("");  // 성공 시 이전 오류 제거

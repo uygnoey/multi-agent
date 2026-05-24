@@ -138,7 +138,11 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None):
                 pending = pending[pos + 1 :]
                 _write_rendered(line)
             if len(pending) > _MAX_STREAM_BYTES:
-                pending = pending[-_MAX_STREAM_BYTES:]
+                pending = (
+                    pending[:_MAX_STREAM_BYTES]
+                    if pending.lstrip().startswith(b"{")
+                    else pending[-_MAX_STREAM_BYTES:]
+                )
                 if f is not None:
                     try:
                         f.write("[stream line truncated]\n")

@@ -148,6 +148,6 @@ def test_role_priority_pin_takes_precedence_over_role_backend():
 def test_numeric_options_coerced_safely():
     cfg = _cfg(concurrency="bad", max_attempts=0, retries=-5, max_units=0)
     assert cfg.concurrency == 3
-    assert cfg.max_attempts == 1
+    assert cfg.max_attempts == 0
     assert cfg.retries == 0
     assert cfg.max_units is None  # 0/음수/이상값 → 제한 없음

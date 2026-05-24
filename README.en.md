@@ -64,7 +64,7 @@ scaffold → init board → PM/PL continuous supervision (background)
               when dev finishes, test/qa run immediately as a separate task
               (the dev slot is released → development moves to the next unit)
   → Phase C:  test-engineer → qa
-              skip QA and rework when test-engineer fails; rework within max_attempts on QA failure
+              skip QA and repair when test-engineer fails; keep repairing QA failures by default
   → Phase D:  cicd
   → Phase E:  docs-writer — deliverable docs (ERD, sequence, DB, API, manual, deploy, run, architecture; EN/KO)
   → done after supervisors (PM/PL) shut down gracefully   (done = the moment all agents have stopped)
@@ -136,7 +136,7 @@ python -m orchestrator --spec examples/specs/sample-spec.md --project-dir /tmp/d
 | `--mock` | Run every role with mock (zero cost) |
 | `--concurrency N` | Number of units processed concurrently (default 3) |
 | `--max-units N` | Cap on the number of units processed |
-| `--max-attempts N` | Per-unit dev→test→qa rework attempts (default 2) |
+| `--max-attempts N` | Per-unit dev→test→qa repair cap. `0` means keep repairing until fixed (default 0) |
 | `--retries N` | Retries for transient role-call failures (default 1) |
 | `--budget USD` | Per-session budget cap (supported backends) |
 | `--model NAME` | Model override |

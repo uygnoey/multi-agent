@@ -60,6 +60,27 @@ def test_unit_fields_are_capped():
     assert len(target) < 2500
 
 
+def test_repair_context_is_included_for_targeted_fix():
+    unit = {
+        "id": "U2",
+        "title": "Backend",
+        "repair_context": "failure_kind: test_harness\nrepair_instruction: move Payload model",
+    }
+    out = compose_prompt(
+        role="test-engineer",
+        phase="test",
+        unit=unit,
+        directives="",
+        result_rel="res.json",
+        spec_excerpt="ignored when unit present",
+    )
+
+    assert "## Previous verification failure to fix" in out
+    assert "failure_kind: test_harness" in out
+    assert "move Payload model" in out
+    assert "fix broken tests/test configuration" in out
+
+
 def test_spec_excerpt_and_scope_when_unit_none():
     out = compose_prompt(
         role="architecture-engineer",

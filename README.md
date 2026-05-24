@@ -54,7 +54,7 @@
   → Phase B:  frontend ‖ backend ‖ dba   (unit별 동시) → dev_done
               dev 끝나면 test/qa 는 별도 태스크로 즉시(개발 슬롯 반납 → 다음 unit 진행)
   → Phase C:  test-engineer → qa
-              test-engineer 실패 시 QA 스킵 후 재작업, QA 실패 시 max_attempts 내 재작업
+              test-engineer 실패 시 QA 스킵 후 재작업, QA 실패 시 기본적으로 고쳐질 때까지 재작업
   → Phase D:  cicd
   → Phase E:  docs-writer — 산출물 문서(ERD·시퀀스·DB·API·매뉴얼·배포·실행·아키텍처, EN/KO)
   → 감독(PM/PL) graceful 종료 후 done   (done = 모든 에이전트 종료 시점)
@@ -127,7 +127,7 @@ python -m orchestrator --spec examples/specs/sample-spec.md --project-dir /tmp/d
 | `--mock` | 모든 역할을 mock 으로 (무비용) |
 | `--concurrency N` | 동시 처리 unit 수 (기본 3) |
 | `--max-units N` | 처리할 unit 수 상한 |
-| `--max-attempts N` | unit별 dev→test→qa 재작업 횟수 (기본 2) |
+| `--max-attempts N` | unit별 dev→test→qa 재작업 상한. `0`이면 고쳐질 때까지 계속(기본 0) |
 | `--retries N` | 역할 호출 전이성 실패 재시도 횟수 (기본 1) |
 | `--budget USD` | 세션당 예산 상한 (지원 백엔드) |
 | `--model NAME` | 모델 override |

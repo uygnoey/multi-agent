@@ -34,6 +34,34 @@ from .runner import Runner
 DEFAULT_STACK = {"stack": "아키텍트가 spec 기반으로 결정 (architect decides from the spec)"}
 MAX_SPEC_BYTES = 4 * 1024 * 1024
 
+_TEST_REPAIR_KINDS = {"test_harness", "test_config", "dependency_env"}
+_TEST_REPAIR_WORDS = (
+    "test-harness",
+    "test harness",
+    "test defect",
+    "test_config",
+    "test config",
+    "config defect",
+    "vitest",
+    "pytest",
+    "forwardref",
+    "forward-ref",
+    "pydanticusererror",
+    "no test files found",
+)
+_MAX_REPAIR_CONTEXT_CHARS = 4000
+
+
+def _exception_outcome(role: str, exc: Exception) -> dict:
+    return {
+        "status": "failed",
+        "artifacts": [],
+        "notes": [],
+        "blockers": [f"{role} raised: {exc}"],
+        "units": [],
+        "_ok": False,
+    }
+
 
 class Scheduler:
     def __init__(self, cfg: RunConfig):
@@ -94,7 +122,13 @@ class Scheduler:
             # Phase A — 설계 + 테스트시트 병렬
             await self.board.set_phase("design")
             await self.board.log_event("scheduler", "Phase A: design ‖ testsheet")
-            design_outcomes = await asyncio.gather(*[self.runner.run_role(r) for r in DESIGN_ROLES])
+            design_outcomes = await asyncio.gather(
+                *[self.runner.run_role(r) for r in DESIGN_ROLES], return_exceptions=True
+            )
+            design_outcomes = [
+                _exception_outcome(r, o) if isinstance(o, Exception) else o
+                for r, o in zip(DESIGN_ROLES, design_outcomes, strict=False)
+            ]
             # 아키텍트 결과를 역할명으로 선택 (DESIGN_ROLES 순서가 바뀌어도 안전)
             by_role = dict(zip(DESIGN_ROLES, design_outcomes, strict=False))
             arch_outcome = by_role.get("architecture-engineer")
@@ -322,9 +356,8 @@ class Scheduler:
             if self._stop.is_set():  # graceful shutdown: 새 개발 시도를 시작하지 않음
                 await self.board.log_event(uid, "stop requested → skip dev attempt")
                 return False
-            await self.board.set_status(
-                uid, IN_PROGRESS, f"dev attempt {attempt}/{self.cfg.max_attempts}"
-            )
+            attempt_label = self._attempt_label(attempt)
+            await self.board.set_status(uid, IN_PROGRESS, f"dev attempt {attempt_label}")
             # dev role 호출이 예외를 던져도 unit 을 blocked 로 내리고 파이프라인을 죽이지 않는다.
             dev_outcomes = await asyncio.gather(
                 *[self.runner.run_role(r, unit) for r in dev_roles], return_exceptions=True
@@ -369,10 +402,64 @@ class Scheduler:
         units = {u["id"]: u for u in self.board.units()}
         return [d for d in deps if units.get(d, {}).get("status") in (FAILED, BLOCKED)]
 
+    def _with_repair_context(self, unit: dict, outcome: dict, source: str) -> dict:
+        notes = [str(n) for n in outcome.get("notes") or []]
+        blockers = [str(b) for b in outcome.get("blockers") or []]
+        fields = []
+        for key in ("failure_kind", "repair_owner", "repair_instruction", "command", "stderr_tail"):
+            if outcome.get(key):
+                fields.append(f"{key}: {outcome[key]}")
+        body = "\n".join(
+            [
+                f"source: {source}",
+                *fields,
+                "blockers:",
+                *(f"- {b}" for b in blockers[:8]),
+                "notes:",
+                *(f"- {n}" for n in notes[:12]),
+            ]
+        ).strip()
+        repaired = dict(unit)
+        repaired["repair_context"] = body[-_MAX_REPAIR_CONTEXT_CHARS:]
+        return repaired
+
+    def _needs_test_repair(self, outcome: dict) -> bool:
+        kind = str(outcome.get("failure_kind") or "").strip().lower().replace("-", "_")
+        owner = str(outcome.get("repair_owner") or "").strip().lower()
+        if kind in _TEST_REPAIR_KINDS or owner == "test-engineer":
+            return True
+        text = " ".join(
+            str(x)
+            for x in [
+                outcome.get("repair_instruction", ""),
+                *(outcome.get("blockers") or []),
+                *(outcome.get("notes") or []),
+            ]
+        ).lower()
+        return any(word in text for word in _TEST_REPAIR_WORDS)
+
+    def _attempt_label(self, attempt: int) -> str:
+        if self.cfg.max_attempts == 0:
+            return f"{attempt}/∞"
+        return f"{attempt}/{self.cfg.max_attempts}"
+
+    def _can_repair(self, attempt: int) -> bool:
+        return self.cfg.max_attempts == 0 or attempt < self.cfg.max_attempts
+
+    def _budget_exhausted(self) -> bool:
+        if self.cfg.budget is None:
+            return False
+        try:
+            spent = float(self.board.snapshot().get("total_cost_usd", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            spent = 0.0
+        return spent >= self.cfg.budget
+
     async def _test_unit(self, unit: dict, sem: asyncio.Semaphore, attempt: int) -> None:
         """unit 개발 완료 직후 test-engineer → qa 를 실행 (개발 슬롯 비점유).
 
-        QA 실패 시 max_attempts 내에서 개발 슬롯을 다시 잡아 재작업 후 재검증.
+        QA 실패 시 개발 슬롯을 다시 잡아 재작업 후 재검증한다. max_attempts=0(기본)은
+        제품 완주 모드라 예산/stop/외부 장애 전까지 계속 수리한다.
 
         test/qa 백엔드 호출은 _test_sem 으로 동시성을 캡한다(dev 슬롯과 별개). rework 는
         _develop_unit 가 dev 슬롯(sem)을 다시 잡으므로, 데드락을 피하려고 _test_sem 을 먼저
@@ -383,6 +470,8 @@ class Scheduler:
 
         # ---- test/qa 본작업: _test_sem 으로 동시성 캡 (이 블록 안에서만 점유) ----
         rework = False  # 블록 밖에서 재작업할지 여부 ('fail + 시도 남음')
+        repair_unit = unit
+        test_repair_first = False
         async with self._test_sem:
             te = await self.runner.run_role("test-engineer", unit)
             test_paths = list(te.get("artifacts", []))
@@ -395,8 +484,10 @@ class Scheduler:
             if not te_ok:
                 await self.board.log_event(uid, "test-engineer 실패 → qa 건너뜀(비용 절감)")
                 await self.board.set_test_status(uid, "fail")
-                if attempt < self.cfg.max_attempts:
+                if self._can_repair(attempt):
                     rework = True
+                    repair_unit = self._with_repair_context(unit, te, "test-engineer")
+                    test_repair_first = True
                 else:
                     await self.board.set_status(uid, FAILED, "test-engineer failed after retries")
                     return
@@ -413,14 +504,20 @@ class Scheduler:
                         f"orchestrator: {uid} verified", [*test_paths, *qa_paths]
                     )
                     return
-                if attempt < self.cfg.max_attempts:
+                if self._can_repair(attempt):
                     rework = True
+                    repair_unit = self._with_repair_context(unit, qa, "qa")
+                    test_repair_first = self._needs_test_repair(qa)
                 else:
                     await self.board.set_status(uid, FAILED, "QA failed after retries")
                     return
 
         # ---- rework: _test_sem 점유를 푼 뒤 수행 (dev 슬롯과 중첩 점유 회피) ----
         if not rework:
+            return
+        if self._budget_exhausted():
+            await self.board.set_status(uid, BLOCKED, "repair stopped: budget exhausted")
+            await self.board.add_warning(f"{uid}: 예산 소진으로 자동 수리 중단")
             return
         # 재작업 전 의존성 재검증: 검증/대기 동안 dep 이 FAILED/BLOCKED 로 무너졌다면
         # 망가진 베이스 위에서 다시 개발하지 않는다. 이 unit 을 BLOCKED 로 두고 중단한다.
@@ -432,13 +529,36 @@ class Scheduler:
             await self.board.set_status(uid, BLOCKED, f"rework aborted: deps broken {broken}")
             await self.board.add_warning(f"{uid}: 재작업 직전 의존성 붕괴 → blocked: {broken}")
             return
-        await self.board.log_event(uid, f"재검증 통과 → 재작업 (attempt {attempt + 1})")
-        if await self._develop_unit(unit, sem, attempt + 1):
-            await self._test_unit(unit, sem, attempt + 1)
+        await self.board.log_event(
+            uid,
+            f"재검증 통과 → {'test/config' if test_repair_first else 'dev'} 재작업 "
+            f"(attempt {attempt + 1})",
+        )
+        if test_repair_first:
+            await self.board.set_status(
+                uid, TESTING, f"test/config repair attempt {self._attempt_label(attempt + 1)}"
+            )
+            te = await self.runner.run_role("test-engineer", repair_unit)
+            await self.board.add_artifacts(uid, list(te.get("artifacts", [])))
+            if te.get("_ok", True) and te.get("status") != "failed":
+                await self._test_unit(repair_unit, sem, attempt + 1)
+                return
+            await self.board.log_event(uid, "test/config repair failed → dev 재작업 fallback")
+        if await self._develop_unit(repair_unit, sem, attempt + 1):
+            await self._test_unit(repair_unit, sem, attempt + 1)
             return
-        # 재개발이 실패하면 _develop_unit 이 이미 BLOCKED 로 두지만, '재시도 후 실패' 의미를
-        # 명확히 남기도록 FAILED 로 마무리한다(기존 동작 유지: rework dev 실패 → failed).
-        await self.board.set_status(uid, FAILED, "rework dev failed after retries")
+        next_attempt = attempt + 2
+        while self._can_repair(next_attempt - 1) and not self._stop.is_set():
+            if self._budget_exhausted():
+                await self.board.set_status(uid, BLOCKED, "repair stopped: budget exhausted")
+                await self.board.add_warning(f"{uid}: 예산 소진으로 자동 수리 중단")
+                return
+            await self.board.log_event(uid, f"dev repair failed → retrying attempt {next_attempt}")
+            if await self._develop_unit(repair_unit, sem, next_attempt):
+                await self._test_unit(repair_unit, sem, next_attempt)
+                return
+            next_attempt += 1
+        await self.board.set_status(uid, FAILED, "rework dev failed")
 
     async def _wait_for_deps(self, unit: dict, timeout: float | None = None) -> bool:
         """deps 가 모두 완료되면 True. 실패/blocked dep 이 있으면 즉시 False(패스트페일).
@@ -465,7 +585,10 @@ class Scheduler:
         if timeout is not None:
             stall = timeout
         elif self.cfg.session_timeout is None:
-            stall = float("inf")
+            # 역할 호출 자체는 무제한이어도 dependency wait 는 영구 대기하면 안 된다. 특히
+            # --max-units/stop 등으로 dep 가 DESIGNED 상태에 머물면 후속 unit 이 사람 개입 전까지
+            # 멈춘다. "무제한 세션"에는 보수적인 stall 상한을 둔다.
+            stall = 3600.0
         else:
             stall = max(1800.0, self.cfg.session_timeout * 2)
         prev_sig = None

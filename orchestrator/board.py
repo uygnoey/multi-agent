@@ -499,7 +499,7 @@ class Board:
                     a["tokens"] = a.get("tokens", 0) + add_t
                     self._data["total_tokens"] = self._data.get("total_tokens", 0) + add_t
             if message is not None:
-                a["last_message"] = message[:500]
+                a["last_message"] = str(message)[:500]
             if call:
                 a["calls"] += 1
             a["updated_at"] = time.time()

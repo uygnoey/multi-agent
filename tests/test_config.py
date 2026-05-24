@@ -45,7 +45,7 @@ def test_runconfig_defaults():
     assert cfg.delegate is False
     assert cfg.full_access is False
     assert cfg.auto_commit is True
-    assert cfg.max_attempts == 2
+    assert cfg.max_attempts == 0
     assert cfg.retries == 1
 
 

@@ -99,7 +99,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help="생성 프로젝트의 단계별 git checkpoint commit 을 비활성화",
     )
-    p.add_argument("--max-attempts", type=int, default=2, help="unit별 dev→test→qa 재작업 횟수")
+    p.add_argument(
+        "--max-attempts",
+        type=int,
+        default=0,
+        help="unit별 dev→test→qa 재작업 상한. 0=고쳐질 때까지(기본)",
+    )
     p.add_argument("--retries", type=int, default=1, help="역할 호출 전이성 실패 재시도 횟수")
     p.add_argument(
         "--timeout",
@@ -270,7 +275,7 @@ def main(argv=None) -> int:
     # → 비종료(in_progress/testing/dev_done) 와 max-units 로 designed 로 남은 미처리 unit 도
     #   스케줄러가 각각 failed 전이 또는 경고로 표면화하므로 자동화가 '미완 성공'을 못 만든다.
     units = snap.get("units", [])
-    failed = [u for u in units if u.get("status") in ("failed", "blocked")]
+    failed = [u for u in units if isinstance(u, dict) and u.get("status") in ("failed", "blocked")]
     if failed or snap.get("warnings"):
         return 1
     return 0

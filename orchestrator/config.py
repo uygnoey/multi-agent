@@ -255,7 +255,7 @@ class RunConfig:
     delegate: bool = False  # allow role sessions to call teammates as subagents
     full_access: bool = False  # machine-wide backend access; default is project workspace access
     auto_commit: bool = True  # create checkpoint commits inside the generated project
-    max_attempts: int = 2  # dev→test→qa rework attempts per unit
+    max_attempts: int = 0  # dev→test→qa repair attempts per unit; 0 = until fixed/external stop
     retries: int = 1  # transient backend-failure retries per role call
     retry_backoff: float = 2.0  # seconds, exponential
     session_timeout: float | None = 1200.0  # 역할 호출 1회 최대 시간(초); None=무제한
@@ -277,11 +277,11 @@ class RunConfig:
         # 하한뿐 아니라 상한(upper clamp)도 둔다: 프로그래매틱 호출부가 병적으로 큰 값을 주면
         # OOM / 무한정 작업 스폰 / 사실상 hang 으로 이어질 수 있으므로 합리적 상한으로 클램프한다.
         #   - concurrency: 동시 역할 세션 수. 64 면 어떤 머신에서도 과한 상한 → OOM/스레드폭증 방지.
-        #   - max_attempts: unit별 dev→test→qa 재작업 횟수. 20 회면 무한 재작업을 막는 충분한 상한.
+        #   - max_attempts: unit별 dev→test→qa 재작업 횟수. 0 이면 제품 완주 모드(고쳐질 때까지).
         #   - retries: 역할 호출 전이성 실패 재시도 횟수. 20 회 상한으로 폭주 방지.
-        # (정상값 concurrency=3 / max_attempts=2 / retries=1 등은 그대로 보존된다.)
+        # (정상값 concurrency=3 / max_attempts=0 / retries=1 등은 그대로 보존된다.)
         self.concurrency = min(64, max(1, _coerce_int(self.concurrency, 3)))
-        self.max_attempts = min(20, max(1, _coerce_int(self.max_attempts, 2)))
+        self.max_attempts = min(20, max(0, _coerce_int(self.max_attempts, 0)))
         self.retries = min(20, max(0, _coerce_int(self.retries, 1)))
         if self.max_units is not None:
             self.max_units = _coerce_optional_positive_int(self.max_units)

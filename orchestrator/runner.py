@@ -37,6 +37,17 @@ _INFLIGHT_RESERVE_USD = 0.50
 _MAX_RESULT_BYTES = 5 * 1024 * 1024
 
 
+def _failure_outcome(status: str, blocker: str) -> dict:
+    return {
+        "status": status,
+        "artifacts": [],
+        "notes": [],
+        "blockers": [blocker],
+        "units": [],
+        "_ok": False,
+    }
+
+
 def _truthy_env(name: str, default: bool) -> bool:
     """ORCH_* 불리언 환경변수 파싱. 미설정이면 default. 0/false/no/off → False, 그 외 → True."""
     raw = os.environ.get(name)
@@ -126,49 +137,52 @@ class Runner:
         )
 
     async def run_role(self, role: str, unit: dict | None = None) -> dict:
-        spec = ROLES[role]
-        agent = load_agent(role)
-        key = unit["id"] if unit else "global"
-        result_rel = f".orchestrator/results/{role}__{key}.json"
-        result_path = self.board.project_dir / result_rel
-
-        # 누적 예산 enforcement: 백엔드 무관하게 runner 에서 강제 (#112). 보드 누적 비용이 이미
-        # 예산 이상이면 백엔드를 호출하지 않고 blocked 반환 → --budget 가 모든 백엔드에 의미.
-        #
-        # #39: concurrency>1 일 때 여러 역할이 add_cost 전에 모두 사전점검을 통과해 N-way 로
-        # 초과하던 문제를 줄인다. check+reserve 를 _budget_lock 으로 직렬화하고, "커밋된 보드
-        # 누적 + 진행 중 예약 추정" 을 함께 보아 동시 시작이 모두 예산을 충분으로 보지 못하게 한다.
-        # 잔여 한계: 이미 시작된 한 호출은 실제 비용을 끝나봐야 알 수 있어 한 호출 비용만큼은
-        # 여전히 초과할 수 있다(완벽 방지는 불가능). reserved 는 호출 종료 시 finally 에서 해제한다.
+        key = "global"
         reserved = 0.0
-        if self.cfg.budget is not None:
-            async with self._budget_lock:
-                committed = self.board.snapshot().get("total_cost_usd", 0.0) or 0.0
-                projected = committed + self._inflight_reserved
-                if projected >= self.cfg.budget:
-                    blocker = (
-                        f"budget exceeded: spent ${committed:.4f} "
-                        f"(+${self._inflight_reserved:.4f} in-flight) >= "
-                        f"budget ${self.cfg.budget:.4f}"
-                    )
-                    await self.board.log_event(role, f"skip [budget] {blocker}")
-                    await self.board.agent_update(
-                        role, status="idle", activity=f"⏸ skipped (budget) {key if unit else ''}"
-                    )
-                    return {
-                        "status": "blocked",
-                        "artifacts": [],
-                        "notes": [],
-                        "blockers": [blocker],
-                        "units": [],
-                        "_ok": False,
-                    }
-                # 통과 → 한 호출분 추정치를 예약(동시 시작자가 같은 잔액을 중복 사용 못 하게).
-                reserved = _INFLIGHT_RESERVE_USD
-                self._inflight_reserved += reserved
 
         try:
+            spec = ROLES[role]
+            agent = load_agent(role)
+            key = str(unit.get("id", "unknown")) if isinstance(unit, dict) else "global"
+            result_rel = f".orchestrator/results/{role}__{key}.json"
+            result_path = self.board.project_dir / result_rel
+
+            # 누적 예산 enforcement: 백엔드 무관하게 runner 에서 강제 (#112). 보드 누적 비용이 이미
+            # 예산 이상이면 백엔드를 호출하지 않고 blocked 반환 → --budget 가 모든 백엔드에 의미.
+            #
+            # #39: concurrency>1 일 때 여러 역할이 add_cost 전에 모두 사전점검을 통과해 N-way 로
+            # 초과하던 문제를 줄인다. check+reserve 를 _budget_lock 으로 직렬화하고, "커밋된 보드
+            # 누적 + 진행 중 예약 추정" 을 함께 보아 동시 시작이 모두 예산을 충분으로 보지
+            # 못하게 한다.
+            # 잔여 한계: 이미 시작된 한 호출은 실제 비용을 끝나봐야 알 수 있어 한 호출 비용만큼은
+            # 여전히 초과할 수 있다(완벽 방지는 불가능). reserved 는 호출 종료 시 finally 에서
+            # 해제한다.
+            if self.cfg.budget is not None:
+                async with self._budget_lock:
+                    committed = self.board.snapshot().get("total_cost_usd", 0.0) or 0.0
+                    projected = committed + self._inflight_reserved
+                    if projected >= self.cfg.budget:
+                        blocker = (
+                            f"budget exceeded: spent ${committed:.4f} "
+                            f"(+${self._inflight_reserved:.4f} in-flight) >= "
+                            f"budget ${self.cfg.budget:.4f}"
+                        )
+                        await self.board.log_event(role, f"skip [budget] {blocker}")
+                        await self.board.agent_update(
+                            role,
+                            status="idle",
+                            activity=f"⏸ skipped (budget) {key if unit else ''}",
+                        )
+                        return _failure_outcome("blocked", blocker)
+                    # 통과 → 한 호출분 추정치를 예약(동시 시작자가 같은 잔액을 중복 사용 못 하게).
+                    reserved = _INFLIGHT_RESERVE_USD
+                    self._inflight_reserved += reserved
+
             return await self._run_role_inner(role, spec, agent, unit, key, result_path, result_rel)
+        except Exception as e:
+            return _failure_outcome(
+                "failed", f"runner setup/preflight failed for {role}:{key}: {e}"
+            )
         finally:
             if reserved:
                 async with self._budget_lock:
@@ -552,7 +566,7 @@ def _coerce_result(data: dict, res, phase: str | None = None, role: str | None =
             blockers = [*blockers, "architect result has no units (contract violation)"]
     # 아티팩트: str 만, 절대경로/'..' 등 안전하지 않은 값 drop (보드 정책과 일치; #11)
     artifacts = [s for a in _as_list(data.get("artifacts")) if (s := _safe_rel_artifact(a))]
-    return {
+    out = {
         "status": status,
         "artifacts": artifacts,
         "notes": [str(n) for n in _as_list(data.get("notes"))],
@@ -560,3 +574,8 @@ def _coerce_result(data: dict, res, phase: str | None = None, role: str | None =
         "units": units,
         "_ok": ok,
     }
+    for key in ("failure_kind", "repair_owner", "repair_instruction", "command", "stderr_tail"):
+        value = data.get(key)
+        if value not in (None, ""):
+            out[key] = str(value)
+    return out

@@ -263,3 +263,5 @@ def test_index_html_has_error_banner_and_handler():
     assert 'id="err"' in html  # 오류 배너 엘리먼트
     assert "function showErr" in html  # 토글 헬퍼
     assert "s.error" in html  # /api/state 오류 본문 검사
+    assert "function fetchWithTimeout" in html
+    assert "AbortController" in html
