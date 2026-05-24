@@ -125,6 +125,11 @@ def test_render_snapshot_units_is_string():
     assert isinstance(out, str)
 
 
+def test_render_snapshot_agents_is_string():
+    out = render_snapshot({"agents": "oops", "units": []}, list(ROLES))
+    assert isinstance(out, str)
+
+
 def test_render_snapshot_units_mixed_elements_counts_valid_dict():
     # 비-dict 원소(1, "a")는 건너뛰고, 유효한 dict 원소는 집계된다.
     out = render_snapshot({"units": [1, "a", {"id": "U1", "status": "done"}]}, list(ROLES))

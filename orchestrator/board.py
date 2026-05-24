@@ -168,7 +168,11 @@ def _tail_lines(path: Path, n: int) -> list[str]:
     # 청크가 줄 중간에서 시작했다면 첫 줄은 불완전할 수 있으니 버린다(파일 시작이 아닌 경우).
     if start > 0:
         nl = text.find("\n")
-        text = text[nl + 1 :] if nl != -1 else ""
+        # 단일 초장문 라인처럼 청크 안에 개행이 전혀 없으면 내용을 통째로 버리지 말고
+        # tail segment 를 보존한다. 최신 지시/로그가 한 줄로 길게 쌓인 경우 빈 결과가 되는
+        # 것보다 불완전한 tail 이라도 보여주는 편이 복구/진단에 유용하다.
+        if nl != -1:
+            text = text[nl + 1 :]
     return text.splitlines()[-n:]
 
 

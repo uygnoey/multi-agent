@@ -451,7 +451,8 @@ def render_snapshot(board: dict, roles: list[str], alive: bool | None = None) ->
     raw = board.get("units")
     units = [u for u in raw if isinstance(u, dict)] if isinstance(raw, list) else []
     done = sum(1 for u in units if u.get("status") in TERMINAL_OK)
-    agents = board.get("agents", {})
+    raw_agents = board.get("agents", {})
+    agents = raw_agents if isinstance(raw_agents, dict) else {}
 
     def status_of(a):
         st = a.get("status", "-")
@@ -551,7 +552,8 @@ def _draw_list(stdscr, board, roles, sel, orch_dir, alive) -> None:
     raw = board.get("units")
     units = [u for u in raw if isinstance(u, dict)] if isinstance(raw, list) else []
     done = sum(1 for u in units if u.get("status") in TERMINAL_OK)
-    agents = board.get("agents", {})
+    raw_agents = board.get("agents", {})
+    agents = raw_agents if isinstance(raw_agents, dict) else {}
 
     def status_of(a):
         st = a.get("status", "idle")
@@ -612,7 +614,8 @@ def _draw_artifacts(stdscr, board: dict, orch_dir: Path, scroll: int) -> int:
     h, w = stdscr.getmaxyx()
     proj = str(orch_dir.parent)
     body = [f"📁 {proj}", ""]
-    glob = board.get("artifacts", [])
+    raw_glob = board.get("artifacts", [])
+    glob = raw_glob if isinstance(raw_glob, list) else []
     if glob:
         body.append("[ 설계·공통 / design & shared ]")
         body += [f"  {proj}/{a}" for a in glob]
@@ -621,7 +624,8 @@ def _draw_artifacts(stdscr, board: dict, orch_dir: Path, scroll: int) -> int:
     raw = board.get("units")
     units = [u for u in raw if isinstance(u, dict)] if isinstance(raw, list) else []
     for u in units:
-        arts = u.get("artifacts", [])
+        raw_arts = u.get("artifacts", [])
+        arts = raw_arts if isinstance(raw_arts, list) else []
         if arts:
             body.append(f"[ {u.get('id', '?')} — {u.get('title', '')} ]  ({u.get('status')})")
             body += [f"  {proj}/{a}" for a in arts]
@@ -673,7 +677,9 @@ def _draw_detail(stdscr, board: dict, orch_dir: Path, role: str, scroll: int, fo
     import curses
 
     h, w = stdscr.getmaxyx()
-    a = board.get("agents", {}).get(role, {})
+    raw_agents = board.get("agents", {})
+    agents = raw_agents if isinstance(raw_agents, dict) else {}
+    a = agents.get(role, {})
     st = a.get("status", "idle")
     running = st == "running"
 

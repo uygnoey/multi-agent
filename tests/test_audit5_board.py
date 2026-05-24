@@ -15,6 +15,7 @@ from pathlib import Path
 
 from orchestrator.board import (
     _MAX_DIRECTIVES_BYTES,
+    _TAIL_CHUNK_BYTES,
     Board,
     _safe_artifact,
     _tail_lines,
@@ -221,6 +222,15 @@ def test_tail_lines_large_file_returns_last_n(tmp_path: Path):
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")
     tail = _tail_lines(p, 5)
     assert tail == [f"line-{i}" for i in range(199_995, 200_000)]
+
+
+def test_tail_lines_large_single_line_keeps_tail_segment(tmp_path: Path):
+    p = tmp_path / "single.log"
+    p.write_text("A" * 200_000, encoding="utf-8")
+
+    tail = _tail_lines(p, 1)
+
+    assert tail == ["A" * _TAIL_CHUNK_BYTES]
 
 
 def test_tail_lines_partial_first_line_dropped(tmp_path: Path):
