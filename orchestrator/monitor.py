@@ -27,7 +27,7 @@ import unicodedata
 from pathlib import Path
 
 from .backends import backend_status
-from .board import _tail_lines
+from .board import TERMINAL_OK, _tail_lines
 from .config import BACKEND_INFO, ROLES
 
 
@@ -417,6 +417,7 @@ def _read_agent_log(orch_dir: Path, role: str, n: int = 500) -> str:
 # 상세 뷰 로그 mtime 캐시: 같은 파일이 안 바뀌었으면 매 refresh 마다 다시 읽지 않는다 (#36).
 # {경로: (mtime, size, tail_text)}
 _LOG_CACHE: dict[str, tuple[float, int, str]] = {}
+_LOG_CACHE_MAX = 128
 
 
 def _read_agent_log_cached(orch_dir: Path, role: str, n: int = 500) -> str:
@@ -433,6 +434,9 @@ def _read_agent_log_cached(orch_dir: Path, role: str, n: int = 500) -> str:
         return cached[2]
     text = _read_agent_log(orch_dir, role, n=n)
     _LOG_CACHE[key] = (stat.st_mtime, stat.st_size, text)
+    if len(_LOG_CACHE) > _LOG_CACHE_MAX:
+        for old in list(_LOG_CACHE)[: len(_LOG_CACHE) - _LOG_CACHE_MAX]:
+            _LOG_CACHE.pop(old, None)
     return text
 
 
@@ -446,7 +450,7 @@ def render_snapshot(board: dict, roles: list[str], alive: bool | None = None) ->
     # #15: units 가 list 가 아니거나 원소가 dict 가 아닌 손상 board 에도 u.get() 가 안 터지게.
     raw = board.get("units")
     units = [u for u in raw if isinstance(u, dict)] if isinstance(raw, list) else []
-    done = sum(1 for u in units if u.get("status") == "done")
+    done = sum(1 for u in units if u.get("status") in TERMINAL_OK)
     agents = board.get("agents", {})
 
     def status_of(a):
@@ -546,7 +550,7 @@ def _draw_list(stdscr, board, roles, sel, orch_dir, alive) -> None:
     # #15: 손상 schema(units 가 list 아님 / 원소가 dict 아님) 에도 TUI 가 안 터지게.
     raw = board.get("units")
     units = [u for u in raw if isinstance(u, dict)] if isinstance(raw, list) else []
-    done = sum(1 for u in units if u.get("status") == "done")
+    done = sum(1 for u in units if u.get("status") in TERMINAL_OK)
     agents = board.get("agents", {})
 
     def status_of(a):

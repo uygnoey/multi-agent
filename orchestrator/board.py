@@ -69,7 +69,7 @@ def _safe_artifact(raw) -> str | None:
     # 절대경로(POSIX '/' 또는 Windows 드라이브/역슬래시) 차단
     if s.startswith("/") or s.startswith("\\"):
         return None
-    if len(s) >= 2 and s[1] == ":":  # 예: C:\... 형태의 드라이브 절대경로
+    if len(s) >= 2 and s[1] == ":" and s[0].isalpha():  # 예: C:\... 형태의 드라이브 절대경로
         return None
     # 경로 traversal('..') 토큰 차단 (제어문자 제거 후 재검사)
     parts = re.split(r"[\\/]+", s)
@@ -264,6 +264,9 @@ class Board:
             id_map: dict[str, str] = {e: e for e in existing}
             accepted: list[tuple[str, dict]] = []  # 1차에서 확정된 (최종 id, 원본 unit)
             for u in units:
+                if not isinstance(u, dict):
+                    skipped_warnings.append(f"unit skipped: non-object unit {u!r}")
+                    continue
                 raw_id = u.get("id")
                 raw_key = str(raw_id)
                 # 동일한 raw id 가 이번 호출에서 또 나오면 진짜 중복 → skip.
@@ -469,6 +472,8 @@ class Board:
                 a["status"] = status
             if unit is not None or status == "running":
                 a["current_unit"] = unit
+            elif status is not None and status != "running":
+                a["current_unit"] = None
             if backend is not None:
                 a["backend"] = backend
             if model is not None:

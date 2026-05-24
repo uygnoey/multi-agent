@@ -381,7 +381,21 @@ class Runner:
                     "_ok": False,
                 }
             try:
-                data = json.loads(result_path.read_text(encoding="utf-8"))
+                with result_path.open("rb") as fh:
+                    raw = fh.read(_MAX_RESULT_BYTES + 1)
+                if len(raw) > _MAX_RESULT_BYTES:
+                    return {
+                        "status": "failed",
+                        "artifacts": [],
+                        "notes": [],
+                        "blockers": [
+                            "result file too large "
+                            f"(> {_MAX_RESULT_BYTES} bytes; contract violation)"
+                        ],
+                        "units": [],
+                        "_ok": False,
+                    }
+                data = json.loads(raw.decode("utf-8"))
                 return _coerce_result(data, res, phase=phase, role=role)
             except Exception:
                 # 결과파일이 있는데 깨졌으면 계약 위반 → 성공으로 오탐하지 않는다
@@ -478,7 +492,7 @@ def _safe_rel_artifact(raw) -> str | None:
         return None
     if s.startswith("/") or s.startswith("\\"):
         return None
-    if len(s) >= 2 and s[1] == ":":  # 예: C:\... 드라이브 절대경로
+    if len(s) >= 2 and s[1] == ":" and s[0].isalpha():  # 예: C:\... 드라이브 절대경로
         return None
     parts = re.split(r"[\\/]+", s)
     if ".." in parts:
@@ -508,7 +522,17 @@ def _coerce_result(data: dict, res, phase: str | None = None, role: str | None =
             "units": [],
             "_ok": False,
         }
-    status = str(data.get("status") or ("done" if res.ok else "failed")).strip().lower()
+    raw_status = data.get("status")
+    if res.ok and phase is not None and (raw_status is None or str(raw_status).strip() == ""):
+        return {
+            "status": "failed",
+            "artifacts": [],
+            "notes": [str(n) for n in _as_list(data.get("notes"))],
+            "blockers": ["result status missing (contract violation)"],
+            "units": [u for u in _as_list(data.get("units")) if isinstance(u, dict)],
+            "_ok": False,
+        }
+    status = str(raw_status or ("done" if res.ok else "failed")).strip().lower()
     # 빈/공백 blocker 슬롯은 무시 (LLM 이 빈 칸을 남겨도 불필요한 실패가 나지 않게)
     blockers = [s for b in _as_list(data.get("blockers")) if (s := str(b).strip())]
     units = [u for u in _as_list(data.get("units")) if isinstance(u, dict)]

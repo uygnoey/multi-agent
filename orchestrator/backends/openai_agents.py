@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import math
 import os
 import re
 import shutil
@@ -161,7 +162,10 @@ def _openai_pricing() -> dict:
             for k, v in data.items():
                 if k.startswith("_") or not isinstance(v, (list, tuple)) or len(v) < 2:
                     continue
-                out[k] = (float(v[0]), float(v[1]))
+                prices = (float(v[0]), float(v[1]))
+                if any((not math.isfinite(x)) or x < 0 for x in prices):
+                    continue
+                out[k] = prices
             if out:
                 return out
         except Exception:
@@ -345,11 +349,19 @@ def _bash_command_spec(command: str, root: str, full_access: bool) -> tuple[list
     if sys.platform.startswith("linux") and shutil.which("bwrap"):
         return [
             "bwrap",
-            "--ro-bind", "/", "/",
-            "--dev", "/dev",
-            "--proc", "/proc",
-            "--bind", root, root,
-            "--bind", "/tmp", "/tmp",
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--bind",
+            root,
+            root,
+            "--bind",
+            "/tmp",
+            "/tmp",
             "--die-with-parent",
             *base,
         ], ""

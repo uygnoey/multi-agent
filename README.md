@@ -211,10 +211,12 @@ python -m orchestrator --web --port 8765 --base-dir ~/agent-runs
 - 세션별 `max_turns`·예산, 전역 동시성 세마포어, `--max-units`, 경로 스코프(타깃 cwd 한정)
 - `codex` 기본 실행은 `--sandbox workspace-write`로 프로젝트 workspace 권한을 쓰고,
   `--full-access`를 명시할 때만 `danger-full-access`를 전달한다.
+- `openai-agents`의 `run_bash`도 기본 모드에서는 macOS `sandbox-exec` 또는 Linux `bwrap`로
+  workspace-write에 맞춰 프로젝트 밖 쓰기를 제한하려고 시도한다. 해당 OS 샌드박스 도구가 없으면
+  출력에 경고를 붙이고 best-effort로 실행한다. `--full-access`를 명시하면 샌드박스 없이 머신
+  전체 권한으로 실행한다.
 - 생성 프로젝트에는 기본적으로 git repo/checkpoint commit 을 만든다. scaffold, design, unit dev,
   unit verified, cicd, docs 단계에서 변경이 있을 때만 커밋하며 `--no-auto-commit`으로 끌 수 있다.
-- ⚠️ `openai-agents` 백엔드의 `run_bash`(shell)는 cwd 만 타깃일 뿐 FS 경계를 강제하지 않는다
-  (allowed_tools 로 Bash 권한 역할만 노출). 강한 격리가 필요하면 **Docker 컨테이너**로 실행할 것
 - ⚠️ **의존성-설치 금지 = 프롬프트 한정(#48)**: 템플릿(`CLAUDE.md`/`AGENTS.md`)은 "의존성 설치/번들
   빌드 금지"를 지시하지만, 이는 CLI/SDK 백엔드에서 **모델 프롬프트로만 강제**된다(Bash 권한 역할은 무시하고
   `pip`/`npm`/build 실행 가능). **실제 차단이 필요하면** 백엔드 샌드박스(`codex --sandbox`)나 Docker 실행을 사용할 것

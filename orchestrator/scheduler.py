@@ -32,6 +32,7 @@ from .runner import Runner
 # 기본 스택은 특정 도메인(web 등)을 가정하지 않는다 — 아키텍트가 spec 을 보고 실제 스택을
 # 결정한다. (이 값은 {{STACK}} 로 템플릿/보드에 문자열로만 들어가며 코드가 키를 읽지 않는다.)
 DEFAULT_STACK = {"stack": "아키텍트가 spec 기반으로 결정 (architect decides from the spec)"}
+MAX_SPEC_BYTES = 4 * 1024 * 1024
 
 
 class Scheduler:
@@ -48,6 +49,11 @@ class Scheduler:
         self._test_sem = asyncio.Semaphore(max(1, self.cfg.concurrency))
 
     async def run(self) -> dict:
+        try:
+            if self.cfg.spec_path.stat().st_size > MAX_SPEC_BYTES:
+                raise ValueError(f"spec too large (> {MAX_SPEC_BYTES} bytes): {self.cfg.spec_path}")
+        except OSError:
+            pass
         spec_text = self.cfg.spec_path.read_text(encoding="utf-8")
         workspace.scaffold(self.cfg.project_dir, spec_text, DEFAULT_STACK)
         self.board.spec_text = spec_text
@@ -161,6 +167,8 @@ class Scheduler:
                 uid = unit["id"]
                 if self._stop.is_set():  # graceful shutdown: 새 unit 작업을 시작하지 않음
                     await self.board.log_event(uid, "stop requested → skip (designed 유지)")
+                    await self.board.set_status(uid, BLOCKED, "stop requested before unit started")
+                    await self.board.add_warning(f"{uid}: stop 요청으로 unit 미처리 → blocked")
                     return
                 if not await self._wait_for_deps(unit):
                     await self.board.set_status(uid, BLOCKED, "deps unmet or failed")
@@ -237,8 +245,12 @@ class Scheduler:
             sup_tasks = []
             # phase 만 보는 소비자가 실패 런을 'done' 으로 오해하지 않도록, failed/blocked unit 이
             # 하나라도 있으면 최종 phase 를 'failed' 로 둔다. (성공 런은 그대로 'done')
-            still_broken = any(u["status"] in (FAILED, BLOCKED) for u in self.board.units())
-            await self.board.set_phase("failed" if still_broken else "done")
+            terminal = set(TERMINAL_OK) | {FAILED, BLOCKED}
+            still_broken = any(u.get("status") in (FAILED, BLOCKED) for u in self.board.units())
+            still_incomplete = any(u.get("status") not in terminal for u in self.board.units())
+            if still_incomplete:
+                await self.board.add_warning("미완료 unit 이 남아 있어 run 을 failed 로 표시합니다")
+            await self.board.set_phase("failed" if (still_broken or still_incomplete) else "done")
         finally:
             self._stop.set()
             # sup_tasks 뿐 아니라 test/qa 백그라운드(test_tasks)도 반드시 정리한다. 정상
@@ -450,8 +462,12 @@ class Scheduler:
         # 단순 시간초과가 아니라 '진행이 멈췄을 때'만 포기한다(stall). dep 가 아직 작업 중이면
         # (상태가 바뀌거나 에이전트가 활동 중이면) 계속 기다린다 — 한 role 호출이 상태를 붙잡는
         # 최대 시간(session_timeout)보다 넉넉한 윈도. timeout 인자를 주면 그 값을 stall 로 쓴다.
-        base_to = self.cfg.session_timeout if self.cfg.session_timeout is not None else 1200.0
-        stall = timeout if timeout is not None else max(1800.0, base_to * 2)
+        if timeout is not None:
+            stall = timeout
+        elif self.cfg.session_timeout is None:
+            stall = float("inf")
+        else:
+            stall = max(1800.0, self.cfg.session_timeout * 2)
         prev_sig = None
         idle = 0.0
         last_check = time.monotonic()
@@ -494,7 +510,11 @@ class Scheduler:
         """
         status_sig = tuple(units.get(d, {}).get("status") for d in pending)
         pending_set = set(pending)
-        scoped = [a for a in agents.values() if a.get("current_unit") in pending_set]
+        scoped = [
+            a
+            for a in agents.values()
+            if a.get("status", "running") == "running" and a.get("current_unit") in pending_set
+        ]
         if scoped:
             # 기존 동작 유지: dep 을 작업 중인 에이전트의 updated_at 을 진행 신호로 사용.
             return (

@@ -39,6 +39,17 @@ _ROLE_INSTRUCTION = {
     ),
 }
 
+_MAX_UNIT_TITLE_CHARS = 200
+_MAX_UNIT_DESCRIPTION_CHARS = 1500
+_MAX_UNIT_DEPS_CHARS = 500
+
+
+def _clip(value, limit: int) -> str:
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "…(truncated)"
+
 
 def compose_prompt(
     *,
@@ -64,9 +75,15 @@ def compose_prompt(
 
     if unit:
         uid = unit.get("id", "?") if isinstance(unit, dict) else "?"
-        title = unit.get("title", "") if isinstance(unit, dict) else ""
-        description = unit.get("description", "") if isinstance(unit, dict) else ""
-        deps = unit.get("deps", []) if isinstance(unit, dict) else []
+        title = (
+            _clip(unit.get("title", ""), _MAX_UNIT_TITLE_CHARS) if isinstance(unit, dict) else ""
+        )
+        description = (
+            _clip(unit.get("description", ""), _MAX_UNIT_DESCRIPTION_CHARS)
+            if isinstance(unit, dict)
+            else ""
+        )
+        deps = _clip(unit.get("deps", []), _MAX_UNIT_DEPS_CHARS) if isinstance(unit, dict) else "[]"
         parts.append(
             "## Target work unit\n"
             f"- id: {uid}\n"

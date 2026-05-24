@@ -292,6 +292,8 @@ class RunConfig:
         # (#9) NaN/Inf 방어: Inf 가 그대로 asyncio.wait_for(timeout=) 로 가면 감독 폴링이
         # 사실상 멈추므로(영원히 대기) 비유한값은 기본 20초로 되돌린다.
         try:
+            if isinstance(self.poll_interval, bool):
+                raise TypeError
             pi = float(self.poll_interval)
         except (TypeError, ValueError):
             pi = 20.0
@@ -307,6 +309,8 @@ class RunConfig:
         # "깨진 예산 = 예산 없음" 을 명시적으로 만든다. 웹 검증과 더불어 방어적 2중 가드.
         if self.budget is not None:
             try:
+                if isinstance(self.budget, bool):
+                    raise TypeError
                 bv = float(self.budget)
             except (TypeError, ValueError):
                 bv = None
@@ -319,6 +323,8 @@ class RunConfig:
         tv = None
         if self.session_timeout is not None:
             try:
+                if isinstance(self.session_timeout, bool):
+                    raise TypeError
                 tv = float(self.session_timeout)
             except (TypeError, ValueError):
                 tv = None
@@ -330,6 +336,8 @@ class RunConfig:
         # 러너는 min(retry_backoff * 2**i, 60.0) 으로 캡을 두지만, 기준값 자체도 60초 상한으로
         # 클램프해 (예: 1e9 같은 병적인 큰 값이) 첫 재시도부터 비정상 대기를 만들지 않게 한다.
         try:
+            if isinstance(self.retry_backoff, bool):
+                raise TypeError
             rb = float(self.retry_backoff)
         except (TypeError, ValueError):
             rb = 2.0

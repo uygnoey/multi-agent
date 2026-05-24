@@ -18,6 +18,7 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -322,10 +323,18 @@ class RunManager:
     @staticmethod
     def _default_spawn(cmd: list[str], log_path: Path):
         f = open(log_path, "w", encoding="utf-8")  # noqa: SIM115 (closed on reap)
-        # start_new_session=True → 새 프로세스 그룹 → stop 시 자식까지 killpg 가능
-        proc = subprocess.Popen(
-            cmd, cwd=str(FRAMEWORK_ROOT), stdout=f, stderr=subprocess.STDOUT, start_new_session=True
-        )
+        try:
+            # start_new_session=True → 새 프로세스 그룹 → stop 시 자식까지 killpg 가능
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(FRAMEWORK_ROOT),
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except Exception:
+            f.close()
+            raise
         proc._logfile = f  # is_running 에서 reap 시 close
         return proc
 
@@ -355,7 +364,11 @@ class RunManager:
         except Exception:
             pass
         cmd = build_command(sys.executable, spec_path, project, opts)
-        proc = self._spawn(cmd, self.base_dir / f"{run_id}.log")
+        try:
+            proc = self._spawn(cmd, self.base_dir / f"{run_id}.log")
+        except Exception:
+            shutil.rmtree(project, ignore_errors=True)
+            raise
         with self._lock:
             self._procs[run_id] = proc
         return run_id
@@ -1259,7 +1272,7 @@ async function tick(){
     const units=Array.isArray(b.units)?b.units:[];
     const warns=Array.isArray(b.warnings)?b.warnings:[];
     const globalArts=Array.isArray(b.artifacts)?b.artifacts:[];
-    const done=units.filter(u=>u&&u.status==="done").length;
+    const done=units.filter(u=>u&&(u.status==="done"||u.status==="tested")).length;
     $("projDir").textContent=proj||"—";
     $("phase").textContent=b.phase||"—";
     $("cost").textContent="$"+num(b.total_cost_usd).toFixed(4)+(b.cost_estimated?" est.":"");

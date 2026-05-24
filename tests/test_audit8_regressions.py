@@ -96,6 +96,51 @@ def test_openai_file_helpers_allow_internal_symlink_and_reject_escape(tmp_path: 
     assert outside.read_text(encoding="utf-8") == "secret"
 
 
+def test_openai_pricing_ignores_bad_external_prices(tmp_path: Path, monkeypatch):
+    f = tmp_path / "pricing.json"
+    f.write_text(
+        '{"bad_nan":["nan",1],"bad_negative":[-1,1],"good":[1.5,2.5]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENAI_PRICING_FILE", str(f))
+
+    assert oa._openai_price_for("bad_nan") is None
+    assert oa._openai_price_for("bad_negative") is None
+    assert oa._openai_price_for("good") == (1.5, 2.5)
+
+
+def test_openai_bash_workspace_write_spec_uses_split_bwrap_args(monkeypatch):
+    monkeypatch.setattr(oa.sys, "platform", "linux")
+    monkeypatch.setattr(
+        oa.shutil, "which", lambda name: "/usr/bin/bwrap" if name == "bwrap" else None
+    )
+
+    argv, warning = oa._bash_command_spec("echo hi", "/tmp/project", full_access=False)
+
+    assert warning == ""
+    assert argv[0] == "bwrap"
+    assert "--ro-bind" in argv
+    ro_i = argv.index("--ro-bind")
+    assert argv[ro_i + 1 : ro_i + 3] == ["/", "/"]
+    assert "--bind" in argv
+    bind_i = argv.index("--bind")
+    assert argv[bind_i + 1 : bind_i + 3] == ["/tmp/project", "/tmp/project"]
+
+
+def test_board_add_units_skips_non_dict_and_clears_current_unit(tmp_path: Path):
+    b = Board(tmp_path)
+
+    asyncio.run(b.init("spec", {}))
+    asyncio.run(b.add_units([{"id": "U1", "title": "ok"}, "bad"]))
+    units = b.units()
+    assert [u["id"] for u in units] == ["U1"]
+
+    asyncio.run(b.agent_update("backend-developer", status="running", unit="U1"))
+    assert b.agents()["backend-developer"]["current_unit"] == "U1"
+    asyncio.run(b.agent_update("backend-developer", status="done"))
+    assert b.agents()["backend-developer"]["current_unit"] is None
+
+
 def test_git_checkpoint_uses_local_identity_and_preserves_baseline_dirty(
     tmp_path: Path, monkeypatch
 ):

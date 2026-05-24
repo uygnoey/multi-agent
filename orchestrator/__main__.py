@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from .backends import ALIASES, backend_status, resolve
+from .board import TERMINAL_OK
 from .config import (
     BACKEND_INFO,
     DEFAULT_BACKEND,
@@ -207,8 +208,13 @@ def _print_summary(snap: dict, cfg: RunConfig) -> None:
     print(f"project-dir : {cfg.project_dir}")
     print(f"phase       : {snap.get('phase')}")
     for u in units:
-        print(f"  {u['id']:<6} {u['status']:<11} test={str(u.get('test_status')):<5} {u['title']}")
-    done = sum(1 for u in units if u["status"] == "done")
+        if not isinstance(u, dict):
+            continue
+        print(
+            f"  {str(u.get('id', '?')):<6} {str(u.get('status', '?')):<11} "
+            f"test={str(u.get('test_status')):<5} {u.get('title', '')}"
+        )
+    done = sum(1 for u in units if isinstance(u, dict) and u.get("status") in TERMINAL_OK)
     print(f"units       : {done}/{len(units)} done")
     # 손상된 스냅샷(문자열/None/리스트 cost)이라도 보드/리포트 경로는 출력되도록 안전 변환 (#29)
     # (#10) NaN/Inf 도 방어: float("nan")/float("inf") 은 float() 를 통과하지만 그대로

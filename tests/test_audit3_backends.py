@@ -303,6 +303,30 @@ def test_claude_team_adds_budget_not_maxturns(tmp_path, monkeypatch):
     assert "--max-turns" not in cmd
 
 
+def test_claude_budget_arg_avoids_scientific_notation():
+    assert cli_mod.budget_arg(3.0) == "3.0"
+    assert cli_mod.budget_arg(0.000001) == "0.000001"
+    assert "e" not in cli_mod.budget_arg(0.000001).lower()
+
+
+def test_claude_stream_error_result_is_failure(tmp_path, monkeypatch):
+    async def fake_run(cmd, cwd, timeout, log_path=None, line_render=None):
+        out = (
+            b'{"type":"result","subtype":"error","is_error":true,'
+            b'"result":"quota exceeded","total_cost_usd":0.1}\n'
+        )
+        return 0, out, b"", False
+
+    monkeypatch.setattr(cli_mod, "run_subprocess", fake_run)
+    req = _make_request(tmp_path, budget=1.0, timeout=5)
+
+    res = asyncio.run(cli_mod.ClaudeCLIBackend().run_role(req))
+
+    assert res.ok is False
+    assert "quota exceeded" in res.error
+    assert res.cost_usd == pytest.approx(0.1)
+
+
 # ---------------------------------------------------------------------------
 # #5/#6/#7: stderr 는 head 가 아니라 tail(마지막 4000자)을 보존한다.
 # ---------------------------------------------------------------------------

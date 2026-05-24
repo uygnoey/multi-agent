@@ -60,6 +60,10 @@ def parse_stream_result(out_bytes: bytes):
         if o.get("type") == "system" and o.get("model"):
             model = o.get("model")
         if o.get("type") == "result":
+            if o.get("is_error") or o.get("subtype") in ("error", "failure"):
+                final = str(o.get("result") or o.get("error") or final)
+                cost = o.get("total_cost_usd", cost)
+                continue
             candidate = o.get("result", final)
             final = candidate if isinstance(candidate, str) else final
             cost = o.get("total_cost_usd", cost)
@@ -72,6 +76,26 @@ def parse_stream_result(out_bytes: bytes):
                     + (u.get("output_tokens") or 0)
                 )
     return final, cost, model, tokens
+
+
+def stream_result_has_error(out_bytes: bytes) -> bool:
+    for line in out_bytes.splitlines():
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        if o.get("type") == "result" and (
+            o.get("is_error") or o.get("subtype") in ("error", "failure")
+        ):
+            return True
+    return False
+
+
+def budget_arg(value) -> str:
+    s = f"{float(value):.12f}".rstrip("0").rstrip(".")
+    if "." not in s:
+        s += ".0"
+    return s
 
 
 class ClaudeCLIBackend(Backend):
@@ -105,7 +129,7 @@ class ClaudeCLIBackend(Backend):
         # 실재한다(-p/--print 전용). 따라서 req.budget 이 명시되면 per-call 예산 캡을 실제로
         # 전달해 강제한다. budget 미지정이면 추가하지 않는다(기존 동작 유지).
         if req.budget is not None:
-            cmd += ["--max-budget-usd", str(req.budget)]
+            cmd += ["--max-budget-usd", budget_arg(req.budget)]
         # #25(#117): 그러나 동일 CLI 에 turn-limit 플래그(--max-turns 등)는 존재하지 않는다
         # (claude --help 로 검증: 0건). 없는 플래그를 넘기면 매 호출이 'unknown option'으로
         # 깨지므로 추가하지 않는다 — req.max_turns 강제는 이 백엔드에서 불가(KEEP-DOCUMENTED).
@@ -125,6 +149,16 @@ class ClaudeCLIBackend(Backend):
             return RoleResult(ok=False, error=err.decode(errors="replace")[-4000:] or f"exit {rc}")
 
         final, cost, model, tokens = parse_stream_result(out)
+        if stream_result_has_error(out):
+            return RoleResult(
+                ok=False,
+                error=final or "claude-cli stream result reported an error",
+                final_message=final,
+                cost_usd=cost,
+                model=model or req.model,
+                tokens=tokens,
+                cost_estimated=not os.environ.get("ANTHROPIC_API_KEY"),
+            )
         return RoleResult(
             ok=True,
             final_message=final or "(done)",

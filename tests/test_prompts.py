@@ -37,6 +37,29 @@ def test_includes_unit_id_and_title_when_unit_given():
     assert "Spec excerpt" not in out
 
 
+def test_unit_fields_are_capped():
+    unit = {
+        "id": "U2",
+        "title": "T" * 500,
+        "description": "D" * 5000,
+        "deps": ["U" + str(i) for i in range(500)],
+    }
+    out = compose_prompt(
+        role="backend-developer",
+        phase="dev",
+        unit=unit,
+        directives="",
+        result_rel="res.json",
+        spec_excerpt="ignored when unit present",
+    )
+
+    target = out.split("## Target work unit\n", 1)[1].split("## Instruction", 1)[0]
+    assert "…(truncated)" in target
+    assert target.count("T") == 200
+    assert target.count("D") == 1500
+    assert len(target) < 2500
+
+
 def test_spec_excerpt_and_scope_when_unit_none():
     out = compose_prompt(
         role="architecture-engineer",

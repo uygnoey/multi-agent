@@ -224,8 +224,10 @@ python -m orchestrator --web --port 8765 --base-dir ~/agent-runs
 - **Web security**: path-traversal blocking (run id confined to base_dir · role validation), request body size cap
 - **Result contract**: non-supervisor roles treat a missing/broken result JSON as failure (avoids false success)
 - Per-session `max_turns`/budget, global concurrency semaphore, `--max-units`, path scoping (confined to target cwd)
-- ⚠️ The `openai-agents` backend's `run_bash` (shell) only sets cwd to the target — it does not enforce an FS
-  boundary (gated by allowed_tools so only Bash-capable roles get it). For strong isolation, run in **Docker**
+- `codex` defaults to `--sandbox workspace-write` and uses `danger-full-access` only when `--full-access` is set.
+- The `openai-agents` backend's `run_bash` follows the same workspace-write policy where possible: macOS
+  `sandbox-exec` or Linux `bwrap` restrict writes outside the project. If neither OS sandbox is available, it
+  runs best-effort and prefixes the tool output with a warning. `--full-access` runs without that sandbox.
 - ⚠️ **No-dependency-install policy is prompt-only (#48)**: the templates (`CLAUDE.md`/`AGENTS.md`) instruct roles
   not to install dependencies or build bundles, but for CLI/SDK backends this is **enforced by the model prompt
   only** — a Bash-capable role can ignore it and run `pip`/`npm`/build. For real enforcement (true isolation), rely
