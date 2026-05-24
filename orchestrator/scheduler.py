@@ -70,6 +70,8 @@ class Scheduler:
         self.runner = Runner(cfg, self.board)
         self.git = GitCheckpointer(cfg.project_dir, enabled=cfg.auto_commit)
         self._stop = asyncio.Event()
+        self._dev_failure_signatures: dict[str, tuple[str, int]] = {}
+        self._last_dev_failure: dict[str, dict] = {}
         # test/qa 동시성 캡: dev 와 별개로 test-engineer+qa 호출을 묶는 세마포어.
         # dev 슬롯(sem)만 캡되어 있고 test/qa 는 unit 마다 자유 태스크로 떠서, unit 이 많으면
         # 동시 백엔드 세션이 폭증할 수 있었다(과금/리소스). concurrency 에서 크기를 끌어와
@@ -211,6 +213,13 @@ class Scheduler:
                 # 개발 슬롯은 반납 → 개발은 곧바로 다음 unit 으로 진행한다.
                 if await self._develop_unit(unit, sem, 1):
                     test_tasks.append(asyncio.create_task(self._test_unit_safe(unit, sem)))
+                    return
+                if self._stop.is_set():
+                    return
+                if self._can_repair(1):
+                    test_tasks.append(
+                        asyncio.create_task(self._repair_failed_dev_safe(unit, sem, 1))
+                    )
 
             # pipeline 이 예기치 못한 예외를 던져도 아래 정리/리포트 블록이 항상 돌도록
             # return_exceptions=True (한 unit 의 내부 오류가 전체 cleanup 을 스킵시키지 않게).
@@ -362,24 +371,36 @@ class Scheduler:
             dev_outcomes = await asyncio.gather(
                 *[self.runner.run_role(r, unit) for r in dev_roles], return_exceptions=True
             )
-            for o in dev_outcomes:
+            normalized_outcomes = []
+            for role, o in zip(dev_roles, dev_outcomes, strict=False):
                 if isinstance(o, Exception):
+                    normalized_outcomes.append(_exception_outcome(role, o))
                     continue
+                normalized_outcomes.append(o)
                 await self.board.add_artifacts(uid, o.get("artifacts", []))
-            failed = any(isinstance(o, Exception) or not o.get("_ok", True) for o in dev_outcomes)
+            failed = any(not o.get("_ok", True) for o in normalized_outcomes)
             if failed:
                 await self.board.set_status(uid, BLOCKED, "dev failed")
+                self._remember_dev_failure(uid, normalized_outcomes)
                 await self.board.add_warning(f"{uid}: 개발(dev) 실패 → blocked")
                 return False
+            self._dev_failure_signatures.pop(uid, None)
+            self._last_dev_failure.pop(uid, None)
             await self.board.set_status(uid, DEV_DONE)
             dev_paths = [
-                p
-                for o in dev_outcomes
-                if not isinstance(o, Exception) and o.get("_ok", True)
-                for p in o.get("artifacts", [])
+                p for o in normalized_outcomes if o.get("_ok", True) for p in o.get("artifacts", [])
             ]
             await self._checkpoint(f"orchestrator: {uid} dev attempt {attempt}", dev_paths)
             return True
+
+    async def _repair_failed_dev_safe(
+        self, unit: dict, sem: asyncio.Semaphore, attempt: int
+    ) -> None:
+        try:
+            await self._repair_failed_dev(unit, sem, attempt)
+        except Exception as e:
+            await self.board.set_status(unit["id"], FAILED, f"dev repair pipeline error: {e}")
+            await self.board.add_warning(f"{unit['id']}: dev repair 파이프라인 예외: {e}")
 
     async def _test_unit_safe(self, unit: dict, sem: asyncio.Semaphore) -> None:
         """test/qa 파이프라인 래퍼 — 예외가 gather 에서 조용히 삼켜져 unit 이 비종료로 남지 않게."""
@@ -402,9 +423,18 @@ class Scheduler:
         units = {u["id"]: u for u in self.board.units()}
         return [d for d in deps if units.get(d, {}).get("status") in (FAILED, BLOCKED)]
 
+    def _text_list(self, value: object) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, (list, tuple, set)):
+            return [str(v) for v in value]
+        return [str(value)]
+
     def _with_repair_context(self, unit: dict, outcome: dict, source: str) -> dict:
-        notes = [str(n) for n in outcome.get("notes") or []]
-        blockers = [str(b) for b in outcome.get("blockers") or []]
+        notes = self._text_list(outcome.get("notes"))
+        blockers = self._text_list(outcome.get("blockers"))
         fields = []
         for key in ("failure_kind", "repair_owner", "repair_instruction", "command", "stderr_tail"):
             if outcome.get(key):
@@ -432,11 +462,56 @@ class Scheduler:
             str(x)
             for x in [
                 outcome.get("repair_instruction", ""),
-                *(outcome.get("blockers") or []),
-                *(outcome.get("notes") or []),
+                *self._text_list(outcome.get("blockers")),
+                *self._text_list(outcome.get("notes")),
             ]
         ).lower()
         return any(word in text for word in _TEST_REPAIR_WORDS)
+
+    def _remember_dev_failure(self, uid: str, outcomes: list[dict]) -> None:
+        failed = [o for o in outcomes if not o.get("_ok", True)]
+        notes: list[str] = []
+        blockers: list[str] = []
+        fields: dict[str, object] = {}
+        for o in failed:
+            notes.extend(self._text_list(o.get("notes")))
+            blockers.extend(self._text_list(o.get("blockers")))
+            for key in (
+                "failure_kind",
+                "repair_owner",
+                "repair_instruction",
+                "command",
+                "stderr_tail",
+            ):
+                if key not in fields and o.get(key):
+                    fields[key] = o[key]
+        signature = json.dumps(
+            {
+                "fields": fields,
+                "blockers": blockers[:8],
+                "notes": notes[:12],
+                "statuses": [str(o.get("status", "")) for o in failed],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        prev_sig, prev_count = self._dev_failure_signatures.get(uid, ("", 0))
+        count = prev_count + 1 if prev_sig == signature else 1
+        self._dev_failure_signatures[uid] = (signature, count)
+        self._last_dev_failure[uid] = {
+            "status": "failed",
+            "artifacts": [],
+            "notes": notes,
+            "blockers": blockers,
+            "_ok": False,
+            "repeat_count": count,
+            **fields,
+        }
+
+    def _dev_failure_stalled(self, uid: str) -> bool:
+        if self.cfg.max_attempts != 0:
+            return False
+        return self._dev_failure_signatures.get(uid, ("", 0))[1] >= 3
 
     def _attempt_label(self, attempt: int) -> str:
         if self.cfg.max_attempts == 0:
@@ -454,6 +529,69 @@ class Scheduler:
         except (TypeError, ValueError):
             spent = 0.0
         return spent >= self.cfg.budget
+
+    async def _repair_failed_dev(self, unit: dict, sem: asyncio.Semaphore, attempt: int) -> None:
+        uid = unit["id"]
+        if self._budget_exhausted():
+            await self.board.set_status(uid, BLOCKED, "repair stopped: budget exhausted")
+            await self.board.add_warning(f"{uid}: 예산 소진으로 자동 수리 중단")
+            return
+        outcome = self._last_dev_failure.get(
+            uid,
+            {"_ok": False, "status": "failed", "blockers": ["dev failed"], "notes": []},
+        )
+        repair_unit = self._with_repair_context(unit, outcome, "dev")
+        next_attempt = attempt + 1
+        while self._can_repair(next_attempt - 1) and not self._stop.is_set():
+            if self._budget_exhausted():
+                await self.board.set_status(uid, BLOCKED, "repair stopped: budget exhausted")
+                await self.board.add_warning(f"{uid}: 예산 소진으로 자동 수리 중단")
+                return
+            broken = self._broken_deps(unit)
+            if broken:
+                await self.board.set_status(uid, BLOCKED, f"rework aborted: deps broken {broken}")
+                await self.board.add_warning(f"{uid}: 재작업 직전 의존성 붕괴 → blocked: {broken}")
+                return
+            await self.board.log_event(uid, f"initial dev failed → repair attempt {next_attempt}")
+            if await self._develop_unit(repair_unit, sem, next_attempt):
+                await self._test_unit(repair_unit, sem, next_attempt)
+                return
+            if self._dev_failure_stalled(uid):
+                await self.board.set_status(
+                    uid, BLOCKED, "repair stopped: repeated identical dev failure"
+                )
+                await self.board.add_warning(
+                    f"{uid}: 동일 dev 실패가 반복되어 외부/환경 장애로 간주하고 자동 수리 중단"
+                )
+                return
+            repair_unit = self._with_repair_context(
+                unit, self._last_dev_failure.get(uid, outcome), "dev"
+            )
+            next_attempt += 1
+        await self.board.set_status(uid, FAILED, "dev failed after retries")
+
+    async def _qa_after_test_repair(
+        self, unit: dict, sem: asyncio.Semaphore, attempt: int, test_paths: list[str]
+    ) -> None:
+        uid = unit["id"]
+        async with self._test_sem:
+            qa = await self.runner.run_role("qa", unit)
+            qa_paths = list(qa.get("artifacts", []))
+            await self.board.add_artifacts(uid, qa_paths)
+            passed = qa.get("_ok", True) and qa.get("status") != "failed"
+            await self.board.set_test_status(uid, "pass" if passed else "fail")
+            if passed:
+                await self.board.set_status(uid, DONE)
+                await self._checkpoint(f"orchestrator: {uid} verified", [*test_paths, *qa_paths])
+                return
+            if not self._can_repair(attempt):
+                await self.board.set_status(uid, FAILED, "QA failed after retries")
+                return
+            repair_unit = self._with_repair_context(unit, qa, "qa")
+            test_repair_first = self._needs_test_repair(qa)
+        await self._rework_after_verification_failure(
+            unit, sem, attempt, repair_unit, test_repair_first
+        )
 
     async def _test_unit(self, unit: dict, sem: asyncio.Semaphore, attempt: int) -> None:
         """unit 개발 완료 직후 test-engineer → qa 를 실행 (개발 슬롯 비점유).
@@ -512,9 +650,22 @@ class Scheduler:
                     await self.board.set_status(uid, FAILED, "QA failed after retries")
                     return
 
-        # ---- rework: _test_sem 점유를 푼 뒤 수행 (dev 슬롯과 중첩 점유 회피) ----
         if not rework:
             return
+        await self._rework_after_verification_failure(
+            unit, sem, attempt, repair_unit, test_repair_first
+        )
+
+    async def _rework_after_verification_failure(
+        self,
+        unit: dict,
+        sem: asyncio.Semaphore,
+        attempt: int,
+        repair_unit: dict,
+        test_repair_first: bool,
+    ) -> None:
+        """test/qa 실패 뒤 수리 루프. _test_sem 밖에서 호출해 dev 슬롯과 중첩 점유하지 않는다."""
+        uid = unit["id"]
         if self._budget_exhausted():
             await self.board.set_status(uid, BLOCKED, "repair stopped: budget exhausted")
             await self.board.add_warning(f"{uid}: 예산 소진으로 자동 수리 중단")
@@ -539,9 +690,10 @@ class Scheduler:
                 uid, TESTING, f"test/config repair attempt {self._attempt_label(attempt + 1)}"
             )
             te = await self.runner.run_role("test-engineer", repair_unit)
-            await self.board.add_artifacts(uid, list(te.get("artifacts", [])))
+            test_paths = list(te.get("artifacts", []))
+            await self.board.add_artifacts(uid, test_paths)
             if te.get("_ok", True) and te.get("status") != "failed":
-                await self._test_unit(repair_unit, sem, attempt + 1)
+                await self._qa_after_test_repair(repair_unit, sem, attempt + 1, test_paths)
                 return
             await self.board.log_event(uid, "test/config repair failed → dev 재작업 fallback")
         if await self._develop_unit(repair_unit, sem, attempt + 1):
@@ -556,6 +708,14 @@ class Scheduler:
             await self.board.log_event(uid, f"dev repair failed → retrying attempt {next_attempt}")
             if await self._develop_unit(repair_unit, sem, next_attempt):
                 await self._test_unit(repair_unit, sem, next_attempt)
+                return
+            if self._dev_failure_stalled(uid):
+                await self.board.set_status(
+                    uid, BLOCKED, "repair stopped: repeated identical dev failure"
+                )
+                await self.board.add_warning(
+                    f"{uid}: 동일 dev 실패가 반복되어 외부/환경 장애로 간주하고 자동 수리 중단"
+                )
                 return
             next_attempt += 1
         await self.board.set_status(uid, FAILED, "rework dev failed")

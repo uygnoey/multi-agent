@@ -198,6 +198,7 @@ class Runner:
             result_rel=result_rel,
             spec_excerpt=self.board.snapshot().get("spec_excerpt", ""),
             recent_events=self.board.recent_events(12) if unit is None else "",
+            completion_level=self.cfg.completion_level,
         )
 
         candidates, skipped = self._candidates(role)

@@ -255,6 +255,7 @@ class RunConfig:
     delegate: bool = False  # allow role sessions to call teammates as subagents
     full_access: bool = False  # machine-wide backend access; default is project workspace access
     auto_commit: bool = True  # create checkpoint commits inside the generated project
+    completion_level: str = "mvp"  # mvp or production: how complete the generated app must be
     max_attempts: int = 0  # dev→test→qa repair attempts per unit; 0 = until fixed/external stop
     retries: int = 1  # transient backend-failure retries per role call
     retry_backoff: float = 2.0  # seconds, exponential
@@ -285,6 +286,12 @@ class RunConfig:
         self.retries = min(20, max(0, _coerce_int(self.retries, 1)))
         if self.max_units is not None:
             self.max_units = _coerce_optional_positive_int(self.max_units)
+        level = str(self.completion_level or "mvp").strip().lower().replace("_", "-")
+        if level in ("prod", "production-ready"):
+            level = "production"
+        if level not in ("mvp", "production"):
+            level = "mvp"
+        self.completion_level = level
         # poll_interval 을 안전 하한으로 클램프 (#33). 웹은 poll_interval=0 을 허용하는데,
         # 0/음수/비-숫자/이상값이 그대로 _supervise 의 asyncio.wait_for 로 들어가면 PM/PL 감독이
         # tight busy-loop 를 돌며 CPU 를 태우고 비싼 LLM 호출을 반복한다. 0/음수는 안전 바닥(5초)

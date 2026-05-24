@@ -45,8 +45,15 @@ def test_runconfig_defaults():
     assert cfg.delegate is False
     assert cfg.full_access is False
     assert cfg.auto_commit is True
+    assert cfg.completion_level == "mvp"
     assert cfg.max_attempts == 0
     assert cfg.retries == 1
+
+
+def test_completion_level_normalized():
+    assert _make_cfg(completion_level="production").completion_level == "production"
+    assert _make_cfg(completion_level="prod").completion_level == "production"
+    assert _make_cfg(completion_level="bad").completion_level == "mvp"
 
 
 def test_backend_for_mock_overrides_everything():

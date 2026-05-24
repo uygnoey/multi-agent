@@ -100,6 +100,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="생성 프로젝트의 단계별 git checkpoint commit 을 비활성화",
     )
     p.add_argument(
+        "--completion-level",
+        choices=("mvp", "production"),
+        default="mvp",
+        help="개발 완료 기준: mvp=핵심 동작 완성, production=통합/빌드 검증까지 강화",
+    )
+    p.add_argument(
         "--max-attempts",
         type=int,
         default=0,
@@ -201,6 +207,7 @@ def build_config(a: argparse.Namespace) -> RunConfig:
         delegate=a.delegate,
         full_access=a.full_access,
         auto_commit=not a.no_auto_commit,
+        completion_level=a.completion_level,
         max_attempts=a.max_attempts,
         retries=a.retries,
         session_timeout=(a.timeout if a.timeout and a.timeout > 0 else None),

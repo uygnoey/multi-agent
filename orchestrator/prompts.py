@@ -61,6 +61,7 @@ def compose_prompt(
     result_rel: str,
     spec_excerpt: str,
     recent_events: str = "",
+    completion_level: str = "mvp",
 ) -> str:
     directives = directives or ""
     spec_excerpt = spec_excerpt or ""
@@ -70,6 +71,25 @@ def compose_prompt(
         "Follow the shared protocol, coding conventions, and tech stack in this directory's "
         "CLAUDE.md / AGENTS.md."
     )
+    level = str(completion_level or "mvp").strip().lower().replace("_", "-")
+    if level in ("prod", "production-ready"):
+        level = "production"
+    if level not in ("mvp", "production"):
+        level = "mvp"
+    if level == "production":
+        parts.append(
+            "## Completion target\n"
+            "Production: implement complete, integrated behavior for the requested scope. "
+            "Do not mark work done just because a narrow happy path passes; include error states, "
+            "persistence/integration details, configuration, and declared build/test verification "
+            "where feasible."
+        )
+    else:
+        parts.append(
+            "## Completion target\n"
+            "MVP: implement the requested user-visible behavior end to end with a runnable, "
+            "coherent slice. Avoid unrelated hardening, but do not bypass missing core behavior."
+        )
 
     if directives.strip():
         parts.append("## PM/PL directives (latest)\n" + directives.strip()[-2000:])
@@ -117,11 +137,18 @@ def compose_prompt(
     parts.append("## Instruction\n" + _ROLE_INSTRUCTION.get(role, "Perform your role."))
 
     if role == "qa":
+        build_rule = (
+            "- For production completion, run the declared production build/check command once "
+            "when feasible; do not start long-running servers.\n"
+            if level == "production"
+            else "- Do NOT build production bundles or start long-running servers.\n"
+        )
         parts.append(
-            "## Constraints (cost & environment)\n"
+            "## Verification discipline\n"
             "- You MAY run the existing test suite to verify; "
             "install test deps only if missing, once.\n"
-            "- Do NOT build production bundles or start long-running servers.\n"
+            f"{build_rule}"
+            "- Avoid repeating successful checks unless source, tests, or configuration changed.\n"
             "- When failing, classify the root cause in the result JSON using "
             "`failure_kind` (`source_bug`, `test_harness`, `test_config`, `dependency_env`, "
             "or `unknown`), `repair_owner` (role that should fix it), and "
@@ -138,10 +165,17 @@ def compose_prompt(
             "- Run the relevant tests when feasible and report the exact command/result."
         )
     elif role not in ("project-manager", "project-leader"):
+        build_rule = (
+            "- Production completion may require build/deploy/config changes; keep commands "
+            "bounded and leave long-running verification to QA.\n"
+            if level == "production"
+            else "- Do NOT create virtualenvs, install dependencies (pip/npm install), build "
+            "production bundles, or start servers — QA handles verification.\n"
+        )
         parts.append(
-            "## Constraints (cost & environment)\n"
-            "- Do NOT create virtualenvs, install dependencies (pip/npm install), build production "
-            "bundles, or start servers — CI handles install/build.\n"
+            "## Development discipline\n"
+            f"{build_rule}"
+            "- Prefer targeted edits and narrow validation over broad, repeated checks.\n"
             "- Write and edit source files only; QA runs the tests."
         )
 

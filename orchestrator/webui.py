@@ -269,6 +269,9 @@ def build_command(py: str, spec_path: Path, project_dir: Path, opts: dict) -> li
         cmd.append("--full-access")
     if opts.get("auto_commit") is False:
         cmd.append("--no-auto-commit")
+    completion_level = str(opts.get("completion_level") or "mvp").strip().lower()
+    if completion_level in ("mvp", "production"):
+        cmd += ["--completion-level", completion_level]
     # #38: max_units/max_attempts 도 손상값을 관대하게 변환. max_units 는 0/음수면 "전체"로
     #      간주해 플래그를 생략(폴백 0). max_attempts 는 0이면 "고쳐질 때까지" 기본값.
     if _coerce_int(opts.get("max_units"), 0) > 0:
@@ -974,6 +977,10 @@ def _make_handler(manager: RunManager, token: str | None = None):
                 if fv < 0:
                     self._json({"error": f"{fld} must be >= 0 (got {fv})"}, 400)
                     return
+            level = str(data.get("completion_level") or "mvp").strip().lower()
+            if level not in ("mvp", "production"):
+                self._json({"error": f"invalid completion_level: {level!r}"}, 400)
+                return
             # #137: name 은 slugify().strip() 으로 흘러가므로 str 이 아니면 .strip() 에서
             #       raise 한다. None(미지정)은 start() 가 기본값 "run" 으로 처리하므로 허용,
             #       그 외 비문자열(숫자/list/object)은 400 으로 거부한다.
@@ -1099,6 +1106,7 @@ INDEX_HTML = r"""<!doctype html>
       <div><label title="감독(PM/PL) 주기. 웹 기본 600초 — CLI 기본(20초)보다 길게 설정됨. 짧게 하려면 직접 입력.">poll-interval (초, 선택 · 웹 기본 600 / CLI 20)</label><input type="text" id="pollInterval" placeholder="600 (웹 기본)"/></div>
       <div><label>timeout (초, 선택)</label><input type="text" id="timeout" placeholder="기본"/></div>
       <div><label>retries (선택)</label><input type="text" id="retries" placeholder="1"/></div>
+      <div><label>completion</label><select id="completionLevel"><option value="mvp">mvp</option><option value="production">production</option></select></div>
       <div><label>budget (USD, 선택)</label><input type="text" id="budget" placeholder="없음"/></div>
       <div><label>model (선택)</label><input type="text" id="model" placeholder="백엔드 기본값"/></div>
     </div>
@@ -1200,7 +1208,8 @@ async function startRun(){
       max_units:raw("maxUnits"),
       max_attempts:raw("maxAttempts"),
       poll_interval:raw("pollInterval"),timeout:raw("timeout"),
-      retries:raw("retries"),budget:raw("budget"),model:raw("model"),
+      retries:raw("retries"),completion_level:$("completionLevel").value,
+      budget:raw("budget"),model:raw("model"),
       mock:$("mock").checked,delegate:$("delegate").checked,full_access:$("fullAccess").checked,
       auto_commit:$("autoCommit").checked};
     const r=await fetchWithTimeout("/api/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)},30000);

@@ -139,3 +139,28 @@ def test_recent_events_block_optional():
     with_events = compose_prompt(recent_events="09:00 [board] initialized", **base_kwargs)
     assert "## Recent events" in with_events
     assert "initialized" in with_events
+
+
+def test_completion_level_changes_verification_guidance():
+    mvp = compose_prompt(
+        role="qa",
+        phase="test",
+        unit={"id": "U1", "title": "t"},
+        directives="",
+        result_rel="res.json",
+        spec_excerpt="",
+        completion_level="mvp",
+    )
+    prod = compose_prompt(
+        role="qa",
+        phase="test",
+        unit={"id": "U1", "title": "t"},
+        directives="",
+        result_rel="res.json",
+        spec_excerpt="",
+        completion_level="production",
+    )
+    assert "MVP: implement" in mvp
+    assert "Do NOT build production bundles" in mvp
+    assert "Production: implement complete" in prod
+    assert "production build/check command once" in prod
