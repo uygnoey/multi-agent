@@ -438,7 +438,13 @@ class Runner:
                 # 계약 위반으로 처리(검사~open 사이 symlink 바꿔치기 레이스까지 원자적 차단).
                 # Windows 에는 O_NOFOLLOW 가 없으므로 getattr 폴백(상단 is_symlink 검사로 보완).
                 fd = os.open(result_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-                with os.fdopen(fd, "rb") as fh:
+                # #audit15: os.fdopen 이 raise 하면 raw fd 가 누수되므로 close 후 재전파.
+                try:
+                    fh = os.fdopen(fd, "rb")
+                except BaseException:
+                    os.close(fd)
+                    raise
+                with fh:
                     raw = fh.read(_MAX_RESULT_BYTES + 1)
                 if len(raw) > _MAX_RESULT_BYTES:
                     return {

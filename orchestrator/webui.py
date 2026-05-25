@@ -794,6 +794,18 @@ def _make_handler(manager: RunManager, token: str | None = None):
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")  # 실시간: 캐시 금지
+                # #audit15: defense-in-depth 보안 헤더. 단일 파일 UI(외부 리소스 없음)라
+                # 정상 동작에는 영향이 없다. CSP 는 인라인 <script>/<style>/onclick 핸들러를
+                # 쓰므로 'unsafe-inline' 을 script/style 에 허용하되 나머지는 self 로 제한.
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header(
+                    "Content-Security-Policy",
+                    "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+                    "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+                    "connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+                )
                 for k, v in extra_headers or []:
                     self.send_header(k, v)
                 self.end_headers()

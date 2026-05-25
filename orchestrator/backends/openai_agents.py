@@ -371,6 +371,29 @@ def _bash_command_spec(command: str, root: str, full_access: bool) -> tuple[list
     )
 
 
+# #audit15: run_bash 가 상속하는 환경에서 비밀 값을 제거한다. 에이전트 셸은 오케스트레이터의
+# API 키/토큰이 필요 없고, 악성/오작동 명령이 env(또는 /proc/self/environ)로 키를 읽어 유출할
+# 수 있다. PATH/HOME/TMPDIR 등 기본 동작 변수는 유지(allow), 비밀 패턴만 제거(block).
+_SECRET_ENV_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_SECRET_KEY", "_PASSWORD", "_ACCESS_KEY")
+_SECRET_ENV_PREFIXES = ("AWS_", "AZURE_", "GCP_")
+_SECRET_ENV_EXACT = {"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GITHUB_TOKEN", "GH_TOKEN"}
+
+
+def _scrubbed_bash_env() -> dict[str, str]:
+    """오케스트레이터 env 에서 비밀 값을 제거한 사본을 반환 (#audit15)."""
+    env: dict[str, str] = {}
+    for k, v in os.environ.items():
+        ku = k.upper()
+        if (
+            ku in _SECRET_ENV_EXACT
+            or any(ku.endswith(s) for s in _SECRET_ENV_SUFFIXES)
+            or any(ku.startswith(p) for p in _SECRET_ENV_PREFIXES)
+        ):
+            continue
+        env[k] = v
+    return env
+
+
 def _run_bash_command(
     command: str, cwd: str, timeout: float, max_capture: int, full_access: bool = False
 ) -> str:
@@ -396,6 +419,7 @@ def _run_bash_command(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,  # stdout+stderr 를 한 스트림으로 합쳐 순서 보존
             start_new_session=True,  # #3: 새 프로세스 그룹 → 자식까지 그룹째 종료 가능
+            env=_scrubbed_bash_env(),  # #audit15: 비밀 env 제거 후 실행(키 유출 표면 축소)
         )
 
         def _drain() -> None:

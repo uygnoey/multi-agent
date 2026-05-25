@@ -98,6 +98,10 @@ class Scheduler:
         # #H04: QA/test 검증 실패의 진행(반복) 추적 — dev 실패와 대칭. dev 는 성공하나 QA 가 계속
         # 실패하는 경우에도 '진전 없음'을 감지해 에스컬레이션·외부장애 분류를 적용한다.
         self._verify_failure_signatures: dict[str, tuple[str, int]] = {}
+        # #audit15: 외부장애(Tier A) 반복 카운터 — escalation 시그니처(source 포함)와 분리한다.
+        # source 가 시그니처에 들어가면 te↔qa 교대 외부장애가 count 를 매번 리셋해 자동중단
+        # (>=2)이 안 터지던 회귀를 막기 위해, 외부장애 반복은 source 무관 별도 카운터로 센다.
+        self._external_repeat: dict[str, int] = {}
         # test/qa 동시성 캡: dev 와 별개로 test-engineer+qa 호출을 묶는 세마포어.
         # dev 슬롯(sem)만 캡되어 있고 test/qa 는 unit 마다 자유 태스크로 떠서, unit 이 많으면
         # 동시 백엔드 세션이 폭증할 수 있었다(과금/리소스). concurrency 에서 크기를 끌어와
@@ -303,7 +307,14 @@ class Scheduler:
             if not docs_out.get("_ok", True):
                 await self.board.add_warning("docs-writer failed (산출물 문서 미완)")
             # 보드 기반 산출물 문서는 백엔드와 무관하게 항상 EN/KO 생성
-            deliverables = self.board.write_deliverables()
+            # #audit15: docs/ 가 symlink 이거나 권한 문제로 가드/쓰기가 실패해도 전체 run 을
+            # failed 로 만들지 않는다. 빌드·테스트가 성공했는데 산출물 문서 단계 예외로 죽지
+            # 않도록 warning 으로 degrade 한다.
+            try:
+                deliverables = self.board.write_deliverables()
+            except Exception as e:  # noqa: BLE001
+                deliverables = []
+                await self.board.add_warning(f"산출물 문서(DELIVERABLES) 작성 건너뜀: {e}")
             await self.board.add_global_artifacts(deliverables)
             await self._checkpoint(
                 "orchestrator: docs artifacts", [*docs_out.get("artifacts", []), *deliverables]
@@ -601,6 +612,7 @@ class Scheduler:
         self._verify_failure_signatures.pop(uid, None)
         self._dev_failure_signatures.pop(uid, None)
         self._last_dev_failure.pop(uid, None)
+        self._external_repeat.pop(uid, None)  # #audit15: 외부장애 카운터도 함께 정리
 
     @staticmethod
     def _escalation_text(count: int, label: str) -> str | None:
@@ -803,10 +815,17 @@ class Scheduler:
                 self._clear_failure_state(uid)  # #RA5: terminal(FAILED) → 시그니처 정리
                 await self.board.set_status(uid, FAILED, f"{source} failed after retries")
                 return
-            count = self._remember_verify_failure(uid, outcome, source)  # #H04 진행 추적
-            # #H09: 고신뢰 외부/영구 장애가 반복되면 분류·중단.
+            count = self._remember_verify_failure(uid, outcome, source)  # #H04 escalation 추적
+            # #H09/#audit15: 고신뢰 외부/영구 장애가 반복되면 분류·중단. escalation 카운터(source
+            # 포함)와 분리된 별도 카운터로 외부장애 반복을 센다 → te↔qa 교대에도 정상 누적.
             ext = self._external_blocker_reason([outcome])
-            if ext and count >= 2:
+            if ext:
+                ext_repeat = self._external_repeat.get(uid, 0) + 1
+                self._external_repeat[uid] = ext_repeat
+            else:
+                self._external_repeat.pop(uid, None)
+                ext_repeat = 0
+            if ext and ext_repeat >= 2:
                 self._clear_failure_state(uid)  # #RA5: terminal(BLOCKED) → 시그니처 정리
                 await self.board.set_status(uid, BLOCKED, f"external blocker: {ext}")
                 await self.board.add_warning(
