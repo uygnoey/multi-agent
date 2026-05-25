@@ -521,19 +521,23 @@ def test_mock_architecture_units_no_broken_markdown(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-# #RA-sdkre: base 키 뒤 포인트 버전 세그먼트를 최대 2개로 제한 — 현행 ID 는 폴백, 그 이상의
-# 미지 변형(가격이 다를 수 있음)은 조용히 base 단가로 매핑하지 않고 None 으로 둔다.
+# #RA-sdkre: 알려진 포인트 버전(4.1/4.5)은 폴백하되, 알 수 없는 미래 포인트 버전은 조용히
+# base 단가로 매핑하지 않고 None 으로 둔다.
 def test_anthropic_price_suffix_limits_point_version_segments():
-    # 현행 ID(접미사 1~2개 + 선택적 날짜)는 base 단가로 폴백한다.
+    # 현행 ID(알려진 포인트 + 선택적 날짜)는 base 단가로 폴백한다.
     assert sdk_mod._anthropic_price_for("claude-opus-4-1") == (15.0, 75.0)
     assert sdk_mod._anthropic_price_for("claude-opus-4-1-20250805") == (15.0, 75.0)
-    assert sdk_mod._anthropic_price_for("claude-opus-4-2-3") == (15.0, 75.0)
-    # base 키 뒤 포인트 세그먼트가 3개 이상이면(미지의 미래 변형) 폴백하지 않는다 → None.
+    assert sdk_mod._anthropic_price_for("claude-sonnet-4-5") == (3.0, 15.0)
+    assert sdk_mod._anthropic_price_for("claude-sonnet-4-5-20250929") == (3.0, 15.0)
+    # 알려지지 않은 미래 포인트 변형은 폴백하지 않는다 → None.
+    assert sdk_mod._anthropic_price_for("claude-opus-4-2") is None
+    assert sdk_mod._anthropic_price_for("claude-opus-4-2-3") is None
     assert sdk_mod._anthropic_price_for("claude-opus-4-2-3-4") is None
     assert sdk_mod._anthropic_price_for("claude-opus-4-2-3-4-20260101") is None
-    # 접미사 정규식 자체도 직접 검증(0~2개 허용, 3개부터 거부).
-    assert sdk_mod._ANTHROPIC_DATE_SUFFIX.match("-1-2")
-    assert sdk_mod._ANTHROPIC_DATE_SUFFIX.match("-1-2-20250101")
+    # 접미사 정규식 자체도 직접 검증(known point 만 허용).
+    assert sdk_mod._ANTHROPIC_DATE_SUFFIX.match("-1")
+    assert sdk_mod._ANTHROPIC_DATE_SUFFIX.match("-5-20250101")
+    assert not sdk_mod._ANTHROPIC_DATE_SUFFIX.match("-2")
     assert not sdk_mod._ANTHROPIC_DATE_SUFFIX.match("-1-2-3")
 
 

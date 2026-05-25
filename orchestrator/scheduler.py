@@ -72,7 +72,6 @@ _EXTERNAL_TIER_A_PATTERNS = (
     "api key is not",
     "api key not set",
     "invalid api key",
-    "authentication failed",
 )
 
 
@@ -413,13 +412,18 @@ class Scheduler:
             if failed:
                 await self.board.set_status(uid, BLOCKED, "dev failed")
                 self._remember_dev_failure(uid, normalized_outcomes)
+                if not self._can_repair(attempt):
+                    self._clear_failure_state(uid)
                 await self.board.add_warning(f"{uid}: 개발(dev) 실패 → blocked")
                 return False
             self._dev_failure_signatures.pop(uid, None)
             self._last_dev_failure.pop(uid, None)
             await self.board.set_status(uid, DEV_DONE)
             dev_paths = [
-                p for o in normalized_outcomes if o.get("_ok", True) for p in o.get("artifacts", [])
+                p
+                for o in normalized_outcomes
+                if o.get("_ok", False)
+                for p in o.get("artifacts", [])
             ]
             await self._checkpoint(f"orchestrator: {uid} dev attempt {attempt}", dev_paths)
             return True
@@ -725,6 +729,10 @@ class Scheduler:
             )
             repair_unit = self._with_repair_context(unit, outcome, "dev", escalation=escalation)
             next_attempt += 1
+        if self._stop.is_set():
+            self._clear_failure_state(uid)
+            await self.board.set_status(uid, BLOCKED, "stop requested during dev repair")
+            return None
         self._clear_failure_state(uid)  # #RA5: terminal(FAILED) → 시그니처 정리
         await self.board.set_status(uid, FAILED, "dev repair failed after retries")
         return None

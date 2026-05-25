@@ -245,9 +245,10 @@ def test_command_not_found_text_is_not_external_blocker(tmp_path, sample_spec_pa
         "read-only file system",
     ):
         assert sched._external_blocker_reason([{"blockers": [txt]}]) is None
-    # 고신뢰 인증/키 텍스트는 여전히 external 로 잡는다.
+    # 고신뢰 키 부재 텍스트는 external 로 잡되, 일반 앱 인증 실패에도 흔한
+    # "authentication failed" 는 자유 텍스트만으로 external 로 단정하지 않는다.
     assert sched._external_blocker_reason([{"blockers": ["missing api key"]}]) == "missing api key"
-    assert sched._external_blocker_reason([{"notes": ["authentication failed"]}]) is not None
+    assert sched._external_blocker_reason([{"notes": ["authentication failed"]}]) is None
     # 구조화된 failure_kind 는 그대로 Tier A(신뢰).
     assert sched._external_blocker_reason([{"failure_kind": "tool_missing"}]) == "tool_missing"
     assert sched._external_blocker_reason([{"failure_kind": "permission_denied"}]) is not None

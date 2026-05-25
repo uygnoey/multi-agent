@@ -470,10 +470,11 @@ class RunManager:
     _ALIVE_TTL = 0.8  # 초
     _ALIVE_CACHE_MAX = 256
 
-    def __init__(self, base_dir: Path, spawn=None):
+    def __init__(self, base_dir: Path, spawn=None, max_running: int = 16):
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self._spawn = spawn or self._default_spawn
+        self.max_running = max(1, int(max_running or 16))
         self._procs: dict[str, object] = {}
         self._lock = threading.Lock()
         # #6: liveness 캐시 — {key: (deadline, alive)}. key 는 pidfile 경로+mtime+size.
@@ -513,30 +514,46 @@ class RunManager:
     def start(self, spec_text: str, opts: dict) -> str:
         run_id = new_run_id(opts.get("name", "run"))
         project = self.project_dir(run_id)
-        project.mkdir(parents=True, exist_ok=True)
-        spec_path = project / "_spec.md"
-        spec_path.write_text(spec_text or "# (empty spec)\n", encoding="utf-8")
-        # 재실행(rerun)용으로 옵션 저장
-        # LOW(#8): 예전엔 write 실패를 조용히 삼켰다(except: pass). 그러면 이후 rerun 이
-        #          원래 backends/옵션을 잃고 조용히 기본값으로 실행된다. 실패를 stderr 로
-        #          알려(서버 로그에 남게) 운영자가 디스크/권한 문제를 인지하게 한다.
-        try:
-            (project / "_run_opts.json").write_text(
-                json.dumps(opts, ensure_ascii=False), encoding="utf-8"
-            )
-        except Exception as e:
-            print(
-                f"[webui] 경고: _run_opts.json 저장 실패 ({project / '_run_opts.json'}): {e} "
-                "— 이후 재실행(rerun)은 기본 옵션으로 동작할 수 있습니다.",
-                file=sys.stderr,
-            )
-        cmd = build_command(sys.executable, spec_path, project, opts)
-        try:
-            proc = self._spawn(cmd, self.base_dir / f"{run_id}.log")
-        except Exception:
-            shutil.rmtree(project, ignore_errors=True)
-            raise
         with self._lock:
+            # /api/run 은 HTTP 레벨 요청 수에 제한이 없으므로, 전체 active run cap 이 없으면
+            # 반복 POST 로 프로세스/디스크를 고갈시킬 수 있다. 종료된 tracked proc 은 먼저 정리한다.
+            for rid, proc in list(self._procs.items()):
+                try:
+                    if proc.poll() is not None:
+                        lf = getattr(proc, "_logfile", None)
+                        if lf:
+                            lf.close()
+                        self._procs.pop(rid, None)
+                except Exception:
+                    self._procs.pop(rid, None)
+            running = sum(
+                1 for proc in self._procs.values() if getattr(proc, "poll", lambda: None)() is None
+            )
+            if running >= self.max_running:
+                raise RuntimeError(f"too many active runs ({running}/{self.max_running})")
+            project.mkdir(parents=True, exist_ok=True)
+            spec_path = project / "_spec.md"
+            spec_path.write_text(spec_text or "# (empty spec)\n", encoding="utf-8")
+            # 재실행(rerun)용으로 옵션 저장
+            # LOW(#8): 예전엔 write 실패를 조용히 삼켰다(except: pass). 그러면 이후 rerun 이
+            #          원래 backends/옵션을 잃고 조용히 기본값으로 실행된다. 실패를 stderr 로
+            #          알려(서버 로그에 남게) 운영자가 디스크/권한 문제를 인지하게 한다.
+            try:
+                (project / "_run_opts.json").write_text(
+                    json.dumps(opts, ensure_ascii=False), encoding="utf-8"
+                )
+            except Exception as e:
+                print(
+                    f"[webui] 경고: _run_opts.json 저장 실패 ({project / '_run_opts.json'}): {e} "
+                    "— 이후 재실행(rerun)은 기본 옵션으로 동작할 수 있습니다.",
+                    file=sys.stderr,
+                )
+            cmd = build_command(sys.executable, spec_path, project, opts)
+            try:
+                proc = self._spawn(cmd, self.base_dir / f"{run_id}.log")
+            except Exception:
+                shutil.rmtree(project, ignore_errors=True)
+                raise
             self._procs[run_id] = proc
         return run_id
 

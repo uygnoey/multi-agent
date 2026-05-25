@@ -38,7 +38,14 @@ _ANTHROPIC_FALLBACK_PRICING = {
 # 변형(가령 단가가 다른 claude-opus-4-2 류)까지 base 단가로 조용히 매핑할 위험이 있다. 포인트
 # 버전 세그먼트를 최대 2개(`{0,2}`)로 제한해, 현행 ID(메이저·마이너 2단계)는 폴백하되 그 이상의
 # 미지 변형은 매칭에서 빠져 None(허위 비용 날조 금지)으로 떨어지게 한다.
-_ANTHROPIC_DATE_SUFFIX = re.compile(r"^(?:-\d+){0,2}(?:-(?:\d{6,8}|latest))?$")
+_ANTHROPIC_DATE_SUFFIX = re.compile(
+    # exact base ("") / dated base ("-20250805") / known point-release forms:
+    # - "-1" / "-1-20250805" for opus 4.1 style IDs
+    # - "-5" / "-5-20250929" for sonnet 4.5 style IDs
+    # Unknown bare point releases such as "-2" intentionally do not match; returning
+    # None is safer than silently applying an old base price to a potentially different SKU.
+    r"^(?:-(?:\d{6,8}|latest)|-(?:1|5)(?:-(?:\d{6,8}|latest))?)?$"
+)
 
 
 def _anthropic_pricing() -> dict:

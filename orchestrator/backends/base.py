@@ -177,9 +177,23 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None, std
             proc.stdin.write(stdin_data)
             await proc.stdin.drain()
         except Exception:
+            # asyncio 의 pipe transport 는 BrokenPipe 를 drain() 밖의 write-ready Future 에도
+            # 보관할 수 있다. 예외를 삼킨 뒤 그 Future 의 exception 을 회수하지 않으면
+            # "Future exception was never retrieved" 경고가 stderr 를 오염시킨다.
+            try:
+                protocol = getattr(proc.stdin, "_protocol", None)
+                waiter = getattr(protocol, "_drain_waiter", None)
+                if waiter is not None and waiter.done():
+                    waiter.exception()
+            except Exception:
+                pass
             pass
         try:
             proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            await proc.stdin.wait_closed()
         except Exception:
             pass
 

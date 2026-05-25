@@ -55,16 +55,38 @@ def _coerce_finite_float(raw) -> float:
     return val if math.isfinite(val) else 0.0
 
 
-def _json_safe(obj):
+def _json_key_safe(key):
+    if isinstance(key, float) and not math.isfinite(key):
+        return str(key)
+    if isinstance(key, (str, int, float, bool)) or key is None:
+        return key
+    return str(key)
+
+
+def _json_safe(obj, _seen: set[int] | None = None):
     # #RA-nan: NaN/Infinity 는 표준 JSON 토큰이 아니어서 JS JSON.parse(webui)가 깨진다.
-    # dict/list 를 재귀 순회하며 비-유한(float NaN/±Inf)만 0.0 으로 치환한 새 구조를 만든다.
-    # (그 외 값은 그대로 두고, json.dumps 의 allow_nan=False 폴백 경로에서만 호출한다.)
+    # dict/list/tuple/set 를 재귀 순회하며 비-유한(float NaN/±Inf)을 치환한다. 순환참조는
+    # 문자열 마커로 끊어, 폴백 직렬화가 writer 를 죽이지 않게 한다.
+    if _seen is None:
+        _seen = set()
     if isinstance(obj, float):
         return obj if math.isfinite(obj) else 0.0
+    if isinstance(obj, (str, int, bool)) or obj is None:
+        return obj
+    oid = id(obj)
+    if isinstance(obj, (dict, list, tuple, set)):
+        if oid in _seen:
+            return "<cycle>"
+        _seen.add(oid)
+        try:
+            if isinstance(obj, dict):
+                return {_json_key_safe(k): _json_safe(v, _seen) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple, set)):
+                return [_json_safe(v, _seen) for v in obj]
+        finally:
+            _seen.discard(oid)
     if isinstance(obj, dict):
-        return {k: _json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_json_safe(v) for v in obj]
+        return {str(k): _json_safe(v, _seen) for k, v in obj.items()}
     return obj
 
 
@@ -74,7 +96,7 @@ def _dumps_safe(data, **kw) -> str:
     # 죽이지 않고 _json_safe 로 살균한 구조를 다시 allow_nan=False 로 직렬화한다.
     try:
         return json.dumps(data, ensure_ascii=False, allow_nan=False, **kw)
-    except ValueError:
+    except (TypeError, ValueError, RecursionError):
         return json.dumps(_json_safe(data), ensure_ascii=False, allow_nan=False, **kw)
 
 

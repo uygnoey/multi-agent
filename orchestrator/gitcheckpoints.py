@@ -146,7 +146,11 @@ class GitCheckpointer:
         # paths=[new] 만 선택되면 old 삭제가 staging 누락되어 커밋이 일관성을 잃는다. 선택된 경로와
         # 같은 디렉터리에 있는 tracked-삭제 파일을 함께 포함해 삭제도 stage 되게 한다(한계: 디렉터리
         # 단위 휴리스틱 — 다른 디렉터리로의 fs-rename 은 git mv 사용 시에만 R 짝으로 정확히 잡힌다).
-        sel_dirs = {s.rsplit("/", 1)[0] if "/" in s else "" for s in selected}
+        # 루트 파일 선택(paths=["new.txt"])에서 dirname 이 ""가 되면 루트의 모든 tracked
+        # deletion 이 같은 checkpoint 로 끌려오는 over-staging 이 된다. 디렉터리 휴리스틱은
+        # "같은 비루트 디렉터리"에 한정하고, 루트-level fs rename 은 git mv/rename-pair 또는
+        # 명시 selected deletion 으로만 처리한다(무관한 루트 삭제를 커밋하지 않는 쪽이 안전).
+        sel_dirs = {s.rsplit("/", 1)[0] for s in selected if "/" in s}
         for d in deleted:
             ddir = d.rsplit("/", 1)[0] if "/" in d else ""
             if _matches(d) or ddir in sel_dirs:
