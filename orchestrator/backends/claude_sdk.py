@@ -258,12 +258,17 @@ class ClaudeSDKBackend(Backend):
                     it = getattr(usage, "input_tokens", 0) or 0
                     ot = getattr(usage, "output_tokens", 0) or 0
                     tt = getattr(usage, "total_tokens", None)
-                total = int(tt) if tt else int(it + ot)
+                # #audit16: SDK 는 usage 를 ResultMessage 에 '누적(cumulative)' 값으로 싣는 형태가
+                # 일반적이다. 메시지마다 max 로 취해 최종 누적값을 유지한다 → (a) 여러 메시지가
+                # usage 를 실어도 중복 합산(double-count) 안 되고, (b) 뒤에 usage 없는/부분 메시지가
+                # 와도 이전 값을 0/축소로 덮지 않는다. (이전엔 주석은 '누적'인데 코드는 단순 = 할당
+                # 이라, 멀티-usage 메시지에서 마지막 값만 남아 과소계상 위험이 있었다.)
+                it_i, ot_i = int(it or 0), int(ot or 0)
+                state["in_tokens"] = max(state["in_tokens"], it_i)
+                state["out_tokens"] = max(state["out_tokens"], ot_i)
+                total = int(tt) if tt else it_i + ot_i
                 if total:
-                    state["tokens"] = total
-                # #3(audit9): 분리 in/out 토큰도 누적 (USD 미보고 시 비용 추정용).
-                state["in_tokens"] = int(it or 0)
-                state["out_tokens"] = int(ot or 0)
+                    state["tokens"] = max(state["tokens"] or 0, total)
 
         async def _consume():
             async for msg in query(prompt=req.prompt, options=options):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import shutil
@@ -13,7 +14,20 @@ _FALLBACK_NAME = "dev-crew-orchestrator"
 _FALLBACK_EMAIL = "dev-crew-orchestrator@brillianttiger.io"
 _DEFAULT_COMMIT_MESSAGE = "orchestrator: checkpoint"
 
+# baseline 캡처 상한 (#audit16): 재사용 디렉터리가 거대해도 init 이 과도하게 느려지지 않게
+# 파일 수/크기를 캡한다. 상한을 넘기면 best-effort 로 중단하며, 미기록 경로는 '신규'로 간주돼
+# 체크포인트에 포함될 수 있다(이전 빈-baseline 동작과 동일한 보수적 폴백).
+_BASELINE_MAX_FILES = 5000
+_BASELINE_MAX_FILE_BYTES = 5 * 1024 * 1024
+# git/orchestrator 메타·의존성 디렉터리는 baseline 해시에서 제외(walk 가속). 이들은 시드
+# .gitignore 로 git status 에도 노출되지 않으므로 제외해도 체크포인트 정확도에 영향 없음.
+_BASELINE_SKIP_DIRS = {".git", ".orchestrator", "node_modules", ".venv", "venv", "__pycache__"}
+
 _log = logging.getLogger(__name__)
+
+
+class _NestedRepoError(RuntimeError):
+    """project_dir 가 부모 git repo 하위 → nested repo 회피·체크포인트 비활성화 (#audit16)."""
 
 
 class GitCheckpointer:
@@ -28,7 +42,13 @@ class GitCheckpointer:
         self.project_dir = Path(project_dir)
         self.enabled = enabled
         self._lock = asyncio.Lock()
-        self._baseline_paths = self._status_paths_best_effort()
+        # #audit16: 경로명 집합 대신 (상대경로 → content hash) baseline 을 캡처한다. 이래야
+        # (a) 비-git 기존 디렉터리에서도 사용자 파일을 첫 체크포인트에 끌어들이지 않고,
+        # (b) 시작 시 dirty 였던 파일을 orchestrator 가 다시 수정하면 그 변경분이 유실되지 않는다.
+        self._baseline_hashes = self._capture_baseline_hashes()
+        # #audit16: project_dir 가 부모 git repo 하위로 판명되면 nested repo 를 피하려고
+        # 체크포인트를 끈 사유를 캐시한다(반복 rev-parse/로그 방지).
+        self._checkpoints_disabled_reason: str | None = None
 
     async def checkpoint(self, message: str, paths: list[str] | None = None) -> tuple[bool, str]:
         if not self.enabled:
@@ -64,25 +84,74 @@ class GitCheckpointer:
                 stderr=f"git {' '.join(args)} timed out after {timeout}s",
             )
 
-    def _status_paths_best_effort(self) -> set[str]:
+    def _capture_baseline_hashes(self) -> dict[str, str]:
+        """run 시작 전(scaffold 이전) 존재하던 파일들의 (상대경로 → content hash) (#audit16).
+
+        체크포인트에서 'orchestrator 가 만들거나 수정한 변경'만 커밋하기 위한 기준이다. 파일 수/
+        크기 상한을 둬 거대한 재사용 디렉터리에서 init 이 느려지지 않게 한다(best-effort).
+        """
+        out: dict[str, str] = {}
         if not self.enabled or not self.project_dir.exists():
-            return set()
+            return out
+        count = 0
         try:
-            # (#1) -z 로 NUL 구분 출력을 받아 공백/한글/이스케이프 경로를 정확히 파싱한다.
-            status = self._run("status", "--porcelain", "-z", "--untracked-files=all")
-        except Exception as e:
-            # (#5) baseline 캡처 실패를 완전히 삼키지 않고 사유를 기록한다.
-            _log.warning("git status (baseline) failed: %s", e)
-            return set()
-        if status.returncode != 0:
-            # (#5) 실패 사유를 남긴다(예: timeout/권한). baseline 이 비어도 조용하진 않게.
-            _log.warning(
-                "git status (baseline) returned %s: %s",
-                status.returncode,
-                (status.stderr or status.stdout or "").strip(),
-            )
-            return set()
-        return _parse_status_paths_z(status.stdout)
+            walker = os.walk(self.project_dir, onerror=None)
+            for root, dirs, files in walker:
+                dirs[:] = [d for d in dirs if d not in _BASELINE_SKIP_DIRS]
+                for fn in files:
+                    full = Path(root) / fn
+                    try:
+                        rel = full.relative_to(self.project_dir).as_posix()
+                    except ValueError:
+                        continue
+                    h = self._hash_file(full)
+                    if h is None:
+                        continue
+                    out[rel] = h
+                    count += 1
+                    if count >= _BASELINE_MAX_FILES:
+                        _log.warning(
+                            "git checkpoint baseline truncated at %d files; some pre-existing "
+                            "files may be included in checkpoints",
+                            _BASELINE_MAX_FILES,
+                        )
+                        return out
+        except OSError as e:
+            _log.warning("git checkpoint baseline capture failed: %s", e)
+        return out
+
+    @staticmethod
+    def _hash_file(full: Path) -> str | None:
+        """파일 내용 서명. symlink/비정규파일/접근불가는 None. 과대 파일은 (크기,mtime) 서명."""
+        try:
+            if full.is_symlink() or not full.is_file():
+                return None
+            st = full.stat()
+        except OSError:
+            return None
+        if st.st_size > _BASELINE_MAX_FILE_BYTES:
+            # 과대 파일은 내용 대신 (크기,mtime) 서명 — 변경되지 않은 거대 사용자 파일이
+            # 매번 커밋되지 않게 하되, orchestrator 수정 시 mtime/크기 변화로 변경을 잡는다.
+            return f"meta:{st.st_size}:{int(st.st_mtime)}"
+        try:
+            data = full.read_bytes()
+        except OSError:
+            return None
+        return "sha1:" + hashlib.sha1(data).hexdigest()
+
+    def _is_orchestrator_change(self, rel: str) -> bool:
+        """rel 이 orchestrator 의 변경(=체크포인트 대상)인지 (#audit16).
+
+        baseline 에 없던 신규 경로·내용이 달라진 경로·사라진(삭제) 경로는 True.
+        baseline 과 동일한 사용자 기존파일만 False(제외).
+        """
+        base = self._baseline_hashes.get(rel)
+        if base is None:
+            return True  # 신규 파일
+        cur = self._hash_file(self.project_dir / rel)
+        if cur is None:
+            return True  # 삭제됨/접근불가 → 변경으로 본다(삭제 stage 필요)
+        return cur != base
 
     def _ensure_repo(self) -> None:
         if not shutil.which("git"):
@@ -91,11 +160,17 @@ class GitCheckpointer:
         top = self._run("rev-parse", "--show-toplevel")
         if top.returncode == 0:
             try:
-                if Path(top.stdout.strip()).resolve() == self.project_dir.resolve():
-                    self._ensure_identity()
-                    return
+                top_path: Path | None = Path(top.stdout.strip()).resolve()
             except Exception:
-                pass
+                top_path = None
+            if top_path is not None and top_path == self.project_dir.resolve():
+                self._ensure_identity()
+                return
+            if top_path is not None:
+                # #audit16: project_dir 가 기존(부모) git repo 하위다. 여기서 git init 하면
+                # 혼란스러운 nested repo 가 생기고, 부모 repo 에 커밋하면 사용자 저장소를
+                # 오염시킨다. 둘 다 피하고 체크포인트를 끈다(best-effort 기능이므로 degrade).
+                raise _NestedRepoError(str(top_path))
         init = self._run("init")
         if init.returncode != 0:
             raise RuntimeError((init.stderr or init.stdout or "git init failed").strip())
@@ -121,14 +196,20 @@ class GitCheckpointer:
         status = self._run("status", "--porcelain", "-z", "--untracked-files=all")
         if status.returncode != 0:
             raise RuntimeError((status.stderr or status.stdout or "git status failed").strip())
-        all_changed = _parse_status_paths_z(status.stdout) - self._baseline_paths
+        # #audit16: 경로명 차집합 대신 내용 해시 기반 판정(_is_orchestrator_change)으로 거른다.
+        # baseline 과 동일한 사용자 기존파일만 제외하고, 신규/수정/삭제는 모두 포함한다.
+        all_changed = {
+            p for p in _parse_status_paths_z(status.stdout) if self._is_orchestrator_change(p)
+        }
         # #RA-git: rename 짝(R/C) 과 tracked-삭제 경로를 미리 뽑아 둔다(필터링 시 짝을 함께 끌어옴).
         rename_pairs = [
             (o, n)
             for (o, n) in _parse_rename_pairs_z(status.stdout)
-            if o not in self._baseline_paths or n not in self._baseline_paths
+            if self._is_orchestrator_change(o) or self._is_orchestrator_change(n)
         ]
-        deleted = _parse_deleted_paths_z(status.stdout) - self._baseline_paths
+        deleted = {
+            p for p in _parse_deleted_paths_z(status.stdout) if self._is_orchestrator_change(p)
+        }
         selected = _normalize_paths(paths)
         if selected is None:
             return sorted(all_changed)
@@ -192,7 +273,18 @@ class GitCheckpointer:
         return out
 
     def _checkpoint_sync(self, message: str, paths: list[str] | None = None) -> tuple[bool, str]:
-        self._ensure_repo()
+        # #audit16: nested-repo 회피로 한 번 비활성화되면 이후 호출은 즉시 skip 사유 반환.
+        if self._checkpoints_disabled_reason:
+            return False, self._checkpoints_disabled_reason
+        try:
+            self._ensure_repo()
+        except _NestedRepoError as e:
+            self._checkpoints_disabled_reason = (
+                f"skipped: project dir is inside an existing git repo ({e}); "
+                "nested checkpoint repo avoided"
+            )
+            _log.warning(self._checkpoints_disabled_reason)
+            return False, self._checkpoints_disabled_reason
         paths = self._stageable_paths(self._changed_paths(paths))
         if not paths:
             return False, "no changes"

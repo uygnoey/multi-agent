@@ -452,8 +452,16 @@ def _coerce_board_schema(data: dict) -> dict:
     monitor(render_snapshot·TUI detail/list·artifacts) 가 .values()/.get()/iter 로 접근하므로
     여기서 한 번 보정해 AttributeError/TypeError 크래시를 막는다.
     """
-    if not isinstance(data.get("agents", {}), dict):
-        data["agents"] = {}
+    # agents 키가 있을 때만 보정한다(없으면 그대로 둬 'absent' 의미를 보존; #70 테스트 호환).
+    if "agents" in data:
+        raw_agents = data.get("agents")
+        if not isinstance(raw_agents, dict):
+            data["agents"] = {}
+        else:
+            # #audit16: agents 의 *값*도 dict 여야 한다. 손상 board(예: {"agents":{"qa":"running"}})
+            # 에서 소비자(webui /api/state·monitor render)가 a.get()/a["status"]= 로 접근하다
+            # AttributeError/TypeError 로 크래시하던 것을 막는다(비-dict 값은 드롭).
+            data["agents"] = {k: v for k, v in raw_agents.items() if isinstance(v, dict)}
     raw_units = data.get("units")
     if raw_units is not None and not isinstance(raw_units, list):
         data["units"] = []

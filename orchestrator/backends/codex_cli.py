@@ -209,10 +209,27 @@ def _visible_tokens(usage: dict[str, int]) -> int | None:
 
 
 def _read_last_message(path: Path, max_chars: int = 8000) -> str:
-    """Read Codex ``--output-last-message`` output with a bounded in-memory cap."""
+    """Read Codex ``--output-last-message`` output with a bounded in-memory cap.
+
+    #audit16: runner 의 결과 JSON 읽기와 동일하게 symlink 를 거부하고 O_NOFOLLOW 로 연다 —
+    workspace-write 샌드박스의 codex 가 이 출력 경로를 외부(예: ~/.codex/auth)를 가리키는
+    symlink 로 바꿔 임의 파일을 'final message' 로 읽히는 것을 막는다(최종 컴포넌트 TOCTOU 차단).
+    """
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as fh:
-            text = fh.read(max_chars + 1)
+        if path.is_symlink():
+            return ""
+        # UTF-8 최악 4바이트/문자 여유로 바이트 상한을 잡고 읽은 뒤 디코드한다.
+        max_bytes = (max_chars + 1) * 4
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        # os.fdopen 이 raise 하면 raw fd 가 누수되므로 close 후 재전파(double-close 없이).
+        try:
+            fh = os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with fh:
+            raw = fh.read(max_bytes)
+        text = raw.decode("utf-8", errors="replace")
     except Exception:
         return ""
     if len(text) > max_chars:

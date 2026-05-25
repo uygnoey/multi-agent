@@ -312,7 +312,10 @@ def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
     gi = project_dir / ".gitignore"
     _guard_managed_path(project_dir, gi, allow_unsafe=allow_unsafe, label=".gitignore")
     if gi.exists():
-        cur = gi.read_text(encoding="utf-8")
+        # #audit16: 기존 .gitignore 가 비-UTF8(예: Latin-1/이진)이면 read_text 가
+        # UnicodeDecodeError 로 scaffold 전체를 중단시켰다. 관리 템플릿(위)과 동일하게
+        # errors="replace" 로 견고하게 읽는다(시드 패턴 추가는 라인 단위라 영향 없음).
+        cur = gi.read_text(encoding="utf-8", errors="replace")
         # 라인 단위로 실제 ignore 패턴을 확인 (주석/부분일치 오인 방지; #92)
         existing = {ln.strip() for ln in cur.splitlines()}
         # 시드 블록을 통째로 붙이면 이미 있는 패턴(node_modules/, .venv/ 등)이 중복된다 (#21).

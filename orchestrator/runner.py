@@ -242,10 +242,14 @@ class Runner:
                         call=True,
                         activity="▶ " + (f"unit={key} " if unit else "") + f"[{name}]{team}{fo}",
                     )
-                    if result_path.exists() and _under_results_dir(result_path, self.board):
-                        # missing_ok: .exists() 와 unlink 사이의 TOCTOU(다른 곳에서 먼저 삭제)
-                        # 로 FileNotFoundError 가 나지 않게 한다 — 후보마다 직전 결과 제거(#25)
+                    # #audit16: result_path 는 검증된 role + _safe_unit_id(key) 로만 구성돼 항상
+                    # .orchestrator/results/ 안에 있다. 따라서 _under_results_dir 가드 없이 무조건
+                    # 직전 결과를 제거한다. (가드가 false 가 되면(results_dir 일시 부재 등) stale
+                    # 결과가 남아 이번 후보의 성공으로 오독될 수 있었다.) missing_ok 로 TOCTOU 흡수.
+                    try:
                         result_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
                     # 상세 로그: 보낸 프롬프트 (시스템 + 작업).
                     # #3: 전체 프롬프트 본문에는 spec excerpt·PM/PL directives 등 민감 내용이 들어가

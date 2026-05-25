@@ -19,6 +19,9 @@ from pathlib import Path
 # 절감 — _run_alive 가 매 refresh 마다 호출될 수 있다). {pid: (만료시각, 토큰)}
 _TOKEN_CACHE: dict[int, tuple[float, str]] = {}
 _TOKEN_TTL = 1.0  # 초
+# #audit16: 만료 항목만 청소하면 모든 항목이 fresh 일 때 캐시가 상한 없이 자랄 수 있다.
+# hard cap 을 두고, 만료 청소 후에도 초과하면 가장 오래된 항목부터 강제 evict 한다.
+_TOKEN_CACHE_MAX = 256
 # #H06: webui 는 ThreadingHTTPServer 라 여러 요청 스레드가 process_start_token 을 동시 호출한다.
 # lock 없이 dict 를 get/set/eviction 하면 eviction 의 items() 순회 중 다른 스레드 삽입으로
 # "RuntimeError: dictionary changed size during iteration" 가 날 수 있다. 캐시 접근을 lock 으로
@@ -69,10 +72,17 @@ def process_start_token(pid: int) -> str:
     token = _compute_start_token(pid)  # 느린 I/O 는 lock 밖에서 (스레드 직렬화 방지)
     with _TOKEN_LOCK:
         _TOKEN_CACHE[pid] = (now + _TOKEN_TTL, token)
-        # 캐시가 무한정 커지지 않게 만료된 항목을 가끔 청소한다(스냅샷 순회로 동시변경 방어).
-        if len(_TOKEN_CACHE) > 256:
+        # 캐시가 무한정 커지지 않게 관리한다(스냅샷 순회로 동시변경 방어).
+        if len(_TOKEN_CACHE) > _TOKEN_CACHE_MAX:
+            # 1) 만료된 항목 제거
             for k in [k for k, v in list(_TOKEN_CACHE.items()) if v[0] <= now]:
                 _TOKEN_CACHE.pop(k, None)
+            # 2) #audit16: 그래도 상한 초과면(모두 fresh) 가장 오래된(만료시각이 이른) 항목부터
+            #    강제 제거해 hard cap 을 보장한다(무한 성장 방지).
+            overflow = len(_TOKEN_CACHE) - _TOKEN_CACHE_MAX
+            if overflow > 0:
+                for k, _v in sorted(_TOKEN_CACHE.items(), key=lambda kv: kv[1][0])[:overflow]:
+                    _TOKEN_CACHE.pop(k, None)
     return token
 
 
@@ -99,7 +109,10 @@ def pid_is_ours(pid: int, stored_token: str | None) -> bool:
     """
     if not stored_token:
         return True
-    current = process_start_token(pid)
+    # #audit16: 검증(kill 결정에 영향)에는 TTL 캐시를 우회하고 토큰을 새로 계산한다. 캐시된
+    # 죽은 pid 의 옛 토큰을 1초 윈도 안에서 재사용하면, 재할당된 무관한 프로세스를 우리 run 으로
+    # 오인할 수 있다(엉뚱한 프로세스 kill). 캐시는 생존확인 같은 비-치명 경로에만 쓴다.
+    current = _compute_start_token(pid)
     if not current:
         return True
     return current == stored_token

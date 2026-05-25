@@ -539,8 +539,12 @@ class RunManager:
             #          원래 backends/옵션을 잃고 조용히 기본값으로 실행된다. 실패를 stderr 로
             #          알려(서버 로그에 남게) 운영자가 디스크/권한 문제를 인지하게 한다.
             try:
+                # #audit16: spec_text 는 이미 _spec.md 에 저장되므로 _run_opts.json 에 중복
+                # 저장하지 않는다(대형/민감 spec 이 디스크에 두 번 남지 않게). rerun 은 spec 을
+                # _spec.md 에서 읽으므로 영향 없음.
+                opts_to_save = {k: v for k, v in opts.items() if k != "spec_text"}
                 (project / "_run_opts.json").write_text(
-                    json.dumps(opts, ensure_ascii=False), encoding="utf-8"
+                    json.dumps(opts_to_save, ensure_ascii=False), encoding="utf-8"
                 )
             except Exception as e:
                 print(
@@ -692,10 +696,12 @@ class RunManager:
     def rerun(self, run_id: str) -> str:
         """저장된 spec + opts 로 새 run 을 시작."""
         project = self.project_dir(run_id)
-        spec_text = ""
         sp = project / "_spec.md"
-        if sp.exists():
-            spec_text = sp.read_text(encoding="utf-8")
+        # #audit16: 존재하지 않는 run 을 rerun 하면 빈 mock run 이 조용히 생성되던 문제.
+        # 실제 run 아티팩트(_spec.md)가 없으면 unknown run 으로 거부한다(빈 run 양산 방지).
+        if not project.is_dir() or not sp.is_file():
+            raise ValueError(f"unknown run: {run_id!r}")
+        spec_text = sp.read_text(encoding="utf-8", errors="replace")
         opts = {"mock": True}
         op = project / "_run_opts.json"
         if op.exists():
@@ -1267,7 +1273,21 @@ def _make_handler(manager: RunManager, token: str | None = None):
             ):
                 self._json({"error": "invalid model"}, 400)
                 return
-            run_id = manager.start(spec_text, data)
+            # #audit16: manager.start() 예외(동시 run 한도 초과·mkdir/write 실패 등)를 핸들러
+            # traceback/연결종료로 흘리지 않고 JSON 에러로 매핑한다.
+            try:
+                run_id = manager.start(spec_text, data)
+            except ValueError as e:
+                self._json({"error": str(e)}, 400)
+                return
+            except RuntimeError as e:
+                # 동시 run 한도 초과 등(우리 메시지, 비민감) → 사유를 노출
+                self._json({"error": str(e)}, 429)
+                return
+            except Exception:
+                # mkdir/write 등 내부 오류 → 경로 등 민감정보 노출 방지로 일반 메시지
+                self._json({"error": "run 시작 실패 (서버 내부 오류)"}, 500)
+                return
             self._json({"run_id": run_id})
 
     return Handler

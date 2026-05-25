@@ -213,6 +213,9 @@ class Scheduler:
 
             # Phase B/C — unit별 동시 개발 + 완료 시 테스트 트리거
             unit_list = self.board.units()
+            # #audit16: --max-units 로 의도적으로 건너뛴 unit 의 id 집합. 이들은 designed 로 남는데,
+            # 최종 still_incomplete 판정에서 제외해야 의도적 스킵이 run 을 failed 로 만들지 않는다.
+            skipped_unit_ids: set[str] = set()
             if self.cfg.max_units and self.cfg.max_units > 0:  # 음수면 슬라이싱 오작동 → 무시
                 skipped_units = unit_list[self.cfg.max_units :]
                 unit_list = unit_list[: self.cfg.max_units]
@@ -220,6 +223,7 @@ class Scheduler:
                     # --max-units 로 잘린 unit 들은 designed 로 남는다. 조용히 'ok' 로 끝나지
                     # 않도록 경고로 표면화 (의도적 스킵이므로 failed 로 만들지는 않는다).
                     skipped_ids = [u["id"] for u in skipped_units]
+                    skipped_unit_ids = {uid for uid in skipped_ids if uid}
                     await self.board.add_warning(
                         f"--max-units={self.cfg.max_units} 로 {len(skipped_ids)}개 unit 미처리"
                         f"(designed 유지): {skipped_ids}"
@@ -330,7 +334,13 @@ class Scheduler:
             # 하나라도 있으면 최종 phase 를 'failed' 로 둔다. (성공 런은 그대로 'done')
             terminal = set(TERMINAL_OK) | {FAILED, BLOCKED}
             still_broken = any(u.get("status") in (FAILED, BLOCKED) for u in self.board.units())
-            still_incomplete = any(u.get("status") not in terminal for u in self.board.units())
+            # #audit16: --max-units 로 의도적으로 건너뛴(designed 유지) unit 은 미완료로 치지 않는다
+            # (스킵은 실패가 아니며 위에서 이미 경고로 표면화됨). 그래야 부분 실행이 failed 로
+            # 오분류되지 않는다.
+            still_incomplete = any(
+                u.get("status") not in terminal and u.get("id") not in skipped_unit_ids
+                for u in self.board.units()
+            )
             if still_incomplete:
                 await self.board.add_warning("미완료 unit 이 남아 있어 run 을 failed 로 표시합니다")
             await self.board.set_phase("failed" if (still_broken or still_incomplete) else "done")
@@ -729,9 +739,18 @@ class Scheduler:
                 await self.board.set_status(uid, BLOCKED, f"rework aborted: deps broken {broken}")
                 await self.board.add_warning(f"{uid}: 재작업 직전 의존성 붕괴 → blocked: {broken}")
                 return None
-            # #H09: 고신뢰 외부/영구 장애가 반복되면(코드 수리 불가) external 로 분류·중단.
+            # #H09/#audit16: 고신뢰 외부/영구 장애가 반복되면(코드 수리 불가) external 로 분류·중단.
+            # test/qa 경로(#audit15)와 동일하게, escalation 시그니처(failure_kind/command 진동에
+            # 취약)와 분리된 별도 _external_repeat 카운터로 센다. 그래야 tool_missing 같은
+            # 외부장애가 매 시도 command 가 달라져도 카운트 리셋 없이 자동중단(>=2)이 발화한다.
             ext = self._external_blocker_reason([self._last_dev_failure.get(uid, {})])
-            if ext and self._dev_failure_repeat_count(uid) >= 2:
+            if ext:
+                ext_repeat = self._external_repeat.get(uid, 0) + 1
+                self._external_repeat[uid] = ext_repeat
+            else:
+                self._external_repeat.pop(uid, None)
+                ext_repeat = 0
+            if ext and ext_repeat >= 2:
                 self._clear_failure_state(uid)  # #RA5: terminal(BLOCKED) → 시그니처 정리
                 await self.board.set_status(uid, BLOCKED, f"external blocker: {ext}")
                 await self.board.add_warning(
