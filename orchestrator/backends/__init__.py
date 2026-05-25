@@ -10,9 +10,23 @@ from .codex_cli import CodexCLIBackend
 from .mock import MockBackend
 from .openai_agents import OpenAIAgentsBackend
 
-_REGISTRY: dict[str, Backend] = {
-    b.name: b
-    for b in [
+
+def _build_registry(backends: list[Backend]) -> dict[str, Backend]:
+    """이름 → 인스턴스 매핑을 만들되, b.name 중복을 조용히 덮어쓰지 않고 즉시 에러로 막는다.
+
+    #8(audit9): dict 컴프리헨션은 같은 b.name 을 가진 백엔드가 둘이면 뒤엣것이 앞엣것을
+    조용히 덮어써 한 백엔드가 사라진다. 등록 시점에 충돌을 감지해 ValueError 로 표면화한다.
+    """
+    registry: dict[str, Backend] = {}
+    for b in backends:
+        if b.name in registry:
+            raise ValueError(f"duplicate backend name in registry: {b.name!r}")
+        registry[b.name] = b
+    return registry
+
+
+_REGISTRY: dict[str, Backend] = _build_registry(
+    [
         MockBackend(),
         ClaudeSDKBackend(),
         ClaudeCLIBackend(),
@@ -20,7 +34,7 @@ _REGISTRY: dict[str, Backend] = {
         OpenAIAgentsBackend(),
         CodexCLIBackend(),
     ]
-}
+)
 
 
 # 공식 명칭 별칭 → 정식 이름 (둘 다 허용)
@@ -47,7 +61,13 @@ def resolve(name: str) -> str:
 def get_backend(name: str) -> Backend:
     canonical = resolve(name)
     if canonical not in _REGISTRY:
-        raise ValueError(f"unknown backend: {name} (valid: {', '.join(_REGISTRY)})")
+        # #8(audit9): 정식 이름뿐 아니라 허용되는 별칭(ALIASES)도 함께 안내해, 사용자가
+        # 'openai'/'claude-code' 같은 유효 별칭을 모른 채 헤매지 않게 한다.
+        valid_names = ", ".join(_REGISTRY)
+        valid_aliases = ", ".join(sorted(ALIASES))
+        raise ValueError(
+            f"unknown backend: {name} (valid: {valid_names}; aliases: {valid_aliases})"
+        )
     return _REGISTRY[canonical]
 
 

@@ -24,7 +24,37 @@ _GITIGNORE_SEED = ".orchestrator/\n__pycache__/\nnode_modules/\n.venv/\n*.db\n"
 _GEN_MARKER = "<!-- orchestrator-generated -->"
 
 
+# (#audit9-11) 루트 바로 아래의 시스템 디렉터리 블랙리스트(이름 단위). 절대경로가 정확히
+# <anchor>/<name> 형태(루트 한 단계 아래)일 때만 거부한다 → /etc/myproj 같은 하위는 정상 허용.
+# POSIX·Windows 모두 포함하는 합리적 교집합. ORCH_ALLOW_UNSAFE_PROJECT_DIR=1 로 우회 가능.
+_SYSTEM_DIR_NAMES = {
+    "etc",
+    "usr",
+    "bin",
+    "sbin",
+    "lib",
+    "lib64",
+    "var",
+    "opt",
+    "boot",
+    "dev",
+    "proc",
+    "sys",
+    "run",
+    "root",
+    "system",  # macOS /System
+    "library",  # macOS /Library
+    "windows",  # Windows C:\Windows
+    "program files",
+    "program files (x86)",
+    "programdata",
+}
+
+
 def _fmt_stack(stack: dict) -> str:
+    # (#audit9-13) stack 이 None/비-dict 여도 죽지 않게 방어.
+    if not isinstance(stack, dict):
+        return ""
     return ", ".join(f"{k}={v}" for k, v in stack.items())
 
 
@@ -34,7 +64,16 @@ def _render_template_once(template: str, values: dict[str, str]) -> str:
     def repl(match: re.Match[str]) -> str:
         return values.get(match.group(1), match.group(0))
 
-    return re.sub(r"\{\{([A-Z_]+)\}\}", repl, template)
+    rendered = re.sub(r"\{\{([A-Z_]+)\}\}", repl, template)
+    # (#audit9-14) 치환되지 않고 남은 {{...}} 토큰을 조용히 흘리지 않고 경고로 표면화한다.
+    # (대문자+언더스코어가 아닌 토큰이나 values 에 없는 키 등) 깨진 placeholder 를 알린다.
+    leftovers = sorted(set(re.findall(r"\{\{([^}]+)\}\}", rendered)))
+    if leftovers:
+        print(
+            "[scaffold] 미치환 템플릿 토큰이 남아 있습니다: "
+            + ", ".join("{{" + name + "}}" for name in leftovers)
+        )
+    return rendered
 
 
 def expose_team_agents(project_dir: Path) -> int:
@@ -50,7 +89,13 @@ def expose_team_agents(project_dir: Path) -> int:
     dest_dir.mkdir(parents=True, exist_ok=True)
     count = 0
     for md in sorted(AGENTS_DIR.glob("*.md")):
-        bundled = md.read_text(encoding="utf-8")
+        # (#audit9-15) 인코딩 처리를 다른 곳(errors="replace")과 일치시키고, 개별 파일이
+        # 읽히지 않으면 전체 스캐폴딩을 중단하지 않고 그 파일만 건너뛴다.
+        try:
+            bundled = md.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            print(f"[scaffold] 역할 정의 읽기 실패로 건너뜀: {md.name} ({exc})")
+            continue
         dest = dest_dir / md.name
         # 기존 파일은 건드리지 않음 (#12): 동일하면 재기록 불필요, 다르면 사용자 편집본 보존.
         # 없을 때만 새로 기록한다.
@@ -72,8 +117,13 @@ def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
     # 가리키면 기존 파일을 오염시킬 수 있으므로 거부한다. ~의 하위 디렉터리는 정상
     # 타깃이므로 허용한다(홈 자체만 거부). 의도적으로 위 경로에 스캐폴딩하려면 환경변수
     # ORCH_ALLOW_UNSAFE_PROJECT_DIR=1 로 우회할 수 있다.
+    # 심링크 해소 전의 절대경로도 따로 둔다(#audit9-11): macOS 에서 /etc → /private/etc 처럼
+    # resolve() 가 심링크를 따라가면 "루트 한 단계 아래" 패턴이 어긋나 시스템 디렉터리 탐지를
+    # 놓친다. abspath(=정규화하되 심링크 미해소)로 사용자가 *지정한* 경로 형태를 보존해 검사한다.
+    abs_unresolved = Path(os.path.abspath(Path(project_dir).expanduser()))
     project_dir = Path(project_dir).expanduser().resolve()
-    if os.environ.get("ORCH_ALLOW_UNSAFE_PROJECT_DIR") != "1":
+    allow_unsafe = os.environ.get("ORCH_ALLOW_UNSAFE_PROJECT_DIR") == "1"
+    if not allow_unsafe:
         unsafe = {
             Path(project_dir.anchor).resolve() if project_dir.anchor else None,
             Path.home().expanduser().resolve(),
@@ -86,8 +136,59 @@ def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
                 "프레임워크 저장소 루트에는 스캐폴딩하지 않습니다). "
                 "정말 의도했다면 ORCH_ALLOW_UNSAFE_PROJECT_DIR=1 을 설정하세요."
             )
+        # (#audit9-11) 루트 바로 아래의 시스템 디렉터리(/etc, /usr, /System, /Library, C:\Windows)
+        # 자체를 타깃으로 삼는 것도 거부한다. 정확히 <anchor>/<name>(루트 한 단계 아래)일 때만
+        # 막아 /etc/myproj 같은 하위 디렉터리는 정상 타깃으로 허용한다. 심링크 미해소 경로
+        # (abs_unresolved)로 검사해 macOS 의 /etc → /private/etc 재작성에도 안정적으로 잡는다.
+        for candidate in {abs_unresolved, project_dir}:
+            anchor = Path(candidate.anchor).resolve() if candidate.anchor else None
+            if (
+                anchor is not None
+                and candidate.parent == Path(candidate.anchor)
+                and candidate.name.lower() in _SYSTEM_DIR_NAMES
+            ):
+                raise ValueError(
+                    f"위험한 project_dir 거부: {candidate} (시스템 디렉터리에는 스캐폴딩하지 "
+                    "않습니다). 정말 의도했다면 ORCH_ALLOW_UNSAFE_PROJECT_DIR=1 을 설정하세요."
+                )
 
     project_dir.mkdir(parents=True, exist_ok=True)
+
+    # (#audit9-12) 심볼릭 링크를 통한 탈출 방어: 스캐폴드 쓰기는 .orchestrator/ 및 그 하위로
+    # 들어간다. 만약 project_dir/.orchestrator(또는 그 부모인 project_dir)가 project_dir 밖을
+    # 가리키는 기존 심볼릭 링크라면, mkdir/write_text 가 링크를 따라가 외부(예: /etc)에 쓰게 된다.
+    # 따라서 .orchestrator 와 project_dir 가 (a) 심링크가 아닌지, (b) 실경로가 여전히 project_dir
+    # 안에 있는지 확인하고, 어긋나면 거부한다. allow_unsafe 면 이 방어도 건너뛴다(명시적 우회).
+    if not allow_unsafe:
+        orch_path = project_dir / ".orchestrator"
+        for comp in (project_dir, orch_path):
+            try:
+                is_link = comp.is_symlink()
+            except OSError as e:
+                # #M12: is_symlink 자체가 실패하면(권한/경합) 심링크 여부를 확인할 수 없다.
+                # fail-closed: 안전을 보장할 수 없으므로 조용히 통과시키지 않고 거부한다.
+                raise ValueError(
+                    f"위험한 project_dir 거부: {comp} 의 심링크 여부를 확인할 수 없습니다 "
+                    f"({e}). 안전을 확인할 수 없어 거부합니다. "
+                    "정말 의도했다면 ORCH_ALLOW_UNSAFE_PROJECT_DIR=1 을 설정하세요."
+                ) from e
+            if is_link:
+                raise ValueError(
+                    f"위험한 project_dir 거부: {comp} 이(가) 심볼릭 링크입니다 "
+                    "(심링크를 통한 외부 쓰기 방지). "
+                    "정말 의도했다면 ORCH_ALLOW_UNSAFE_PROJECT_DIR=1 을 설정하세요."
+                )
+        # .orchestrator 가 이미 존재하면 실경로가 project_dir 밖으로 새지 않는지 한 번 더 확인.
+        if orch_path.exists():
+            resolved_orch = orch_path.resolve()
+            expected = project_dir / ".orchestrator"
+            inside = resolved_orch == expected or project_dir in resolved_orch.parents
+            if not inside:
+                raise ValueError(
+                    f"위험한 project_dir 거부: .orchestrator 실경로가 project_dir 밖을 "
+                    f"가리킵니다 ({resolved_orch}). "
+                    "정말 의도했다면 ORCH_ALLOW_UNSAFE_PROJECT_DIR=1 을 설정하세요."
+                )
 
     orch = project_dir / ".orchestrator"
     (orch / "results").mkdir(parents=True, exist_ok=True)
@@ -112,7 +213,8 @@ def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
                 base,
                 {
                     "STACK": stack_str,
-                    "SPEC_EXCERPT": spec_text[:1200],
+                    # (#audit9-13) spec_text 가 None 여도 죽지 않게 안전화.
+                    "SPEC_EXCERPT": (spec_text or "")[:1200],
                 },
             )
         )

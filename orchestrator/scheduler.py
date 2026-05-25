@@ -8,13 +8,14 @@ CI/CD → graceful shutdown.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import signal
 import sys
 import time
 
-from . import workspace
+from . import procutil, workspace
 from .board import (
     BLOCKED,
     DEV_DONE,
@@ -51,6 +52,30 @@ _TEST_REPAIR_WORDS = (
 )
 _MAX_REPAIR_CONTEXT_CHARS = 4000
 
+# #H09 external blocker classification — 코드 수리로 풀 수 없는 '고신뢰 영구 외부 장애'(Tier A)만
+# 분류한다. 오분류 시 사용자가 명시 제거한 '조기 포기'가 재발하므로 보수적으로 잡는다.
+# network/DNS/registry/403(Tier B)은 transient 가능성이 있어 external 로 단정하지 않는다(계속 수리).
+# (후속 합의 열린 항목: backend available()/failover 를 1차 신호로, Tier B 반복게이트 임계값 도입.)
+_EXTERNAL_TIER_A_KINDS = {
+    "auth_missing",
+    "tool_missing",
+    "permission_denied",
+    "sandbox_unavailable",
+}
+_EXTERNAL_TIER_A_PATTERNS = (
+    "missing api key",
+    "no api key",
+    "api key is not",
+    "api key not set",
+    "invalid api key",
+    "authentication failed",
+    "unauthorized",
+    "command not found",
+    "permission denied",
+    "read-only file system",
+    "operation not permitted",
+)
+
 
 def _exception_outcome(role: str, exc: Exception) -> dict:
     return {
@@ -72,6 +97,9 @@ class Scheduler:
         self._stop = asyncio.Event()
         self._dev_failure_signatures: dict[str, tuple[str, int]] = {}
         self._last_dev_failure: dict[str, dict] = {}
+        # #H04: QA/test 검증 실패의 진행(반복) 추적 — dev 실패와 대칭. dev 는 성공하나 QA 가 계속
+        # 실패하는 경우에도 '진전 없음'을 감지해 에스컬레이션·외부장애 분류를 적용한다.
+        self._verify_failure_signatures: dict[str, tuple[str, int]] = {}
         # test/qa 동시성 캡: dev 와 별개로 test-engineer+qa 호출을 묶는 세마포어.
         # dev 슬롯(sem)만 캡되어 있고 test/qa 는 unit 마다 자유 태스크로 떠서, unit 이 많으면
         # 동시 백엔드 세션이 폭증할 수 있었다(과금/리소스). concurrency 에서 크기를 끌어와
@@ -90,10 +118,12 @@ class Scheduler:
         await self.board.init(spec_text, DEFAULT_STACK)
         await self._checkpoint("orchestrator: scaffold project")
 
-        # 생존 확인용 PID 파일 (웹 서버 재시작에도 running 상태를 정확히 판단)
+        # 생존 확인용 PID 파일 (웹 서버 재시작에도 running 상태를 정확히 판단). pid 와 함께
+        # 시작시각 토큰을 둘째 줄에 기록해, pid 재사용 시 무관한 프로세스를 우리 run 으로 오인해
+        # stop 때 엉뚱한 프로세스에 시그널 보내는 것을 막는다(#M6). 토큰을 못 구하면 pid 한 줄만.
         pid_file = self.board.orch_dir / "run.pid"
         try:
-            pid_file.write_text(str(os.getpid()), encoding="utf-8")
+            pid_file.write_text(procutil.format_pidfile(os.getpid()), encoding="utf-8")
         except Exception:
             pass
         # 재실행(rerun)용 커맨드 저장 (웹/CLI/TUI 어디서 띄웠든 동일하게 재실행 가능)
@@ -208,6 +238,7 @@ class Scheduler:
                     return
                 if not await self._wait_for_deps(unit):
                     await self.board.set_status(uid, BLOCKED, "deps unmet or failed")
+                    await self.board.add_warning(f"{uid}: 의존성 미충족/실패로 blocked")
                     return
                 # dev 가 끝나면(dev_done) test/qa 는 별도 태스크로 즉시 실행하고,
                 # 개발 슬롯은 반납 → 개발은 곧바로 다음 unit 으로 진행한다.
@@ -432,7 +463,9 @@ class Scheduler:
             return [str(v) for v in value]
         return [str(value)]
 
-    def _with_repair_context(self, unit: dict, outcome: dict, source: str) -> dict:
+    def _with_repair_context(
+        self, unit: dict, outcome: dict, source: str, escalation: str | None = None
+    ) -> dict:
         notes = self._text_list(outcome.get("notes"))
         blockers = self._text_list(outcome.get("blockers"))
         fields = []
@@ -449,7 +482,12 @@ class Scheduler:
                 *(f"- {n}" for n in notes[:12]),
             ]
         ).strip()
-        repaired = dict(unit)
+        # 반복 실패 시 강화 지시를 본문 앞에 붙여 가장 먼저 읽히게 한다(#C1).
+        if escalation:
+            body = f"{escalation.strip()}\n\n{body}"
+        # #M2: dict(unit) 얕은 복사는 deps/roles/notes 등 list 필드를 원본과 공유해, runner/백엔드가
+        # repair_unit 을 변형하면 원본 unit 까지 오염됐다. deepcopy 로 완전히 분리한다.
+        repaired = copy.deepcopy(unit)
         repaired["repair_context"] = body[-_MAX_REPAIR_CONTEXT_CHARS:]
         return repaired
 
@@ -485,16 +523,7 @@ class Scheduler:
             ):
                 if key not in fields and o.get(key):
                     fields[key] = o[key]
-        signature = json.dumps(
-            {
-                "fields": fields,
-                "blockers": blockers[:8],
-                "notes": notes[:12],
-                "statuses": [str(o.get("status", "")) for o in failed],
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
+        signature = self._failure_signature(fields, failed)
         prev_sig, prev_count = self._dev_failure_signatures.get(uid, ("", 0))
         count = prev_count + 1 if prev_sig == signature else 1
         self._dev_failure_signatures[uid] = (signature, count)
@@ -508,10 +537,93 @@ class Scheduler:
             **fields,
         }
 
-    def _dev_failure_stalled(self, uid: str) -> bool:
-        if self.cfg.max_attempts != 0:
-            return False
-        return self._dev_failure_signatures.get(uid, ("", 0))[1] >= 3
+    @staticmethod
+    def _failure_signature(fields: dict, failed: list[dict]) -> str:
+        # #M01/#C1: '진전 없음(동일 실패 반복)' 판정 시그니처는 LLM 이 매번 바꾸는 자유 텍스트
+        # (repair_instruction·notes·blockers)와 변동성 큰 stderr_tail(타임스탬프·줄번호·임시경로)을
+        # 제외하고, 실제 장애를 식별하는 안정 필드(failure_kind·repair_owner·command)만 쓴다.
+        # 그래야 반복 카운트가 헛리셋되지 않아 에스컬레이션이 정상 발화한다.
+        stable = {k: fields[k] for k in ("failure_kind", "repair_owner", "command") if k in fields}
+        return json.dumps(
+            {"fields": stable, "statuses": [str(o.get("status", "")) for o in failed]},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    def _remember_verify_failure(self, uid: str, outcome: dict) -> int:
+        """QA/test 검증 실패의 진행 시그니처를 기록하고 반복 횟수를 반환한다(#H04).
+
+        dev 실패(_remember_dev_failure)와 대칭. dev 는 성공하나 QA 가 계속 실패하는 경우에도
+        '진전 없음'을 추적해 에스컬레이션·외부장애 분류에 쓴다.
+        """
+        fields = {
+            k: outcome[k] for k in ("failure_kind", "repair_owner", "command") if outcome.get(k)
+        }
+        signature = self._failure_signature(fields, [outcome])
+        prev_sig, prev_count = self._verify_failure_signatures.get(uid, ("", 0))
+        count = prev_count + 1 if prev_sig == signature else 1
+        self._verify_failure_signatures[uid] = (signature, count)
+        return count
+
+    def _dev_failure_repeat_count(self, uid: str) -> int:
+        """동일 dev 실패가 연속으로 몇 번 반복됐는지(진전 없음 횟수)."""
+        return self._dev_failure_signatures.get(uid, ("", 0))[1]
+
+    @staticmethod
+    def _escalation_text(count: int, label: str) -> str | None:
+        """동일 실패가 반복되면(진전 없음) 포기하지 않고 수리 전략을 점진적으로 강화한다(#C1/#H04).
+
+        제품 완주 모드(max_attempts=0)는 완료까지 무한히 수리하되, '같은 시도를 그대로 반복하는'
+        토큰 낭비를 막는다. 반복될수록 더 강한 지시를 주입해 매 시도가 실질적으로 달라지게 한다.
+        """
+        if count < 2:
+            return None
+        note = (
+            f"\n[수리 에스컬레이션] 동일한 {label} 실패가 {count}회 반복되었습니다. "
+            "표면적 수정이 듣지 않으니 '직전과 같은 시도를 반복하지 말고' 접근을 바꾸세요:\n"
+            "1) 에러/스택 트레이스를 처음부터 다시 읽고 근본 원인을 특정하세요.\n"
+            "2) 관련 모듈·인터페이스·계약·설정 파일을 전체적으로 다시 확인하세요.\n"
+            "3) 빌드/의존성/환경/버전 설정을 점검하세요.\n"
+            "4) 이전과 '다른' 구현 전략을 시도하세요."
+        )
+        if count >= 4:
+            note += (
+                "\n5) 현재 접근이 막혀 있습니다 — 가정을 의심하고, 필요하면 라이브러리·패턴·"
+                "구현 방식을 교체하거나 더 단순하고 견고한 대안 구현으로 전환하세요."
+            )
+        return note
+
+    def _escalation_note(self, uid: str) -> str | None:
+        """동일 dev 실패 반복 시 수리 전략 강화 노트(#C1)."""
+        return self._escalation_text(self._dev_failure_repeat_count(uid), "dev")
+
+    def _external_blocker_reason(self, outcomes: list[dict]) -> str | None:
+        """코드 수리로 풀 수 없는 고신뢰 외부/환경 장애(Tier A)면 사유 문자열, 아니면 None (#H09).
+
+        보수적으로 — auth/key·tool/backend 부재·권한 거부 같은 고신뢰 영구 신호만 본다. 구조화된
+        failure_kind 를 우선 보고, 보조로 제한된 텍스트 패턴을 본다. network/DNS/registry/403(Tier
+        B)은 transient 가능성이 있어 여기서 external 로 단정하지 않는다(계속 수리).
+        """
+        for o in outcomes:
+            if not isinstance(o, dict):
+                continue
+            kind = str(o.get("failure_kind") or "").strip().lower().replace("-", "_")
+            if kind in _EXTERNAL_TIER_A_KINDS:
+                return kind
+            text = " ".join(
+                str(x)
+                for x in [
+                    o.get("repair_instruction", ""),
+                    o.get("command", ""),
+                    o.get("stderr_tail", ""),
+                    *self._text_list(o.get("blockers")),
+                    *self._text_list(o.get("notes")),
+                ]
+            ).lower()
+            for pat in _EXTERNAL_TIER_A_PATTERNS:
+                if pat in text:
+                    return pat
+        return None
 
     def _attempt_label(self, attempt: int) -> str:
         if self.cfg.max_attempts == 0:
@@ -531,18 +643,135 @@ class Scheduler:
         return spent >= self.cfg.budget
 
     async def _repair_failed_dev(self, unit: dict, sem: asyncio.Semaphore, attempt: int) -> None:
+        """초기 dev 실패(pipeline 진입) 후 dev 재작업 루프 → 성공 시 검증(_test_unit).
+
+        재귀 없이 _dev_repair_loop(while)로 dev 재작업을 반복하고, 성공한 repair_unit 으로 검증한다.
+        """
         uid = unit["id"]
         if self._budget_exhausted():
             await self.board.set_status(uid, BLOCKED, "repair stopped: budget exhausted")
             await self.board.add_warning(f"{uid}: 예산 소진으로 자동 수리 중단")
             return
         outcome = self._last_dev_failure.get(
-            uid,
-            {"_ok": False, "status": "failed", "blockers": ["dev failed"], "notes": []},
+            uid, {"_ok": False, "status": "failed", "blockers": ["dev failed"], "notes": []}
         )
-        repair_unit = self._with_repair_context(unit, outcome, "dev")
-        next_attempt = attempt + 1
+        repair_unit = self._with_repair_context(
+            unit, outcome, "dev", escalation=self._escalation_note(uid)
+        )
+        developed = await self._dev_repair_loop(unit, sem, attempt + 1, repair_unit)
+        if developed is not None:
+            await self._test_unit(developed, sem, attempt + 1)
+
+    async def _dev_repair_loop(
+        self, unit: dict, sem: asyncio.Semaphore, next_attempt: int, repair_unit: dict
+    ) -> dict | None:
+        """dev 재작업을 while 로 반복한다(#H03: 재귀 제거).
+
+        dev 성공 시 그 repair_unit 을 반환(호출자가 _test_unit 으로 재검증). 종료 조건(예산 소진·
+        deps 붕괴·고신뢰 외부 장애·stop·유한 attempts 소진) 시 terminal 상태를 세팅하고 None.
+        동일 dev 실패 반복 시 포기 대신 에스컬레이션(#C1); 고신뢰 외부 장애 반복은 분류·중단(#H09).
+        """
+        uid = unit["id"]
         while self._can_repair(next_attempt - 1) and not self._stop.is_set():
+            if self._budget_exhausted():
+                await self.board.set_status(uid, BLOCKED, "repair stopped: budget exhausted")
+                await self.board.add_warning(f"{uid}: 예산 소진으로 자동 수리 중단")
+                return None
+            broken = self._broken_deps(unit)
+            if broken:
+                await self.board.set_status(uid, BLOCKED, f"rework aborted: deps broken {broken}")
+                await self.board.add_warning(f"{uid}: 재작업 직전 의존성 붕괴 → blocked: {broken}")
+                return None
+            # #H09: 고신뢰 외부/영구 장애가 반복되면(코드 수리 불가) external 로 분류·중단.
+            ext = self._external_blocker_reason([self._last_dev_failure.get(uid, {})])
+            if ext and self._dev_failure_repeat_count(uid) >= 2:
+                await self.board.set_status(uid, BLOCKED, f"external blocker: {ext}")
+                await self.board.add_warning(
+                    f"{uid}: 외부/환경 장애로 자동 수리 중단 (external: {ext})"
+                )
+                return None
+            await self.board.log_event(uid, f"dev 재작업 → attempt {next_attempt}")
+            if await self._develop_unit(repair_unit, sem, next_attempt):
+                return repair_unit
+            escalation = self._escalation_note(uid)
+            if escalation:
+                await self.board.log_event(
+                    uid,
+                    f"동일 dev 실패 {self._dev_failure_repeat_count(uid)}회 반복 → "
+                    "수리 전략 에스컬레이션 후 계속",
+                )
+            outcome = self._last_dev_failure.get(
+                uid, {"_ok": False, "status": "failed", "blockers": ["dev failed"], "notes": []}
+            )
+            repair_unit = self._with_repair_context(unit, outcome, "dev", escalation=escalation)
+            next_attempt += 1
+        await self.board.set_status(uid, FAILED, "dev repair failed after retries")
+        return None
+
+    async def _test_unit(self, unit: dict, sem: asyncio.Semaphore, attempt: int) -> None:
+        """dev 완료 후 test-engineer → qa 검증. 실패 시 재작업→재검증을 단일 while 루프로 반복한다.
+
+        #H03: 예전엔 _test_unit↔_rework_after_verification_failure↔_qa_after_test_repair 가 상호
+        재귀라, dev 는 성공하나 QA 가 계속 실패하면 max_attempts=0 에서 스택이 무한히 깊어져
+        RecursionError 로 죽었다. 이를 평탄화한다(스택 증가 없음).
+        #H04: QA/test 반복 실패에도 진행 시그니처·에스컬레이션을 적용(동일 시도 반복 낭비 방지).
+        #H09: 고신뢰 외부/영구 장애 반복은 분류·중단.
+        제품 완주 모드(max_attempts=0)는 통과/예산/deps/stop/외부장애 전까지 계속한다.
+
+        test/qa 호출은 _test_sem 으로 캡한다(dev 슬롯과 별개). dev 재작업은 반드시 _test_sem 블록
+        밖에서 수행해 두 세마포어를 중첩 점유하지 않는다.
+        """
+        uid = unit["id"]
+        target = unit  # 검증 대상 (실패 시 repair_context 가 붙은 unit 으로 갱신)
+        skip_te_once = False  # test/config 재작업 직후엔 te 를 생략하고 바로 qa
+        while True:
+            if self._stop.is_set():  # #H5: stop 중 새 test/qa 세션 시작 금지
+                await self.board.log_event(uid, "stop requested → skip test/qa")
+                return
+            await self.board.set_status(uid, TESTING)
+            outcome: dict | None = None
+            source = ""
+            test_paths: list[str] = []
+            async with self._test_sem:
+                if not skip_te_once:
+                    te = await self.runner.run_role("test-engineer", target)
+                    test_paths = list(te.get("artifacts", []))
+                    await self.board.add_artifacts(uid, test_paths)
+                    # #18: test-engineer 실패 시 qa 비용을 쓰지 않는다. #H3: _ok 기본 False.
+                    if not (te.get("_ok", False) and te.get("status") != "failed"):
+                        await self.board.log_event(uid, "test-engineer 실패 → qa 건너뜀(비용 절감)")
+                        await self.board.set_test_status(uid, "fail")
+                        outcome, source = te, "test-engineer"
+                skip_te_once = False
+                if outcome is None:
+                    qa = await self.runner.run_role("qa", target)
+                    qa_paths = list(qa.get("artifacts", []))
+                    await self.board.add_artifacts(uid, qa_paths)
+                    passed = qa.get("_ok", False) and qa.get("status") != "failed"  # #H3
+                    await self.board.set_test_status(uid, "pass" if passed else "fail")
+                    if passed:
+                        await self.board.set_status(uid, DONE)
+                        await self._checkpoint(
+                            f"orchestrator: {uid} verified", [*test_paths, *qa_paths]
+                        )
+                        return
+                    outcome, source = qa, "qa"
+            # ---- 검증 실패 (_test_sem 해제됨) ----
+            if not self._can_repair(attempt):
+                await self.board.set_status(uid, FAILED, f"{source} failed after retries")
+                return
+            count = self._remember_verify_failure(uid, outcome)  # #H04 진행 추적
+            # #H09: 고신뢰 외부/영구 장애가 반복되면 분류·중단.
+            ext = self._external_blocker_reason([outcome])
+            if ext and count >= 2:
+                await self.board.set_status(uid, BLOCKED, f"external blocker: {ext}")
+                await self.board.add_warning(
+                    f"{uid}: 외부/환경 장애로 자동 수리 중단 (external: {ext})"
+                )
+                return
+            if self._stop.is_set():  # #H5
+                await self.board.log_event(uid, "stop requested → skip rework")
+                return
             if self._budget_exhausted():
                 await self.board.set_status(uid, BLOCKED, "repair stopped: budget exhausted")
                 await self.board.add_warning(f"{uid}: 예산 소진으로 자동 수리 중단")
@@ -552,173 +781,41 @@ class Scheduler:
                 await self.board.set_status(uid, BLOCKED, f"rework aborted: deps broken {broken}")
                 await self.board.add_warning(f"{uid}: 재작업 직전 의존성 붕괴 → blocked: {broken}")
                 return
-            await self.board.log_event(uid, f"initial dev failed → repair attempt {next_attempt}")
-            if await self._develop_unit(repair_unit, sem, next_attempt):
-                await self._test_unit(repair_unit, sem, next_attempt)
-                return
-            if self._dev_failure_stalled(uid):
-                await self.board.set_status(
-                    uid, BLOCKED, "repair stopped: repeated identical dev failure"
+            # ---- 재작업 (sem 밖) ----
+            attempt += 1
+            escalation = self._escalation_text(count, "검증(QA/test)")  # #H04
+            target = self._with_repair_context(unit, outcome, source, escalation=escalation)
+            if escalation:
+                await self.board.log_event(
+                    uid, f"동일 검증 실패 {count}회 반복 → 에스컬레이션 후 계속"
                 )
-                await self.board.add_warning(
-                    f"{uid}: 동일 dev 실패가 반복되어 외부/환경 장애로 간주하고 자동 수리 중단"
-                )
-                return
-            repair_unit = self._with_repair_context(
-                unit, self._last_dev_failure.get(uid, outcome), "dev"
-            )
-            next_attempt += 1
-        await self.board.set_status(uid, FAILED, "dev failed after retries")
-
-    async def _qa_after_test_repair(
-        self, unit: dict, sem: asyncio.Semaphore, attempt: int, test_paths: list[str]
-    ) -> None:
-        uid = unit["id"]
-        async with self._test_sem:
-            qa = await self.runner.run_role("qa", unit)
-            qa_paths = list(qa.get("artifacts", []))
-            await self.board.add_artifacts(uid, qa_paths)
-            passed = qa.get("_ok", True) and qa.get("status") != "failed"
-            await self.board.set_test_status(uid, "pass" if passed else "fail")
-            if passed:
-                await self.board.set_status(uid, DONE)
-                await self._checkpoint(f"orchestrator: {uid} verified", [*test_paths, *qa_paths])
-                return
-            if not self._can_repair(attempt):
-                await self.board.set_status(uid, FAILED, "QA failed after retries")
-                return
-            repair_unit = self._with_repair_context(unit, qa, "qa")
-            test_repair_first = self._needs_test_repair(qa)
-        await self._rework_after_verification_failure(
-            unit, sem, attempt, repair_unit, test_repair_first
-        )
-
-    async def _test_unit(self, unit: dict, sem: asyncio.Semaphore, attempt: int) -> None:
-        """unit 개발 완료 직후 test-engineer → qa 를 실행 (개발 슬롯 비점유).
-
-        QA 실패 시 개발 슬롯을 다시 잡아 재작업 후 재검증한다. max_attempts=0(기본)은
-        제품 완주 모드라 예산/stop/외부 장애 전까지 계속 수리한다.
-
-        test/qa 백엔드 호출은 _test_sem 으로 동시성을 캡한다(dev 슬롯과 별개). rework 는
-        _develop_unit 가 dev 슬롯(sem)을 다시 잡으므로, 데드락을 피하려고 _test_sem 을 먼저
-        풀고 나서(아래 'with' 블록 밖에서) rework 를 수행한다(두 세마포어를 중첩 점유하지 않음).
-        """
-        uid = unit["id"]
-        await self.board.set_status(uid, TESTING)
-
-        # ---- test/qa 본작업: _test_sem 으로 동시성 캡 (이 블록 안에서만 점유) ----
-        rework = False  # 블록 밖에서 재작업할지 여부 ('fail + 시도 남음')
-        repair_unit = unit
-        test_repair_first = False
-        async with self._test_sem:
-            te = await self.runner.run_role("test-engineer", unit)
-            test_paths = list(te.get("artifacts", []))
-            await self.board.add_artifacts(uid, test_paths)
-
-            # #18: test-engineer(테스트 작성)가 실패하면 그 산출물 위에서 qa 비용을 쓰지 않는다.
-            #      미통과로 표시하고, 시도가 남았으면 dev 부터 재작업해 '고쳐서' 다시 검증한다
-            #      (단순 중단이 아니라 rework 경로 — "실패 → 버그픽스 → 재검증").
-            te_ok = te.get("_ok", True) and te.get("status") != "failed"
-            if not te_ok:
-                await self.board.log_event(uid, "test-engineer 실패 → qa 건너뜀(비용 절감)")
-                await self.board.set_test_status(uid, "fail")
-                if self._can_repair(attempt):
-                    rework = True
-                    repair_unit = self._with_repair_context(unit, te, "test-engineer")
-                    test_repair_first = True
-                else:
-                    await self.board.set_status(uid, FAILED, "test-engineer failed after retries")
-                    return
-            else:
-                qa = await self.runner.run_role("qa", unit)
-                qa_paths = list(qa.get("artifacts", []))
-                await self.board.add_artifacts(uid, qa_paths)
-                # test-engineer 가 성공한 경우에만 qa 를 돌렸으므로, 통과 판정은 qa 결과만 본다.
-                passed = qa.get("_ok", True) and qa.get("status") != "failed"
-                await self.board.set_test_status(uid, "pass" if passed else "fail")
-                if passed:
-                    await self.board.set_status(uid, DONE)
-                    await self._checkpoint(
-                        f"orchestrator: {uid} verified", [*test_paths, *qa_paths]
-                    )
-                    return
-                if self._can_repair(attempt):
-                    rework = True
-                    repair_unit = self._with_repair_context(unit, qa, "qa")
-                    test_repair_first = self._needs_test_repair(qa)
-                else:
-                    await self.board.set_status(uid, FAILED, "QA failed after retries")
-                    return
-
-        if not rework:
-            return
-        await self._rework_after_verification_failure(
-            unit, sem, attempt, repair_unit, test_repair_first
-        )
-
-    async def _rework_after_verification_failure(
-        self,
-        unit: dict,
-        sem: asyncio.Semaphore,
-        attempt: int,
-        repair_unit: dict,
-        test_repair_first: bool,
-    ) -> None:
-        """test/qa 실패 뒤 수리 루프. _test_sem 밖에서 호출해 dev 슬롯과 중첩 점유하지 않는다."""
-        uid = unit["id"]
-        if self._budget_exhausted():
-            await self.board.set_status(uid, BLOCKED, "repair stopped: budget exhausted")
-            await self.board.add_warning(f"{uid}: 예산 소진으로 자동 수리 중단")
-            return
-        # 재작업 전 의존성 재검증: 검증/대기 동안 dep 이 FAILED/BLOCKED 로 무너졌다면
-        # 망가진 베이스 위에서 다시 개발하지 않는다. 이 unit 을 BLOCKED 로 두고 중단한다.
-        broken = self._broken_deps(unit)
-        if broken:
+            test_repair_first = self._needs_test_repair(outcome)
             await self.board.log_event(
-                uid, f"rework 중단: 의존성이 failed/blocked 로 무너짐 → blocked: {broken}"
+                uid,
+                f"재검증 실패 → {'test/config' if test_repair_first else 'dev'} 재작업 "
+                f"(attempt {attempt})",
             )
-            await self.board.set_status(uid, BLOCKED, f"rework aborted: deps broken {broken}")
-            await self.board.add_warning(f"{uid}: 재작업 직전 의존성 붕괴 → blocked: {broken}")
-            return
-        await self.board.log_event(
-            uid,
-            f"재검증 통과 → {'test/config' if test_repair_first else 'dev'} 재작업 "
-            f"(attempt {attempt + 1})",
-        )
-        if test_repair_first:
-            await self.board.set_status(
-                uid, TESTING, f"test/config repair attempt {self._attempt_label(attempt + 1)}"
-            )
-            te = await self.runner.run_role("test-engineer", repair_unit)
-            test_paths = list(te.get("artifacts", []))
-            await self.board.add_artifacts(uid, test_paths)
-            if te.get("_ok", True) and te.get("status") != "failed":
-                await self._qa_after_test_repair(repair_unit, sem, attempt + 1, test_paths)
-                return
-            await self.board.log_event(uid, "test/config repair failed → dev 재작업 fallback")
-        if await self._develop_unit(repair_unit, sem, attempt + 1):
-            await self._test_unit(repair_unit, sem, attempt + 1)
-            return
-        next_attempt = attempt + 2
-        while self._can_repair(next_attempt - 1) and not self._stop.is_set():
-            if self._budget_exhausted():
-                await self.board.set_status(uid, BLOCKED, "repair stopped: budget exhausted")
-                await self.board.add_warning(f"{uid}: 예산 소진으로 자동 수리 중단")
-                return
-            await self.board.log_event(uid, f"dev repair failed → retrying attempt {next_attempt}")
-            if await self._develop_unit(repair_unit, sem, next_attempt):
-                await self._test_unit(repair_unit, sem, next_attempt)
-                return
-            if self._dev_failure_stalled(uid):
+            if test_repair_first:
                 await self.board.set_status(
-                    uid, BLOCKED, "repair stopped: repeated identical dev failure"
+                    uid, TESTING, f"test/config repair attempt {self._attempt_label(attempt)}"
                 )
-                await self.board.add_warning(
-                    f"{uid}: 동일 dev 실패가 반복되어 외부/환경 장애로 간주하고 자동 수리 중단"
-                )
-                return
-            next_attempt += 1
-        await self.board.set_status(uid, FAILED, "rework dev failed")
+                te = await self.runner.run_role("test-engineer", target)
+                await self.board.add_artifacts(uid, list(te.get("artifacts", [])))
+                if te.get("_ok", False) and te.get("status") != "failed":
+                    skip_te_once = True  # 다음 루프: te 생략하고 바로 qa
+                    continue
+                await self.board.log_event(uid, "test/config repair failed → dev 재작업 fallback")
+            # dev 재작업: 먼저 QA 컨텍스트(target)로 1회, 실패하면 dev 재작업 루프(dev 컨텍스트).
+            if await self._develop_unit(target, sem, attempt):
+                continue  # 재검증
+            dev_outcome = self._last_dev_failure.get(uid, outcome)
+            dev_repair_unit = self._with_repair_context(
+                unit, dev_outcome, "dev", escalation=self._escalation_note(uid)
+            )
+            developed = await self._dev_repair_loop(unit, sem, attempt + 1, dev_repair_unit)
+            if developed is None:
+                return  # terminal 상태 세팅됨
+            target = developed  # 재검증 (continue)
 
     async def _wait_for_deps(self, unit: dict, timeout: float | None = None) -> bool:
         """deps 가 모두 완료되면 True. 실패/blocked dep 이 있으면 즉시 False(패스트페일).
@@ -755,6 +852,9 @@ class Scheduler:
         idle = 0.0
         last_check = time.monotonic()
         while True:
+            if self._stop.is_set():  # #M02: graceful shutdown 중엔 dep 대기를 즉시 중단(응답성).
+                await self.board.log_event(uid, "stop requested → dep wait aborted")
+                return False
             units = {u["id"]: u for u in self.board.units()}
             pending = [d for d in deps if d in units]  # 미지 dep 은 스킵
             if any(units.get(d, {}).get("status") in (FAILED, BLOCKED) for d in pending):

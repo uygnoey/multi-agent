@@ -9,12 +9,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import re
 
 from .agents import load_agent
 from .backends import get_backend
 from .backends.base import RoleRequest, RoleResult
-from .board import Board
+from .board import Board, _safe_unit_id
 from .config import (
     DELEGATES,
     DELEGATION_CAPABLE,
@@ -130,7 +131,9 @@ class Runner:
             result_rel=result_rel,
             spec_text=self.board.spec_text,
             timeout=self.cfg.session_timeout,
-            live_log_path=self.board.agents_dir / f"{role}.log",
+            # #L10: board._log_path(role) 를 써서 라이브 스트림 경로와 보드의 agent-log
+            # 경로가 항상 일치하게 한다(raw role 직접 조합은 _safe_unit_id 살균과 어긋남).
+            live_log_path=self.board._log_path(role),
             delegate=delegate,
             full_access=self.cfg.full_access,
             teammates=teammates,
@@ -143,7 +146,13 @@ class Runner:
         try:
             spec = ROLES[role]
             agent = load_agent(role)
-            key = str(unit.get("id", "unknown")) if isinstance(unit, dict) else "global"
+            # #9: raw unit id 를 result 파일 경로에 그대로 끼우면 '/'·'..' 등이 결과 파일을
+            # results 디렉터리 밖으로 빼낼 수 있다. 보드와 동일한 _safe_unit_id 로 방어적으로
+            # 살균(경로 구분자/특수문자 → '-')한다. 살균 후 빈 값이면 "unknown" 으로 폴백.
+            if isinstance(unit, dict):
+                key = _safe_unit_id(unit.get("id", "unknown")) or "unknown"
+            else:
+                key = "global"
             result_rel = f".orchestrator/results/{role}__{key}.json"
             result_path = self.board.project_dir / result_rel
 
@@ -234,7 +243,9 @@ class Runner:
                         activity="▶ " + (f"unit={key} " if unit else "") + f"[{name}]{team}{fo}",
                     )
                     if result_path.exists() and _under_results_dir(result_path, self.board):
-                        result_path.unlink()  # 후보마다 직전 결과 제거 → 신선도 보장 (#25)
+                        # missing_ok: .exists() 와 unlink 사이의 TOCTOU(다른 곳에서 먼저 삭제)
+                        # 로 FileNotFoundError 가 나지 않게 한다 — 후보마다 직전 결과 제거(#25)
+                        result_path.unlink(missing_ok=True)
 
                     # 상세 로그: 보낸 프롬프트 (시스템 + 작업).
                     # #3: 전체 프롬프트 본문에는 spec excerpt·PM/PL directives 등 민감 내용이 들어가
@@ -307,24 +318,34 @@ class Runner:
         result_required = spec.phase != PHASE_SUPERVISOR
         # 페이즈/역할을 넘겨 _ok 판정을 페이즈별 계약에 맞춘다 (#97).
         outcome = self._read_result(result_path, res, result_required, phase=spec.phase, role=role)
-        cost = f" ${role_cost:.4f}" if role_cost else ""
-        await self.board.log_event(
-            role,
-            f"done [{chosen}] ok={res.ok}{cost}" + ("" if res.ok else f" err={res.error}"),
-        )
-        summary = (outcome.get("status") or "?") + (
-            f" · {len(outcome.get('artifacts', []))} files" if outcome.get("artifacts") else ""
-        )
-        await self.board.agent_update(
-            role,
-            status="idle",
-            backend=chosen,
-            model=res.model or self.cfg.model_for(chosen),
-            message=res.final_message or (res.error or ""),
-            activity=f"✓ done [{chosen}]{cost} → {summary}"
-            if res.ok
-            else f"✗ failed [{chosen}]{cost}: {res.error}",
-        )
+        # #10: done 스테이지(로그/agent_update)는 후보 try/except 밖이라, 여기서 예외가 나면
+        # 바깥 run_role 의 setup-실패 처리로 빠져 '성공한 역할'이 'failed' 로 오보된다. 이미 결과는
+        # outcome 으로 확정됐으므로, 부수적 로깅/상태 갱신 실패는 흡수하고 outcome 을 보존한다.
+        try:
+            cost = f" ${role_cost:.4f}" if role_cost else ""
+            await self.board.log_event(
+                role,
+                f"done [{chosen}] ok={res.ok}{cost}" + ("" if res.ok else f" err={res.error}"),
+            )
+            summary = (outcome.get("status") or "?") + (
+                f" · {len(outcome.get('artifacts', []))} files" if outcome.get("artifacts") else ""
+            )
+            await self.board.agent_update(
+                role,
+                status="idle",
+                backend=chosen,
+                model=res.model or self.cfg.model_for(chosen),
+                message=res.final_message or (res.error or ""),
+                activity=f"✓ done [{chosen}]{cost} → {summary}"
+                if res.ok
+                else f"✗ failed [{chosen}]{cost}: {res.error}",
+            )
+        except Exception as e:
+            # 성공한 백엔드 결과를 setup 실패로 오보하지 않도록 오류만 best-effort 로 남기고 흡수.
+            try:
+                await self.board.log_event(role, f"done-stage logging error [{chosen}]: {e}")
+            except Exception:
+                pass
         return outcome
 
     async def _run_with_retries(self, backend, req, role, key):
@@ -352,7 +373,11 @@ class Runner:
                 return res
             last = res
             if i < attempts - 1:
-                delay = min(self.cfg.retry_backoff * (2**i), 60.0)
+                # #11: 지수 백오프에 지터를 더한다(0.5~1.0배). 레이트리밋 백엔드에 여러 역할이
+                # 동시에 재시도하며 동시 폭주(thundering herd)하는 것을 방지한다. 캡(60s)을 먼저
+                # 적용한 뒤 지터를 곱해 항상 캡 이하가 되게 한다.
+                base = min(self.cfg.retry_backoff * (2**i), 60.0)
+                delay = base * (0.5 + random.random() / 2)
                 await self.board.log_event(
                     role, f"retry {i + 1}/{attempts - 1} after err: {res.error} (in {delay:.0f}s)"
                 )
@@ -410,7 +435,8 @@ class Runner:
                         "units": [],
                         "_ok": False,
                     }
-                data = json.loads(raw.decode("utf-8"))
+                # utf-8-sig: 선행 UTF-8 BOM 이 있어도 유효 JSON 으로 디코드(BOM 거부 방지)
+                data = json.loads(raw.decode("utf-8-sig"))
                 return _coerce_result(data, res, phase=phase, role=role)
             except Exception:
                 # 결과파일이 있는데 깨졌으면 계약 위반 → 성공으로 오탐하지 않는다
@@ -427,7 +453,8 @@ class Runner:
             return {
                 "status": "failed",
                 "artifacts": [],
-                "notes": [res.final_message[:300]] if res.final_message else [],
+                # #12: final_message 가 str 이 아닐 수도 있으니 방어적으로 str() 후 슬라이스
+                "notes": [str(res.final_message)[:300]] if res.final_message else [],
                 "blockers": ["no result file written (contract violation)"],
                 "units": [],
                 "_ok": False,
@@ -436,7 +463,8 @@ class Runner:
         return {
             "status": "done" if res.ok else "failed",
             "artifacts": [],
-            "notes": [res.final_message[:300]] if res.final_message else [],
+            # #12: final_message 가 str 이 아닐 수도 있으니 방어적으로 str() 후 슬라이스
+            "notes": [str(res.final_message)[:300]] if res.final_message else [],
             "blockers": [] if res.ok else [res.error or "unknown error"],
             "units": [],
             "_ok": res.ok,

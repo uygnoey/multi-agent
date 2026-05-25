@@ -308,7 +308,30 @@ class CodexCLIBackend(Backend):
                 return RoleResult(ok=False, error=str(e))
 
             if timed_out:
-                return RoleResult(ok=False, error=f"codex timed out after {req.timeout}s")
+                # #5(audit9): 타임아웃이어도 그때까지 스트리밍된 stdout 에 turn.completed usage 가
+                # 남아있을 수 있다. 부분 usage 라도 best-effort 로 계산해 사용량/비용이 통째로
+                # 0 으로 떨어지지 않게 한다(드롭 대신 부분 회계). 파싱이 비면 None 으로 남는다.
+                partial = _usage_from_jsonl(out)
+                model = req.model or _codex_default_model()
+                p_tokens = _visible_tokens(partial)
+                p_cost = (
+                    codex_cost(
+                        model,
+                        partial.get("input_tokens", 0),
+                        partial.get("cached_input_tokens", 0),
+                        partial.get("output_tokens", 0),
+                    )
+                    if partial
+                    else None
+                )
+                return RoleResult(
+                    ok=False,
+                    error=f"codex timed out after {req.timeout}s",
+                    model=model,
+                    tokens=p_tokens,
+                    cost_usd=p_cost,
+                    cost_estimated=p_cost is not None,
+                )
             if rc != 0:
                 # #6(#43): sandbox/login/runtime 진단의 '끝부분'(마지막 에러 컨텍스트)이 살아남도록
                 # 예전의 head 절단(err[:4000])이 아니라 tail(마지막 4000자, err[-4000:])을 보존한다.

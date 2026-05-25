@@ -105,13 +105,15 @@ def test_dashboard_units_uses_array_guard():
     assert "(b.units||[]).forEach" not in html
 
 
-def test_runconfig_malformed_max_units_limits_to_one(tmp_path):
+def test_runconfig_malformed_max_units_means_unlimited(tmp_path):
+    # (#audit9-2) malformed max_units 는 0/음수와 동일하게 None(무제한)으로 정규화한다.
+    # 예전엔 malformed→1(=1개 제한) 인데 명시적 0→None(무제한)이라 정반대 의미였다(드리프트).
     cfg = RunConfig(
         spec_path=Path("s.md"),
         project_dir=tmp_path / "p",
         max_units="not-an-int",  # type: ignore[arg-type]
     )
-    assert cfg.max_units == 1
+    assert cfg.max_units is None
 
 
 def test_bounded_buffer_caps_single_huge_chunk():

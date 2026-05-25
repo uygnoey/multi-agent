@@ -7,6 +7,8 @@ This text is injected into every role call, so keep it concise and in English.
 
 from __future__ import annotations
 
+from .config import normalize_completion_level
+
 _ROLE_INSTRUCTION = {
     "architecture-engineer": (
         "Read the spec and design the system. Write architecture, API contract, and data-model "
@@ -71,11 +73,8 @@ def compose_prompt(
         "Follow the shared protocol, coding conventions, and tech stack in this directory's "
         "CLAUDE.md / AGENTS.md."
     )
-    level = str(completion_level or "mvp").strip().lower().replace("_", "-")
-    if level in ("prod", "production-ready"):
-        level = "production"
-    if level not in ("mvp", "production"):
-        level = "mvp"
+    # (#audit9-10) 완료 수준 정규화는 config.normalize_completion_level 단일 소스를 재사용한다.
+    level = normalize_completion_level(completion_level)
     if level == "production":
         parts.append(
             "## Completion target\n"
@@ -94,17 +93,14 @@ def compose_prompt(
     if directives.strip():
         parts.append("## PM/PL directives (latest)\n" + directives.strip()[-2000:])
 
-    if unit:
-        uid = unit.get("id", "?") if isinstance(unit, dict) else "?"
-        title = (
-            _clip(unit.get("title", ""), _MAX_UNIT_TITLE_CHARS) if isinstance(unit, dict) else ""
-        )
-        description = (
-            _clip(unit.get("description", ""), _MAX_UNIT_DESCRIPTION_CHARS)
-            if isinstance(unit, dict)
-            else ""
-        )
-        deps = _clip(unit.get("deps", []), _MAX_UNIT_DEPS_CHARS) if isinstance(unit, dict) else "[]"
+    # (#audit9-9) dict 인 unit 만 "Target work unit" 으로 처리한다. 예전엔 `if unit:` 가
+    # truthy non-dict(list/str)도 받아들여 uid="?"/title="" 같은 빈 블록을 내보냈다.
+    # dict 가 아니면 unit 이 없는 것으로 보고 "entire spec" 경로로 떨어진다.
+    if unit and isinstance(unit, dict):
+        uid = unit.get("id", "?")
+        title = _clip(unit.get("title", ""), _MAX_UNIT_TITLE_CHARS)
+        description = _clip(unit.get("description", ""), _MAX_UNIT_DESCRIPTION_CHARS)
+        deps = _clip(unit.get("deps", []), _MAX_UNIT_DEPS_CHARS)
         parts.append(
             "## Target work unit\n"
             f"- id: {uid}\n"

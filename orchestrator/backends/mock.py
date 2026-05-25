@@ -27,6 +27,19 @@ def _ident(raw: str, *, prefix: str = "u") -> str:
     return s
 
 
+def _safe_id_text(raw: str) -> str:
+    """#12(audit9): id 를 '텍스트로' 안전하게 임베드한다(식별자 아님 — 가독성 유지).
+
+    개행/제어문자/따옴표가 들어있는 id 를 주석·마크다운 리스트·파이썬 리터럴에 그대로 박으면
+    생성된 mock 산출물이 깨진다(라인 분리, 따옴표 escape 깨짐). 개행·제어문자는 공백으로,
+    따옴표는 제거하고 양끝 공백을 정리해 한 줄 텍스트로 만든다. 빈 값은 'unit'.
+    """
+    s = re.sub(r"[\x00-\x1f\x7f]", " ", str(raw))  # 개행 포함 제어문자 → 공백
+    s = s.replace('"', "").replace("'", "")  # 따옴표 제거(리터럴/마크다운 깨짐 방지)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s or "unit"
+
+
 class MockBackend(Backend):
     name = "mock"
 
@@ -59,7 +72,11 @@ class MockBackend(Backend):
                 "docs/design/architecture.md",
                 "# Architecture (mock)\n\n"
                 "Stack: FastAPI + React/Vite + SQLite\n\n## Units\n"
-                + "\n".join(f"- {u['id']}: {u['title']}" for u in units),
+                # #12(audit9): id/title 에 개행/따옴표가 있어도 마크다운 리스트가 깨지지 않게 sanitize.
+                + "\n".join(
+                    f"- {_safe_id_text(u['id'])}: {_safe_id_text(u.get('title', ''))}"
+                    for u in units
+                ),
             )
             status = "designed"
         elif role == "testsheet-creator":
@@ -69,15 +86,21 @@ class MockBackend(Backend):
             comp = _ident(unit["id"], prefix="Comp")
             write(
                 f"frontend/src/{_ident(unit['id'])}.jsx",
-                f"// mock frontend for {unit['id']}: {unit.get('title', '')}\n"
+                # #12(audit9): 주석에 박히는 id/title 의 개행/따옴표로 JS 가 깨지지 않게 sanitize.
+                f"// mock frontend for {_safe_id_text(unit['id'])}: "
+                f"{_safe_id_text(unit.get('title', ''))}\n"
                 f"export default function {comp}() {{ return null; }}\n",
             )
             status = "dev_done"
         elif role == "backend-developer" and unit:
+            # #12(audit9): 주석·파이썬 문자열 리터럴에 박히는 id 는 개행/따옴표가 들어가면
+            # 생성 코드가 깨지므로 텍스트 sanitize 한다(파일명은 _ident 로 식별자화).
+            safe_id = _safe_id_text(unit["id"])
+            safe_title = _safe_id_text(unit.get("title", ""))
             write(
                 f"backend/app/{_ident(unit['id'])}.py",
-                f"# mock backend for {unit['id']}: {unit.get('title', '')}\n"
-                f"def handler():\n    return {{'unit': {unit['id']!r}}}\n",
+                f"# mock backend for {safe_id}: {safe_title}\n"
+                f"def handler():\n    return {{'unit': {safe_id!r}}}\n",
             )
             status = "dev_done"
         elif role == "dba" and unit:
@@ -85,7 +108,9 @@ class MockBackend(Backend):
             table = _ident(unit["id"], prefix="t").lower()
             write(
                 f"db/migrations/{_ident(unit['id'])}.sql",
-                f"-- mock migration for {unit['id']}: {unit.get('title', '')}\n"
+                # #12(audit9): SQL 주석에 박히는 id/title 의 개행으로 마이그레이션이 깨지지 않게 sanitize.
+                f"-- mock migration for {_safe_id_text(unit['id'])}: "
+                f"{_safe_id_text(unit.get('title', ''))}\n"
                 f"CREATE TABLE IF NOT EXISTS t_{table} (id INTEGER PRIMARY KEY);\n",
             )
             status = "dev_done"
@@ -94,7 +119,9 @@ class MockBackend(Backend):
             tname = _ident(unit["id"], prefix="t").lower()
             write(
                 f"tests/test_{tname}.py",
-                f"def test_{tname}():\n    assert True  # mock test for {unit.get('title', '')}\n",
+                # #12(audit9): 주석에 박히는 title 의 개행/따옴표로 테스트 파일이 깨지지 않게 sanitize.
+                f"def test_{tname}():\n    assert True  "
+                f"# mock test for {_safe_id_text(unit.get('title', ''))}\n",
             )
             status = "tested"
         elif role == "qa" and unit:

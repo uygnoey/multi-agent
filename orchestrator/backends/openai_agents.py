@@ -590,12 +590,6 @@ class OpenAIAgentsBackend(Backend):
             return False, "OPENAI_API_KEY 미설정"
         return True, "ready"
 
-    @staticmethod
-    def _kill_proc(proc) -> None:
-        # #3/#36: 타임아웃/예외 시 자식까지 프로세스 그룹째 정리한다 (좀비/고아 방지).
-        # 단일 proc.kill() 은 셸이 spawn 한 자식을 남기므로 _kill_process_group 으로 위임.
-        _kill_process_group(proc)
-
     async def run_role(self, req: RoleRequest) -> RoleResult:
         try:
             from agents import Agent, Runner, function_tool
@@ -677,7 +671,9 @@ class OpenAIAgentsBackend(Backend):
                 return f"<write error: {path}: {e}>"
             except Exception as e:
                 return f"<write error: {path}: {e}>"
-            return f"wrote {path} ({len(content)} bytes)"
+            # #11(audit9): len(content) 는 (UTF-8 다바이트 문자에서) 문자 수라 실제 바이트 수와
+            # 다르다. 디스크에 쓴 UTF-8 바이트 수(len(data))를 보고한다.
+            return f"wrote {path} ({len(data)} bytes)"
 
         @function_tool
         def edit_file(path: str, old_string: str, new_string: str) -> str:
@@ -739,7 +735,8 @@ class OpenAIAgentsBackend(Backend):
                 return f"<write error: {path}: {e}>"
             except Exception as e:
                 return f"<write error: {path}: {e}>"
-            return f"edited {path} ({len(updated)} bytes)"
+            # #11(audit9): 문자 수(len(updated)) 가 아니라 디스크에 쓴 UTF-8 바이트 수를 보고한다.
+            return f"edited {path} ({len(data)} bytes)"
 
         @function_tool
         def list_dir(path: str = ".") -> str:
@@ -753,14 +750,25 @@ class OpenAIAgentsBackend(Backend):
             # #1(audit7): 목록 직전 realpath 재검사 — symlink 로 root 밖을 들여다보지 못하게.
             if not _resolve_under_root(p, root):
                 return f"<path escapes project dir: {path}>"
+            # #6(audit9): 항목 하나의 is_dir() 가 (깨진 symlink/권한 등으로) 실패해도 목록 전체가
+            # '<list error>' 로 무너지지 않게 한다 — 가능한 항목은 나열하고, 판정 불가 항목은
+            # 이름만 표기한다(접미사 '/' 없이). iterdir() 자체 실패만 치명적 에러로 처리한다.
             try:
-                names = [x.name + ("/" if x.is_dir() else "") for x in p.iterdir()]
+                entries = list(p.iterdir())
             except Exception as e:
                 return f"<list error: {path}: {e}>"
+            names = []
+            for x in entries:
+                try:
+                    names.append(x.name + ("/" if x.is_dir() else ""))
+                except Exception:
+                    names.append(x.name)
             # #4: node_modules/.venv 같은 거대 디렉터리도 상한까지만 반환해 컨텍스트 폭주 방지.
             return _format_dir_listing(names)
 
-        bash_timeout = req.timeout if req.timeout else 120  # config 의 세션 타임아웃을 따른다
+        # #7(audit9): req.timeout==0 은 falsy 라 예전엔 120 으로 둔갑했다. None(미지정)일 때만
+        # 기본 120 을 쓰고, 0 을 포함한 명시값은 그대로 따른다.
+        bash_timeout = req.timeout if req.timeout is not None else 120
         # #36: 반환 텍스트는 어차피 4000자로 자르므로, 보관하는 양도 상한선으로 묶는다.
         max_bash_capture = 64 * 1024  # 보관 상한(~64KB) — 4000자 절단보다 넉넉
 
@@ -828,6 +836,16 @@ class OpenAIAgentsBackend(Backend):
             if est is not None:
                 cost = est
                 cost_estimated = True  # 토큰×단가 추정치 — 실청구액 아님
+        elif tokens:
+            # #4(audit9): in/out 분리가 안 되고 합산 토큰만 있는 응답은 예전엔 tokens>0 인데도
+            # cost=None 으로 남아 보고가 불일치했다(토큰은 보이는데 비용은 0/미상). 분리값이
+            # 없으니 정확 추정은 불가하지만, 합산 토큰 전체를 (더 비싼) output 단가로 환산해
+            # 보수적 상한 추정치를 내고 cost_estimated=True 로 표기한다 — codex/openai 와 일관되게
+            # 사용량이 보이는 호출이 비용 0 으로 과소표시되지 않게 한다. 모델 단가가 없으면 None.
+            est = _estimate_openai_cost(model, 0, tokens)
+            if est is not None:
+                cost = est
+                cost_estimated = True  # 합산 토큰 기반 보수적 상한 추정치 — 실청구액 아님
         return RoleResult(
             ok=True,
             final_message=str(getattr(result, "final_output", "")),

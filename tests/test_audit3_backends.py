@@ -139,7 +139,9 @@ def test_openai_read_file_truncates_without_loading_all(tmp_path, monkeypatch):
 
 def test_openai_kill_proc_safe_on_none():
     # run_bash 의 정리 헬퍼는 proc 이 None 이어도 예외를 던지지 않아야 한다.
-    oa_mod.OpenAIAgentsBackend._kill_proc(None)
+    # #9(audit9): 죽은 코드였던 OpenAIAgentsBackend._kill_proc 래퍼를 제거하고,
+    # 실제 사용되는 모듈 레벨 _kill_process_group 을 직접 검증한다.
+    oa_mod._kill_process_group(None)
 
 
 def test_openai_run_bash_large_output_is_capped(tmp_path):

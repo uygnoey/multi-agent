@@ -167,9 +167,10 @@ def test_rerun_corrupt_opts_returns_clean_error_not_raw_exception(server):
     # 관대 변환 덕분에 rerun 은 성공한다.
     assert code == 200
     assert "run_id" in j
-    # 새 run 의 명령에 손상값 대신 기본 concurrency 가 들어갔는지
+    # 새 run 의 명령에 손상값 대신 합리적 값이 들어갔는지. #M08 클램프가 손상 concurrency 를
+    # _coerce_int(.., lo=1) 로 폴백해 최소 유효값(1)으로 수렴시킨다(음수/손상→argparse 에러 방지).
     cmd = server["spawned"][-1]
-    assert cmd[cmd.index("--concurrency") + 1] == "3"
+    assert cmd[cmd.index("--concurrency") + 1] == "1"
 
 
 def test_rerun_error_message_has_no_int_exception_text(server, monkeypatch):

@@ -29,6 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+from . import procutil
 from .backends import backend_status, resolve
 from .board import _tail_lines
 from .config import BACKEND_INFO, FRAMEWORK_ROOT, ROLES, VALID_BACKENDS
@@ -81,6 +82,32 @@ def _read_agent_logs(orch_dir, roles, n: int = 120) -> dict:
     return out
 
 
+def _read_pid(pf) -> int | None:
+    """run.pid 에서 *양의 정수* PID 만 안전하게 읽는다 (손상/악성 pidfile 방어).
+
+    HIGH(안전): 예전엔 int(read_text().strip()) 로 곧장 변환해 0/-1 같은 값도 그대로
+    os.kill/os.getpgid/os.killpg 로 흘러갔다. os.kill(-1, sig) 는 호출자가 시그널을 보낼 수
+    있는 *모든* 프로세스에 시그널을 보내고(0 은 호출자의 프로세스 그룹 전체), 이는 손상된
+    pidfile 한 줄로 무관한 프로세스를 무더기로 죽이는 사고로 이어진다. 따라서 PID 가
+    *양의 정수*(>0)일 때만 반환하고, 그 외(0/음수/비숫자/빈값/없음)는 None 을 돌려준다.
+
+    pidfile 포맷: 첫 줄이 PID. 다른 소유자가 둘째 줄에 start-time 토큰을 덧붙일 수 있으므로
+    (선택적) 추가 줄을 너그럽게 허용한다 — 단 강제하지는 않는다(첫 줄만 본다).
+    """
+    try:
+        txt = pf.read_text(encoding="utf-8")
+    except Exception:
+        return None
+    first = txt.strip().split("\n", 1)[0].strip()
+    if not re.fullmatch(r"[+-]?\d+", first):
+        return None
+    try:
+        pid = int(first)
+    except (ValueError, OverflowError):
+        return None
+    return pid if pid > 0 else None
+
+
 def _is_zombie(pid: int) -> bool:
     """pid 가 좀비(이미 종료, 부모가 reap 대기 중) 인지 best-effort 로 판별.
 
@@ -92,7 +119,12 @@ def _is_zombie(pid: int) -> bool:
         if stat.exists():
             # 형식: pid (comm) STATE ... — comm 에 ')' 가 있을 수 있어 마지막 ')' 기준.
             txt = stat.read_text(encoding="utf-8", errors="replace")
-            state = txt[txt.rfind(")") + 1 :].strip().split(" ", 1)[0]
+            idx = txt.rfind(")")
+            # #L17: monitor._is_zombie_uncached 와 동일 가드 — ')' 없는 손상 stat 은
+            # [-1+1:]=[0:] 오독을 막기 위해 좀비 아님(False) 처리한다.
+            if idx == -1:
+                return False
+            state = txt[idx + 1 :].strip().split(" ", 1)[0]
             return state == "Z"
     except Exception:
         pass
@@ -109,13 +141,21 @@ def _is_zombie(pid: int) -> bool:
 
 
 def _run_alive(orch_dir) -> bool:
-    """run.pid 의 프로세스가 살아있는지 (웹 서버 재시작/외부 실행에도 정확)."""
+    """run.pid 의 프로세스가 살아있는지 (웹 서버 재시작/외부 실행에도 정확).
+
+    semantics 는 캐시 없이 항상 즉시 판정한다 — 폴링 핫패스의 캐싱은 호출부
+    (RunManager._run_alive_cached)에서만 적용한다(#6). 그래야 직접 호출하는 곳/테스트는
+    monkeypatch(_is_zombie 등)의 효과를 즉시 본다.
+    """
     pf = orch_dir / "run.pid"
     if not pf.exists():
         return False
-    try:
-        pid = int(pf.read_text(encoding="utf-8").strip())
-    except Exception:
+    # HIGH(#1): int() 직접 변환 대신 _read_pid 로 *양의 정수* PID 만 받는다(0/-1 거부).
+    pid = _read_pid(pf)
+    if pid is None:
+        return False
+    # #M6: pid 가 재사용된 무관 프로세스면(시작시각 토큰 불일치) 우리 run 이 아니다 → not alive.
+    if not procutil.pid_is_ours(pid, procutil.read_pid_token(pf)):
         return False
     try:
         os.kill(pid, 0)  # signal 0 = 존재/권한 확인 (죽었으면 OSError)
@@ -274,8 +314,10 @@ def build_command(py: str, spec_path: Path, project_dir: Path, opts: dict) -> li
         cmd += ["--completion-level", completion_level]
     # #38: max_units/max_attempts 도 손상값을 관대하게 변환. max_units 는 0/음수면 "전체"로
     #      간주해 플래그를 생략(폴백 0). max_attempts 는 0이면 "고쳐질 때까지" 기본값.
-    if _coerce_int(opts.get("max_units"), 0) > 0:
-        cmd += ["--max-units", str(_coerce_int(opts.get("max_units"), 0))]
+    # NIT(#10): 같은 변환을 두 번 계산하지 않도록 한 번만 구해 변수에 담는다.
+    max_units = _coerce_int(opts.get("max_units"), 0)
+    if max_units > 0:
+        cmd += ["--max-units", str(max_units)]
     if opts.get("max_attempts") not in (None, ""):
         cmd += ["--max-attempts", str(_coerce_int(opts.get("max_attempts"), 0))]
     # #62: timeout/retries/budget/model 도 있으면 CLI 로 전달 (웹 실행에서도 사용 가능).
@@ -293,6 +335,83 @@ def build_command(py: str, spec_path: Path, project_dir: Path, opts: dict) -> li
     if opts.get("model"):
         cmd += ["--model", str(opts["model"])]
     return cmd
+
+
+def sanitize_run_opts(opts: dict) -> dict:
+    """MEDIUM(#3): rerun 경로가 저장된 _run_opts.json 을 build_command 에 넘기기 전에
+    /api/run 과 같은 타입 보장으로 정리한다.
+
+    /api/run 은 backends=list[str], role_backends=dict[str, str|list[str]],
+    completion_level∈{mvp,production} 등을 검증한다. rerun 은 이 검증을 거치지 않고 저장
+    파일을 그대로 start() 로 넘겨, 손상/수기편집된 opts(예: backends 가 dict, role_backends
+    가 list)가 build_command 안에서 .items()/",".join 등으로 불투명하게 깨졌다.
+
+    /api 처럼 *거부(400)* 하는 대신 여기서는 *정규화* 한다 — rerun 은 사용자가 폼을 다시
+    채울 기회 없이 한 번에 재실행하는 경로라, 합리적으로 복구 가능한 값은 기본값으로
+    수렴시켜 명령이 깨지지 않게 한다(기존 _coerce_* 의 관대한 정책과 일관).
+    """
+    if not isinstance(opts, dict):
+        return {"mock": True}
+    out = dict(opts)
+
+    # backend: str 만 허용 (resolve()/ALIASES.get 가 unhashable 로 죽지 않게). 그 외 → "mock".
+    backend = out.get("backend", "mock")
+    out["backend"] = backend if isinstance(backend, str) else "mock"
+
+    # backends: list[str] 만 허용. 문자열이면 콤마 분해, dict/숫자 등은 제거.
+    backends = out.get("backends")
+    if isinstance(backends, str):
+        backends = [b.strip() for b in backends.split(",") if b.strip()]
+    if isinstance(backends, list):
+        backends = [b for b in backends if isinstance(b, str) and b]
+        out["backends"] = backends or None
+    elif backends is not None:
+        out["backends"] = None
+
+    # role_backends: dict 만 허용. 값은 str 또는 list[str] 로 정리, 알 수 없는 역할은 버린다.
+    rb = out.get("role_backends")
+    if isinstance(rb, dict):
+        clean_rb = {}
+        for role, prov in rb.items():
+            if role not in ROLES:
+                continue
+            if isinstance(prov, str):
+                if prov:
+                    clean_rb[role] = prov
+            elif isinstance(prov, list):
+                provs = [p for p in prov if isinstance(p, str) and p]
+                if provs:
+                    clean_rb[role] = provs
+            # 그 외(dict/숫자/None)는 버린다.
+        out["role_backends"] = clean_rb
+    elif rb is not None:
+        out["role_backends"] = None
+
+    # completion_level: 화이트리스트. 그 외/손상 → mvp.
+    level = str(out.get("completion_level") or "mvp").strip().lower()
+    out["completion_level"] = level if level in ("mvp", "production") else "mvp"
+
+    # name: str 또는 None 만 (slugify 가 비문자열도 폴백하지만 명시적으로 정규화).
+    name = out.get("name")
+    if name is not None and not isinstance(name, str):
+        out["name"] = None
+
+    # #M03: model 은 str 만, 길이 상한 + '-' 시작 거부('--flag' 로 오인돼 argv 가 오염되는 것 방지).
+    #       그 외(비문자열/과길이/대시 시작) → None(백엔드 기본 모델).
+    model = out.get("model")
+    if model is not None and (
+        not isinstance(model, str) or len(model) > 200 or model.startswith("-")
+    ):
+        out["model"] = None
+
+    # #M08: 저장된 rerun opts 의 숫자 범위를 클램프한다. 음수가 build_command 를 거쳐
+    #       `--concurrency -5` 처럼 스폰 프로세스의 argparse 검증 에러로 재실행을 깨지 않게 한다
+    #       (concurrency≥1, retries/max_attempts/max_units≥0; max_units 0 은 build_command 가 생략).
+    for fld, lo in (("concurrency", 1), ("max_units", 0), ("max_attempts", 0), ("retries", 0)):
+        if fld in out:
+            iv = _coerce_int(out.get(fld), lo)
+            out[fld] = iv if iv >= lo else lo
+    return out
 
 
 def list_runs(base_dir: Path) -> list[dict]:
@@ -316,12 +435,23 @@ def list_runs(base_dir: Path) -> list[dict]:
 class RunManager:
     """기획서 텍스트로 오케스트레이터 서브프로세스를 띄우고 추적."""
 
+    # LOW(#6): /api/runs(3초)·/api/state(1초) 폴링마다 run 별로 os.kill + `ps` 좀비 검사를
+    #   동기 수행하면 run 수에 비례해 blocking I/O 가 늘어난다(특히 macOS 의 ps 서브프로세스).
+    #   monitor 의 _LOG_CACHE 와 같은 결로, run.pid 의 (mtime,size) 기준 liveness 결과를 짧은
+    #   TTL 동안 캐시해 폴링 부하를 상수에 가깝게 묶는다. TTL 이 짧아(0.8초) UI 갱신 주기보다
+    #   작으므로 stop/완료 직후의 상태 전이는 그대로 보인다(관찰 가능한 의미 불변).
+    _ALIVE_TTL = 0.8  # 초
+    _ALIVE_CACHE_MAX = 256
+
     def __init__(self, base_dir: Path, spawn=None):
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self._spawn = spawn or self._default_spawn
         self._procs: dict[str, object] = {}
         self._lock = threading.Lock()
+        # #6: liveness 캐시 — {key: (deadline, alive)}. key 는 pidfile 경로+mtime+size.
+        self._alive_cache: dict[str, tuple[float, bool]] = {}
+        self._alive_lock = threading.Lock()
 
     @staticmethod
     def _default_spawn(cmd: list[str], log_path: Path):
@@ -360,12 +490,19 @@ class RunManager:
         spec_path = project / "_spec.md"
         spec_path.write_text(spec_text or "# (empty spec)\n", encoding="utf-8")
         # 재실행(rerun)용으로 옵션 저장
+        # LOW(#8): 예전엔 write 실패를 조용히 삼켰다(except: pass). 그러면 이후 rerun 이
+        #          원래 backends/옵션을 잃고 조용히 기본값으로 실행된다. 실패를 stderr 로
+        #          알려(서버 로그에 남게) 운영자가 디스크/권한 문제를 인지하게 한다.
         try:
             (project / "_run_opts.json").write_text(
                 json.dumps(opts, ensure_ascii=False), encoding="utf-8"
             )
-        except Exception:
-            pass
+        except Exception as e:
+            print(
+                f"[webui] 경고: _run_opts.json 저장 실패 ({project / '_run_opts.json'}): {e} "
+                "— 이후 재실행(rerun)은 기본 옵션으로 동작할 수 있습니다.",
+                file=sys.stderr,
+            )
         cmd = build_command(sys.executable, spec_path, project, opts)
         try:
             proc = self._spawn(cmd, self.base_dir / f"{run_id}.log")
@@ -391,9 +528,12 @@ class RunManager:
         orch = self.project_dir(run_id) / ".orchestrator"
         pf = orch / "run.pid"
         if pf.exists():
-            try:
-                pid = int(pf.read_text(encoding="utf-8").strip())
-            except Exception:
+            # HIGH(#1): 양의 정수 PID 만 받는다. 0/-1 같은 손상값이 os.kill/os.getpgid/
+            #           os.killpg 로 흘러가 무관한 프로세스를 죽이는 사고를 막는다.
+            pid = _read_pid(pf)
+            # #M6: pidfile 의 pid 가 재사용된 무관 프로세스면(시작시각 토큰 불일치) 신뢰하지 않고
+            #      tracked proc(우리가 직접 띄운 프로세스)으로 폴백한다(엉뚱한 프로세스 오살 방지).
+            if pid is not None and not procutil.pid_is_ours(pid, procutil.read_pid_token(pf)):
                 pid = None
         with self._lock:
             proc = self._procs.get(run_id)
@@ -451,8 +591,10 @@ class RunManager:
             return not _is_zombie(pid)
 
         def _remove_pidfile():
+            # #1: 비교도 _read_pid(첫 줄 PID)로 한다 — 다른 소유자가 둘째 줄에 start-time
+            #     토큰을 덧붙여도(선택적 추가 줄) PID 가 우리 것과 같으면 정상 제거한다.
             try:
-                if pf.read_text(encoding="utf-8").strip() != str(pid):
+                if _read_pid(pf) != pid:
                     return
                 pf.unlink()
             except Exception:
@@ -517,7 +659,40 @@ class RunManager:
                 opts = json.loads(op.read_text(encoding="utf-8"))
             except Exception:
                 pass
+        # MEDIUM(#3): /api/run 이 적용하는 타입 검증을 rerun 도 통과시킨다 — 손상/수기편집된
+        #             opts(backends 가 dict, role_backends 가 list 등)가 build_command 안에서
+        #             불투명하게 깨지지 않도록 start() 전에 정규화한다.
+        opts = sanitize_run_opts(opts)
         return self.start(spec_text, opts)
+
+    def _run_alive_cached(self, orch_dir) -> bool:
+        """#6: _run_alive 결과를 pidfile 의 (경로,mtime,size) 키로 짧은 TTL 동안 캐시.
+
+        폴링 핫패스(/api/runs·/api/state)에서 run 수에 비례하는 os.kill+ps 비용을 막는다.
+        pidfile 이 바뀌면(stop 이 제거/갱신) 키가 바뀌어 캐시가 자동 무효화된다.
+        """
+        pf = orch_dir / "run.pid"
+        try:
+            st = pf.stat()
+            key = f"{pf}|{st.st_mtime_ns}|{st.st_size}"
+        except OSError:
+            # pidfile 부재 등 — _run_alive 가 빠르게 False 를 돌려주므로 캐시 불필요.
+            return _run_alive(orch_dir)
+        now = time.monotonic()
+        with self._alive_lock:
+            cached = self._alive_cache.get(key)
+            if cached is not None and now < cached[0]:
+                return cached[1]
+        result = _run_alive(orch_dir)
+        with self._alive_lock:
+            self._alive_cache[key] = (now + self._ALIVE_TTL, result)
+            if len(self._alive_cache) > self._ALIVE_CACHE_MAX:
+                # 만료 시각이 이른 순(가장 오래된)으로 정리 — 장기 실행 서버 누적 방지.
+                for old in sorted(self._alive_cache, key=lambda k: self._alive_cache[k][0])[
+                    : len(self._alive_cache) - self._ALIVE_CACHE_MAX
+                ]:
+                    self._alive_cache.pop(old, None)
+        return result
 
     def is_running(self, run_id: str) -> bool:
         with self._lock:
@@ -542,8 +717,9 @@ class RunManager:
                 if self._procs.get(run_id) is proc:
                     self._procs.pop(run_id, None)
         # 이 서버가 띄우지 않은(고아/외부) run 도 PID 파일로 생존 확인
+        # #6: 폴링 핫패스 비용을 줄이려고 짧은 TTL 캐시를 통해 판정한다(의미 불변).
         try:
-            return _run_alive(self.project_dir(run_id) / ".orchestrator")
+            return self._run_alive_cached(self.project_dir(run_id) / ".orchestrator")
         except ValueError:
             return False
 
@@ -582,9 +758,16 @@ def _make_handler(manager: RunManager, token: str | None = None):
                 pass
 
         def _json(self, obj, code: int = 200):
-            self._send(
-                code, json.dumps(obj, ensure_ascii=False).encode("utf-8"), "application/json"
-            )
+            # #4: json.dumps 가 직렬화 불가 값(set/객체)이나 surrogate(비-UTF8) 경로명 등으로
+            #     raise 하면, 응답을 못 보내고 핸들러가 죽어 클라이언트는 빈 연결을 받는다.
+            #     직렬화/인코딩을 try/except 로 감싸 실패 시 제네릭 500 JSON 으로 응답한다.
+            # #9: 바디가 UTF-8(ensure_ascii=False)이므로 Content-Type 에 charset=utf-8 명시.
+            try:
+                body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+            except (TypeError, ValueError, UnicodeEncodeError):
+                code = 500
+                body = b'{"error": "internal serialization error"}'
+            self._send(code, body, "application/json; charset=utf-8")
 
         def _redirect(self, location: str, extra_headers=None):
             self._send(
@@ -658,13 +841,29 @@ def _make_handler(manager: RunManager, token: str | None = None):
               브라우저가 쿠키를 자동 전송하므로 CSRF 표적이기 때문.
             - Authorization/X-Auth-Token 헤더로 인증하는 비-브라우저 클라이언트(쿠키 없음)는
               Origin 없이도 진행을 허용한다(CSRF 로 위조 불가).
+
+            audit9(#2) 강화 — 무토큰 dogfood 보호:
+            - 토큰이 *미설정* 이어도 Origin 부재 시 무조건 허용하면, 로컬 악성 페이지가
+              fetch 로 /api/run 에 POST 해 임의 빌드를 시작시킬 수 있다(브라우저는 same-site
+              cross-origin POST 에 Origin 을 안 붙일 수 있다). 그래서 *상태변경 POST* 에서
+              Origin 이 없으면 Sec-Fetch-Site 를 본다 — 모든 현대 브라우저가 fetch/navigation
+              에 자동으로 붙이며 위조 불가하다:
+                · same-origin / none(주소창 직접 입력) → 허용
+                · cross-site / same-site → 차단(CSRF)
+              Sec-Fetch-Site 도 없는 요청은 비-브라우저(curl/urllib 등)로 보고 기존대로 허용해
+              자동화/테스트 호환을 유지한다(브라우저가 아니므로 CSRF 표적이 아님).
             """
             origin = self.headers.get("Origin")
             if not origin:
-                # Origin 부재: 쿠키-only 인증(토큰 설정 시)이면 차단(CSRF 표적), 그 외는 허용.
+                # Origin 부재: 쿠키-only 인증(토큰 설정 시)이면 차단(CSRF 표적).
                 if auth_token and self._is_cookie_only_auth():
                     return False
-                return True  # 헤더 토큰 사용/토큰 미설정 — CSRF 대상 아님
+                # #2: 무토큰/헤더토큰이라도 브라우저발 cross-site/same-site POST 는 차단한다.
+                sfs = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+                if sfs in ("cross-site", "same-site"):
+                    return False
+                # same-origin/none → 허용, 미설정(비-브라우저) → 허용(하위호환).
+                return True
             try:
                 parsed = urlparse(origin)
                 o_host = parsed.hostname
@@ -782,6 +981,10 @@ def _make_handler(manager: RunManager, token: str | None = None):
                         "board": board,
                         "running": running,
                         "exists": exists,
+                        # #12: _read_board 가 손상 board.json 에 {"_corrupt": True} 를 돌려주는데
+                        #      예전엔 응답에 반영하지 않아 UI 가 "미초기화"처럼 보였다. corrupt 를
+                        #      명시적으로 노출해 UI 가 "board 손상" 을 표시할 수 있게 한다.
+                        "corrupt": bool(board.get("_corrupt")),
                         "project_dir": str(proj) if proj else "",
                         "events": events,
                         "agent_logs": agent_logs if run else {},
@@ -988,6 +1191,14 @@ def _make_handler(manager: RunManager, token: str | None = None):
             if name is not None and not isinstance(name, str):
                 self._json({"error": "name must be a string"}, 400)
                 return
+            # #M03: model 은 검증 없이 build_command 의 --model 인자로 흘러갔다. 비문자열/과길이/
+            #       '-' 시작('--flag' 로 오인돼 argv 오염)을 거부한다.
+            model = data.get("model")
+            if model is not None and (
+                not isinstance(model, str) or len(model) > 200 or model.startswith("-")
+            ):
+                self._json({"error": "invalid model"}, 400)
+                return
             run_id = manager.start(spec_text, data)
             self._json({"run_id": run_id})
 
@@ -1009,6 +1220,9 @@ def serve(port: int = 8765, base_dir: Path | None = None, host: str = "127.0.0.1
         )
     manager = RunManager(base)
     httpd = ThreadingHTTPServer((host, port), _make_handler(manager, token))
+    # LOW(#5): ThreadingHTTPServer.daemon_threads 기본은 False — 종료 시 진행 중인 워커
+    #          스레드를 join 하느라 매달릴 수 있다. daemon=True 로 즉시 종료 가능하게 한다.
+    httpd.daemon_threads = True
     print(f"web ui: http://{host}:{port}   (runs → {base})")
     if token:
         print(f"  [auth] WEB_UI_TOKEN 필요 — 최초 접속: http://{host}:{port}/?token=…")
@@ -1016,6 +1230,9 @@ def serve(port: int = 8765, base_dir: Path | None = None, host: str = "127.0.0.1
         httpd.serve_forever()
     except KeyboardInterrupt:
         httpd.shutdown()
+    finally:
+        # LOW(#5): server_close() 누락 시 소켓이 닫히지 않아 포트가 바인딩된 채 남을 수 있다.
+        httpd.server_close()
 
 
 def main(argv=None) -> int:
@@ -1224,7 +1441,10 @@ async function startRun(){
 }
 async function refreshRuns(){
   let runs=[];
-  try{runs=((await (await fetchWithTimeout("/api/runs",{},15000)).json()).runs)||[]}catch(e){}
+  // #23/#7: 예전엔 빈 catch(e){} 로 실패를 조용히 삼켜 목록이 갱신 안 돼도 사용자가 몰랐다.
+  //         실패를 오류 배너로 노출한다(성공 시 자동 해제는 tick() 가 담당).
+  try{runs=((await (await fetchWithTimeout("/api/runs",{},15000)).json()).runs)||[]}
+  catch(e){showErr("실행 목록 갱신 실패: "+e)}
   const sel=$("runSel");const prev=CUR;sel.innerHTML="";
   if(!runs.length){const o=document.createElement("option");o.value="";o.text="(실행 없음)";sel.appendChild(o)}
   runs.forEach(r=>{const o=document.createElement("option");o.value=r.id;
@@ -1251,13 +1471,25 @@ function renderPicker(runs){
 async function stopRun(){
   if(!CUR)return;
   if(!confirm("이 run 을 정지할까요?"))return;
-  try{await fetchWithTimeout("/api/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({run:CUR})},15000)}catch(e){}
+  // #7: 예전엔 빈 catch(e){} 로 실패를 조용히 삼켰다. 네트워크/HTTP 오류를 배너로 알리고,
+  //     {stopped:false}(정지 대상 없음/실패) 응답도 사용자에게 표시한다.
+  try{
+    const r=await fetchWithTimeout("/api/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({run:CUR})},15000);
+    let j={};try{j=await r.json()}catch(_){}
+    if(j&&j.error){showErr("정지 오류: "+j.error)}
+    else if(j&&j.stopped===false){showErr("정지할 수 없습니다 — 실행 중이 아니거나 PID 를 찾지 못했습니다.")}
+    else{showErr("")}
+  }catch(e){showErr("정지 실패: "+e)}
 }
 async function rerunRun(){
   if(!CUR)return;
   let j={};
-  try{j=await (await fetchWithTimeout("/api/rerun",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({run:CUR})},30000)).json()}catch(e){}
-  if(j.run_id){await refreshRuns();selectRun(j.run_id)}else if(j.error){alert("재실행 오류: "+j.error)}
+  // #M04: 예전엔 빈 catch(e){} 로 네트워크/HTTP 오류를 조용히 삼켜 재실행이 안 돼도 사용자가 몰랐다.
+  try{j=await (await fetchWithTimeout("/api/rerun",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({run:CUR})},30000)).json()}
+  catch(e){showErr("재실행 실패: "+e);return}
+  if(j.run_id){await refreshRuns();selectRun(j.run_id)}
+  else if(j.error){showErr("재실행 오류: "+j.error)}
+  else{showErr("재실행 실패: 알 수 없는 응답")}
 }
 
 function statusDot(s){return '<span class="dot'+(s==="running"?" run":"")+'"></span>'}
@@ -1282,6 +1514,8 @@ async function tick(){
     const r=await fetchWithTimeout("/api/state?run="+encodeURIComponent(CUR),{},15000);
     const s=await r.json();
     if(s&&s.error){showErr("상태 조회 오류: "+s.error+(r.status===401?" — 인증 필요: 먼저 /?token=<TOKEN> 으로 한 번 접속해 인증 쿠키를 설정하면 대시보드가 동작합니다":""));return}
+    // #12: board.json 이 손상된 경우 미초기화처럼 보이지 않고 명확히 "board 손상" 을 표시한다.
+    if(s&&s.corrupt){showErr("board.json 손상 — 읽을 수 없습니다 (실행 상태를 표시할 수 없습니다).");return}
     showErr("");  // 성공 시 이전 오류 제거
     const b=s.board||{};const ag=b.agents||{};const proj=s.project_dir||"";
     const units=Array.isArray(b.units)?b.units:[];
@@ -1329,6 +1563,9 @@ async function tick(){
 let _tk=0;
 let _looping=false;
 async function loop(){
+  // #11: 탭이 숨겨져 있으면(다른 탭/최소화) 폴링을 건너뛴다 — 보이지 않는 화면 갱신을 위해
+  //      서버/네트워크를 두드릴 필요가 없다(부하 감소). 탭이 다시 보이면 다음 틱부터 재개.
+  if(document.hidden)return;
   // #64: 이전 loop(tick 포함)가 끝나기 전에 다음 틱이 겹치면 stale 렌더가 날 수 있다.
   //      플래그로 중첩을 막고, tick() 을 반드시 await 한다.
   if(_looping)return;

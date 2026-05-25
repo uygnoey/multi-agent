@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .config import AGENTS_DIR, DEV_TOOLS, ROLES
+from .config import AGENTS_DIR, DEV_TOOLS, ROLES, normalize_role
 
 
 @dataclass
@@ -35,21 +35,47 @@ def _split_frontmatter(text: str) -> tuple[str, str]:
     return "", text
 
 
+def _strip_quotes(s: str) -> str:
+    """값 양끝의 짝맞는 따옴표(" 또는 ')를 한 겹 벗긴다 (#audit9-8)."""
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1]
+    return s
+
+
+def _parse_scalar_value(v: str):
+    """경량 폴백 값 파서: 인라인 리스트([a, b])는 list, 그 외는 따옴표 벗긴 문자열 (#audit9-8)."""
+    v = v.strip()
+    if v.startswith("[") and v.endswith("]"):
+        # 최소한의 인라인 리스트 처리: 콤마 분리 + 각 항목 따옴표 제거.
+        inner = v[1:-1]
+        return [_strip_quotes(item) for item in inner.split(",") if item.strip()]
+    return _strip_quotes(v)
+
+
 def _parse_meta(fm: str) -> dict:
     try:
         import yaml  # type: ignore
-
-        data = yaml.safe_load(fm) or {}
-        if isinstance(data, dict):
-            return {k: v for k, v in data.items()}
     except Exception:
         pass
-    # 경량 폴백
+    else:
+        # (#audit9-7) yaml 파싱이 성공했으면 그 결과를 신뢰한다. dict 면 그대로, dict 가 아니면
+        # (frontmatter 가 list/scalar 등) 깨끗한 빈 dict 를 돌려준다 — 경량 폴백으로 떨어지면
+        # 같은 텍스트를 ':' 분리로 다시 긁어 garbage 메타를 만들기 때문이다.
+        try:
+            data = yaml.safe_load(fm)
+        except Exception:
+            data = None  # yaml 파싱 자체 실패 → 아래 경량 폴백 시도
+        else:
+            if data is None:
+                return {}
+            return {k: v for k, v in data.items()} if isinstance(data, dict) else {}
+    # 경량 폴백 (pyyaml 미설치 또는 yaml 파싱 예외 시에만 도달)
     meta: dict = {}
     for line in fm.splitlines():
         if ":" in line:
             k, v = line.split(":", 1)
-            meta[k.strip()] = v.strip()
+            meta[k.strip()] = _parse_scalar_value(v)
     return meta
 
 
@@ -62,6 +88,11 @@ def _as_tools(value) -> list[str]:
 
 
 def load_agent(role: str) -> AgentDef:
+    # (#audit9-6) 권한 상승 방지: 정규화 전 역할명(예: "pm")은 ROLES/AGENTS_DIR 어디에도
+    # 매칭되지 않아 .md 가 없는 경로로 빠지고, 그러면 supervisor(PM/PL=RO_TOOLS)인데도
+    # DEV_TOOLS(Write/Bash)가 폴백으로 부여되는 권한 상승이 된다. 시작 시 정식 역할명으로
+    # 정규화해 supervisor 가 절대 쓰기/실행 권한을 얻지 못하게 한다.
+    role = normalize_role(role)
     path = AGENTS_DIR / f"{role}.md"
     if not path.exists():
         # fail-open 방지: 정의 파일이 없을 때 무조건 DEV_TOOLS(Read·Write·Edit·Bash)를 주면
@@ -90,7 +121,12 @@ def _norm_model(value) -> str | None:
     """
     if not value:
         return None
-    s = str(value).strip()
+    # #L16: YAML 이 model 값을 숫자/불리언으로 파싱하면(model: 5 → int 5, model: true → bool)
+    # str() 로 강제하면 "5"/"True" 같은 가짜 모델명이 새어 들어간다. 진짜 문자열만 수용하고
+    # 비-문자열은 미지정(None) 처리한다.
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
     if not s or s.lower() == "inherit":
         return None
     return s

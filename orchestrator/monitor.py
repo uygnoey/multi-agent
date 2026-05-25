@@ -24,11 +24,46 @@ import sys
 import threading
 import time
 import unicodedata
+from collections import OrderedDict
 from pathlib import Path
 
+from . import procutil
 from .backends import backend_status
 from .board import TERMINAL_OK, _tail_lines
 from .config import BACKEND_INFO, ROLES
+
+
+def _read_pid(path: Path) -> int | None:
+    """run.pid 를 읽어 *양의 정수* pid 만 반환한다. 그 외(없음/손상/<=0)는 None (#6).
+
+    안전성: 손상된 pidfile 에 '0'/'-1' 이 들어 있으면 os.kill(0, sig) 가 *프로세스 그룹 전체*,
+    os.kill(-1, sig) 가 *권한 닿는 모든 프로세스* 를 시그널한다. 따라서 pid<=0 은 반드시
+    거부한다. 또한 다른 change owner 가 pidfile 에 start-time 토큰을 둘째 줄로 추가할 수
+    있으므로(쓰기 포맷은 건드리지 않음) 첫 줄만 읽어 둘째 줄 유무에 관대하게 동작한다.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    first = text.splitlines()[0].strip() if text.splitlines() else ""
+    if not first:
+        return None
+    try:
+        pid = int(first)
+    except ValueError:
+        return None
+    return pid if pid > 0 else None  # (#6) pid<=0 거부
+
+
+# alive/zombie 판별 캐시(#7): 비-Linux 는 `_is_zombie` 가 매 refresh(~1s)마다 `ps` 를
+# 띄워 TUI 루프를 timeout(=2s)까지 막을 수 있다. 짧은 TTL 로 결과를 캐싱해 매 tick 마다
+# 외부 프로세스를 spawn 하지 않게 한다. {pid: (만료시각, 좀비여부)}
+_ZOMBIE_CACHE: dict[int, tuple[float, bool]] = {}
+_ZOMBIE_TTL = 0.8  # 초
+# #H07: _is_zombie 는 TUI 메인 루프와 _stop_run 의 데몬 _supervise 스레드 양쪽에서 호출된다.
+# lock 없이 캐시를 get/set/eviction 하면 동시 변경으로 RuntimeError 가 날 수 있다(_LOG_CACHE 와
+# 동일 패턴으로 보호). 느린 _is_zombie_uncached(ps) 는 lock 밖에서 수행한다.
+_ZOMBIE_LOCK = threading.Lock()
 
 
 def _is_zombie(pid: int) -> bool:
@@ -37,13 +72,43 @@ def _is_zombie(pid: int) -> bool:
     webui._is_zombie 와 동일한 기준이지만, 무거운 import 사이클을 피하려고 monitor 에
     가벼운 사본을 둔다. Linux 는 /proc, 그 외(macOS 등)는 `ps` 로 상태 코드를 본다.
     판별 불가 시 False (= 좀비 아님으로 보수적 처리).
+
+    #7: 비-Linux 의 `ps` 호출 결과를 짧은 TTL 로 캐싱해 매 refresh 마다 외부 프로세스를
+    spawn 하지 않게 한다(메인 루프가 ps timeout 만큼 막히는 것 방지).
     """
+    now = time.monotonic()
+    with _ZOMBIE_LOCK:
+        cached = _ZOMBIE_CACHE.get(pid)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+    result = _is_zombie_uncached(pid)  # 느린 ps 는 lock 밖에서 (메인 루프/스레드 직렬화 방지)
+    with _ZOMBIE_LOCK:
+        _ZOMBIE_CACHE[pid] = (now + _ZOMBIE_TTL, result)
+        # 캐시가 무한정 커지지 않게 만료된 항목을 정리한다(스냅샷 순회로 동시변경 방어).
+        if len(_ZOMBIE_CACHE) > 64:
+            for k in [k for k, (exp, _) in list(_ZOMBIE_CACHE.items()) if exp <= now]:
+                _ZOMBIE_CACHE.pop(k, None)
+            # #N02: 만료 항목만으로 캡이 안 풀리면(모두 미만료) 하드 캡을 강제한다 — 만료가
+            # 임박한(=가장 오래된) 항목부터 64개가 될 때까지 제거해 cache 가 무한정 커지는 것을
+            # 막는다(_ZOMBIE_LOCK 안에서 수행).
+            if len(_ZOMBIE_CACHE) > 64:
+                for k, _ in sorted(_ZOMBIE_CACHE.items(), key=lambda kv: kv[1][0])[
+                    : len(_ZOMBIE_CACHE) - 64
+                ]:
+                    _ZOMBIE_CACHE.pop(k, None)
+    return result
+
+
+def _is_zombie_uncached(pid: int) -> bool:
     try:
         stat = Path(f"/proc/{pid}/stat")
         if stat.exists():
             # 형식: pid (comm) STATE ... — comm 에 ')' 가 있을 수 있어 마지막 ')' 기준.
             txt = stat.read_text(encoding="utf-8", errors="replace")
-            state = txt[txt.rfind(")") + 1 :].strip().split(" ", 1)[0]
+            idx = txt.rfind(")")
+            if idx == -1:  # (#16) ')' 없는 손상 stat → [-1+1:]=[0:] 오독 방지. 좀비 아님 처리.
+                return False
+            state = txt[idx + 1 :].strip().split(" ", 1)[0]
             return state == "Z"
     except Exception:
         pass
@@ -62,11 +127,11 @@ def _is_zombie(pid: int) -> bool:
 def _run_alive(orch_dir: Path) -> bool:
     """run.pid 의 프로세스가 살아있는지 (웹 UI 와 동일 기준)."""
     pf = orch_dir / "run.pid"
-    if not pf.exists():
+    pid = _read_pid(pf)  # (#6) 양의 정수 pid 만 통과(<=0/손상은 None)
+    if pid is None:
         return False
-    try:
-        pid = int(pf.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
+    # #M6: pid 가 재사용된 무관 프로세스면(시작시각 토큰 불일치) 우리 run 이 아니다 → not alive.
+    if not procutil.pid_is_ours(pid, procutil.read_pid_token(pf)):
         return False
     try:
         os.kill(pid, 0)  # signal 0 = 존재/권한 확인 (죽었으면 OSError)
@@ -119,11 +184,12 @@ def _stop_run(orch_dir: Path) -> bool:
     이션·pidfile 제거는 데몬 스레드에서 처리한다. stop 이 시작되면 True 를 반환한다.
     """
     pf = orch_dir / "run.pid"
-    if not pf.exists():
+    pid = _read_pid(pf)  # (#6) 양의 정수 pid 만 통과 → os.killpg(0/-1,...) 같은 광역 시그널 차단
+    if pid is None:
         return False
-    try:
-        pid = int(pf.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
+    # #M6: pidfile 의 pid 가 재사용된 무관 프로세스면(시작시각 토큰 불일치) 시그널을 보내지
+    #      않는다(엉뚱한 프로세스 오살 방지). stop 할 우리 run 이 없는 것으로 본다.
+    if not procutil.pid_is_ours(pid, procutil.read_pid_token(pf)):
         return False
     try:
         pgid = os.getpgid(pid)
@@ -165,8 +231,10 @@ def _stop_run(orch_dir: Path) -> bool:
                 pass
 
     def _remove_pidfile():
+        # (#6) start-time 토큰이 둘째 줄에 추가될 수 있으므로 첫 줄 pid 만 비교한다(쓰기 포맷
+        # 불변, 리더만 관대). 우리가 추적한 pid 가 아니면(다른 run 이 pidfile 을 덮어씀) 보존.
         try:
-            if pf.read_text(encoding="utf-8").strip() != str(pid):
+            if _read_pid(pf) != pid:
                 return
             pf.unlink()
         except Exception:
@@ -205,9 +273,12 @@ def _rerun(orch_dir: Path) -> tuple[bool, str]:
     if not f.exists():
         return False, "재실행 정보 없음 (rerun.json 없음 — 이 run 은 재실행 불가)"
     try:
-        argv = json.loads(f.read_text(encoding="utf-8")).get("argv") or []
+        data = json.loads(f.read_text(encoding="utf-8"))
     except Exception:
         return False, "rerun.json 파싱 실패"
+    # (#17) JSON 이 dict 가 아니면(list/숫자 등) .get 이 AttributeError → "파싱 실패" 로 오보됨.
+    # isinstance 가드로 형식 오류를 정확히 구분한다.
+    argv = data.get("argv") if isinstance(data, dict) else None
     if not argv:
         return False, "재실행 인자 없음"
     ok, why = _validate_rerun_argv(argv)
@@ -246,11 +317,17 @@ _VALUE_RERUN_FLAGS = frozenset(
         "--max-attempts",
         "--retries",
         "--timeout",
+        # #H01: 완료 레벨은 production 빌드 rerun argv 에 항상 들어가므로 화이트리스트에 포함해야
+        #       TUI 재실행이 "허용되지 않은 플래그"로 깨지지 않는다.
+        "--completion-level",
     }
 )
 _NONNEG_FLOAT_RERUN_FLAGS = frozenset({"--budget", "--poll-interval", "--timeout"})
-_POSITIVE_INT_RERUN_FLAGS = frozenset({"--max-units", "--concurrency", "--max-attempts"})
-_NONNEG_INT_RERUN_FLAGS = frozenset({"--retries"})
+_POSITIVE_INT_RERUN_FLAGS = frozenset({"--max-units", "--concurrency"})
+# #H02: --max-attempts 는 0(완주/무제한 모드, CLI 기본값)이 유효하므로 양의정수가 아니라 0 이상.
+_NONNEG_INT_RERUN_FLAGS = frozenset({"--retries", "--max-attempts"})
+# #H01: enum 값만 허용하는 플래그 (그 외 값은 거부).
+_ENUM_RERUN_FLAGS = {"--completion-level": frozenset({"mvp", "production"})}
 # 값 없는 store-true 플래그 (#12).
 _STORE_TRUE_RERUN_FLAGS = frozenset(
     {
@@ -337,6 +414,10 @@ def _validate_rerun_value(flag: str, value: str) -> tuple[bool, str]:
         elif flag in _NONNEG_INT_RERUN_FLAGS:
             if not re.fullmatch(r"[+]?\d+", value):
                 return False, f"재실행 인자 거부 ({flag} 값이 0 이상의 정수가 아님)"
+        elif flag in _ENUM_RERUN_FLAGS:
+            if value not in _ENUM_RERUN_FLAGS[flag]:
+                allowed = "|".join(sorted(_ENUM_RERUN_FLAGS[flag]))
+                return False, f"재실행 인자 거부 ({flag} 값이 {allowed} 중 하나가 아님: {value})"
     except ValueError:
         return False, f"재실행 인자 거부 ({flag} 값이 잘못됨)"
     return True, ""
@@ -416,8 +497,11 @@ def _read_agent_log(orch_dir: Path, role: str, n: int = 500) -> str:
 
 # 상세 뷰 로그 mtime 캐시: 같은 파일이 안 바뀌었으면 매 refresh 마다 다시 읽지 않는다 (#36).
 # {경로: (mtime, size, tail_text)}
-_LOG_CACHE: dict[str, tuple[float, int, str]] = {}
+# (#11) OrderedDict + move_to_end 로 진짜 LRU(재기록 키도 끝으로 이동)를 구현하고, 같은
+#       프로세스의 webui 와 공유될 수 있으므로 lock 으로 동시 변경(RuntimeError)을 막는다.
+_LOG_CACHE: OrderedDict[str, tuple[float, int, str]] = OrderedDict()
 _LOG_CACHE_MAX = 128
+_LOG_CACHE_LOCK = threading.Lock()
 
 
 def _read_agent_log_cached(orch_dir: Path, role: str, n: int = 500) -> str:
@@ -427,16 +511,21 @@ def _read_agent_log_cached(orch_dir: Path, role: str, n: int = 500) -> str:
     try:
         stat = p.stat()
     except OSError:
-        _LOG_CACHE.pop(key, None)
+        with _LOG_CACHE_LOCK:  # (#11) 동시 변경 방어
+            _LOG_CACHE.pop(key, None)
         return ""
-    cached = _LOG_CACHE.get(key)
-    if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
-        return cached[2]
+    with _LOG_CACHE_LOCK:
+        cached = _LOG_CACHE.get(key)
+        if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+            _LOG_CACHE.move_to_end(key)  # (#11) LRU: 최근 접근을 끝으로
+            return cached[2]
+    # 파일 읽기는 lock 밖에서(블로킹 I/O 동안 다른 스레드 차단 방지).
     text = _read_agent_log(orch_dir, role, n=n)
-    _LOG_CACHE[key] = (stat.st_mtime, stat.st_size, text)
-    if len(_LOG_CACHE) > _LOG_CACHE_MAX:
-        for old in list(_LOG_CACHE)[: len(_LOG_CACHE) - _LOG_CACHE_MAX]:
-            _LOG_CACHE.pop(old, None)
+    with _LOG_CACHE_LOCK:
+        _LOG_CACHE[key] = (stat.st_mtime, stat.st_size, text)
+        _LOG_CACHE.move_to_end(key)  # (#11) 재기록 키도 끝으로(진짜 LRU)
+        while len(_LOG_CACHE) > _LOG_CACHE_MAX:
+            _LOG_CACHE.popitem(last=False)  # 가장 오래 안 쓰인 항목부터 제거
     return text
 
 
@@ -545,6 +634,7 @@ def _wrap_line(text: str, width: int) -> list[str]:
 def _draw_list(stdscr, board, roles, sel, orch_dir, alive) -> None:
     import curses
 
+    alive = bool(alive)  # (#14) None alive → not alive 오판 방지(render_snapshot 과 동일 정규화)
     h, w = stdscr.getmaxyx()
     phase = board.get("phase", "—")
     cost = _num(board.get("total_cost_usd", 0.0))  # 손상값 가드 (#142)
@@ -627,7 +717,9 @@ def _draw_artifacts(stdscr, board: dict, orch_dir: Path, scroll: int) -> int:
         raw_arts = u.get("artifacts", [])
         arts = raw_arts if isinstance(raw_arts, list) else []
         if arts:
-            body.append(f"[ {u.get('id', '?')} — {u.get('title', '')} ]  ({u.get('status')})")
+            # (#15) status 누락 시 '(None)' 대신 '?' 로 표시.
+            st = u.get("status") or "?"
+            body.append(f"[ {u.get('id', '?')} — {u.get('title', '')} ]  ({st})")
             body += [f"  {proj}/{a}" for a in arts]
             body.append("")
     if len(body) <= 2:
@@ -669,6 +761,38 @@ def _draw_backends(stdscr) -> None:
     _safe_add(stdscr, h - 1, 0, " b/Esc: back   q: quit ", curses.A_REVERSE)
 
 
+def _detail_body(stdscr, board: dict, orch_dir: Path, role: str) -> tuple[list[str], int]:
+    """상세 뷰의 soft-wrap 된 표시 라인과 max_scroll 을 계산한다 (#8 공통화).
+
+    _draw_detail 과 키 핸들러가 동일한 기준으로 max_scroll 을 구할 수 있게 분리한다.
+    그렇지 않으면 키 처리 시 직전 프레임의 stale max_scroll 을 써서 새 로그 줄이 도착할 때
+    한 프레임 깜빡임이 생긴다.
+    """
+    h, w = stdscr.getmaxyx()
+    raw_agents = board.get("agents", {})
+    agents = raw_agents if isinstance(raw_agents, dict) else {}
+    a = agents.get(role, {})
+    # 매 refresh 마다 2000줄을 다시 읽지 않고, mtime 이 바뀐 경우에만 최근 500줄을 재로드 (#36)
+    log = _read_agent_log_cached(orch_dir, role, n=500)
+    body = log.splitlines() if log else ["(아직 활동 없음 — 이 에이전트가 시작되면 채워집니다)"]
+    last_msg = a.get("last_message") or ""
+    if last_msg:
+        body += ["", "── last message ──"] + last_msg.splitlines()
+    top = 3
+    view_h = max(1, h - top - 1)
+    view_w = max(2, w - 2)
+    body = [seg for line in body for seg in _wrap_line(line, view_w)]  # soft-wrap
+    max_scroll = max(0, len(body) - view_h)
+    return body, max_scroll
+
+
+def _detail_max_scroll(stdscr, board: dict, orch_dir: Path, role: str) -> int:
+    """현재 화면/로그 기준의 max_scroll 만 신선하게 계산한다 (#8 키 핸들러용)."""
+    if role is None:
+        return 0
+    return _detail_body(stdscr, board, orch_dir, role)[1]
+
+
 def _draw_detail(stdscr, board: dict, orch_dir: Path, role: str, scroll: int, follow: bool):
     """에이전트 상세 로그. follow=True 면 최신(맨 아래)을 자동으로 따라간다(스트리밍).
 
@@ -698,18 +822,9 @@ def _draw_detail(stdscr, board: dict, orch_dir: Path, role: str, scroll: int, fo
     )
     _safe_add(stdscr, 2, 1, "activity (live):", curses.A_DIM)
 
-    # 매 refresh 마다 2000줄을 다시 읽지 않고, mtime 이 바뀐 경우에만 최근 500줄을 재로드 (#36)
-    log = _read_agent_log_cached(orch_dir, role, n=500)
-    body = log.splitlines() if log else ["(아직 활동 없음 — 이 에이전트가 시작되면 채워집니다)"]
-    last_msg = a.get("last_message") or ""
-    if last_msg:
-        body += ["", "── last message ──"] + last_msg.splitlines()
-
     top = 3
     view_h = max(1, h - top - 1)
-    view_w = max(2, w - 2)
-    body = [seg for line in body for seg in _wrap_line(line, view_w)]  # soft-wrap
-    max_scroll = max(0, len(body) - view_h)
+    body, max_scroll = _detail_body(stdscr, board, orch_dir, role)
     scroll = max_scroll if follow else min(scroll, max_scroll)  # follow → 맨 아래
     for j, line in enumerate(body[scroll : scroll + view_h]):
         _safe_add(stdscr, top + j, 1, line)
@@ -720,13 +835,18 @@ def _draw_detail(stdscr, board: dict, orch_dir: Path, role: str, scroll: int, fo
     return scroll, max_scroll
 
 
+_CLAMP_INTERVAL_MAX = 60.0  # (#13) curses timeout(int*1000) 오버플로/장시간 무응답 방지 상한
+
+
 def _clamp_interval(raw) -> float:
     """TUI refresh 주기를 안전한 값으로 정규화한다 (#17, curses 없이 단위 테스트 가능한 순수 함수).
 
     interval=0 이면 busy redraw, 음수면 blocking getch, NaN/Inf 면 int() 가 깨진다.
     - float 변환 실패(TypeError/ValueError) → 1.0
     - 비유한값(NaN/Inf) 또는 <= 0 → 1.0
-    - 그 외 → max(0.1, value) (너무 잦은 redraw 방지 하한 0.1초)
+    - 그 외 → max(0.1, min(60.0, value))
+      하한 0.1초(너무 잦은 redraw 방지), 상한 60초 (#13: 거대한 --interval 이
+      curses timeout(int*1000) 을 오버플로하거나 루프가 수십 분 무응답이 되는 것 방지).
     """
     try:
         value = float(raw)
@@ -734,7 +854,7 @@ def _clamp_interval(raw) -> float:
         return 1.0
     if not math.isfinite(value) or value <= 0:
         return 1.0
-    return max(0.1, value)
+    return max(0.1, min(_CLAMP_INTERVAL_MAX, value))  # (#13) 상한 추가
 
 
 def run_tui(project_dir: Path, interval: float = 1.0) -> None:
@@ -755,94 +875,115 @@ def run_tui(project_dir: Path, interval: float = 1.0) -> None:
         max_scroll = 0
         status_msg = ""
         while True:
-            board = _read_board(orch)
-            alive = _run_alive(orch)
-            stdscr.erase()
-            if mode == "backends":
-                _draw_backends(stdscr)
-            elif mode == "artifacts":
-                scroll = _draw_artifacts(stdscr, board, orch, scroll)
-            elif board.get("_corrupt"):  # 손상 board.json 을 빈 보드로 숨기지 않고 표시 (#70)
-                _safe_add(stdscr, 0, 0, " MULTI-AGENT MONITOR ", curses.A_REVERSE | curses.A_BOLD)
-                _safe_add(
-                    stdscr,
-                    2,
-                    1,
-                    f"⚠ board.json 손상 — 읽을 수 없습니다: {orch / 'board.json'}",
-                    curses.A_BOLD,
-                )
-                _safe_add(
-                    stdscr, 3, 1, "run 상태가 깨졌습니다. 파일 확인.  c: 백엔드 체크   q: 종료"
-                )
-            elif not board:
-                _safe_add(stdscr, 0, 0, " MULTI-AGENT MONITOR ", curses.A_REVERSE)
-                _safe_add(stdscr, 2, 1, f"run 대기 중… {orch / 'board.json'} 가 아직 없습니다.")
-                _safe_add(
-                    stdscr, 3, 1, "오케스트레이터 실행 시 자동 갱신.  c: 백엔드 체크   q: 종료"
-                )
-            elif mode == "list":
-                _draw_list(stdscr, board, roles, sel, orch, alive)
-            else:
-                scroll, max_scroll = _draw_detail(
-                    stdscr, board, orch, detail_role, scroll, detail_follow
-                )
-            if status_msg and mode in ("list", "detail"):
-                hh, _ww = stdscr.getmaxyx()
-                _safe_add(stdscr, hh - 2, 1, "→ " + status_msg, curses.A_BOLD)
-            stdscr.refresh()
-
             try:
+                board = _read_board(orch)
+                alive = _run_alive(orch)
+                stdscr.erase()
+                # (#10) 손상 board 는 mode 별 렌더링보다 *먼저* 표시한다. 그렇지 않으면
+                #       artifacts 모드가 손상 board 를 "산출물 없음" 으로 그려 손상을 숨긴다.
+                #       backends 는 board 와 무관한 진단 화면이라 손상 중에도 접근을 허용한다.
+                if board.get("_corrupt") and mode != "backends":
+                    _safe_add(
+                        stdscr, 0, 0, " MULTI-AGENT MONITOR ", curses.A_REVERSE | curses.A_BOLD
+                    )
+                    _safe_add(
+                        stdscr,
+                        2,
+                        1,
+                        f"⚠ board.json 손상 — 읽을 수 없습니다: {orch / 'board.json'}",
+                        curses.A_BOLD,
+                    )
+                    _safe_add(
+                        stdscr, 3, 1, "run 상태가 깨졌습니다. 파일 확인.  c: 백엔드 체크   q: 종료"
+                    )
+                elif not board and mode != "backends":
+                    _safe_add(stdscr, 0, 0, " MULTI-AGENT MONITOR ", curses.A_REVERSE)
+                    _safe_add(stdscr, 2, 1, f"run 대기 중… {orch / 'board.json'} 가 아직 없습니다.")
+                    _safe_add(
+                        stdscr, 3, 1, "오케스트레이터 실행 시 자동 갱신.  c: 백엔드 체크   q: 종료"
+                    )
+                elif mode == "backends":
+                    _draw_backends(stdscr)
+                elif mode == "artifacts":
+                    scroll = _draw_artifacts(stdscr, board, orch, scroll)
+                elif mode == "list":
+                    _draw_list(stdscr, board, roles, sel, orch, alive)
+                else:  # detail
+                    scroll, max_scroll = _draw_detail(
+                        stdscr, board, orch, detail_role, scroll, detail_follow
+                    )
+                if status_msg and mode in ("list", "detail"):
+                    hh, _ww = stdscr.getmaxyx()
+                    _safe_add(stdscr, hh - 2, 1, "→ " + status_msg, curses.A_BOLD)
+                stdscr.refresh()
+
                 c = stdscr.getch()
+                if c == -1:
+                    continue
+                if c == ord("q"):
+                    break
+                if mode == "backends":
+                    if c in (ord("b"), 27, ord("c"), curses.KEY_LEFT):
+                        mode = "list"
+                elif mode == "artifacts":
+                    if c in (ord("b"), 27, ord("a"), curses.KEY_LEFT):
+                        mode = "list"
+                    elif c in (curses.KEY_DOWN, ord("j")):
+                        scroll += 1
+                    elif c in (curses.KEY_UP, ord("k")):
+                        scroll = max(0, scroll - 1)
+                elif mode == "list":
+                    if c in (curses.KEY_DOWN, ord("j")):
+                        sel = min(len(roles) - 1, sel + 1)
+                    elif c in (curses.KEY_UP, ord("k")):
+                        sel = max(0, sel - 1)
+                    elif c in (curses.KEY_ENTER, 10, 13, curses.KEY_RIGHT):
+                        if roles:  # (#9) roles 가 비어 있으면 roles[sel] IndexError 방지
+                            mode, detail_role, scroll, detail_follow = (
+                                "detail",
+                                roles[sel],
+                                0,
+                                True,
+                            )
+                    elif c == ord("a"):
+                        mode, scroll = "artifacts", 0
+                    elif c == ord("c"):
+                        mode = "backends"
+                    elif c == ord("s"):  # 정지 (실행 중일 때만)
+                        # #N03: 루프 상단에서 잡은 alive 는 getch() 대기 동안 stale 해질 수 있다
+                        # (run 이 그 사이 죽거나 새로 떴을 수 있음). 행동 직전에 재판정한다.
+                        alive = _run_alive(orch)
+                        if alive:
+                            status_msg = (
+                                "정지 요청됨 (SIGTERM→SIGKILL)" if _stop_run(orch) else "정지 실패"
+                            )
+                        else:
+                            status_msg = "이미 정지 상태"
+                    elif c == ord("r"):  # 재실행 (정지 상태에서만)
+                        # #N03: s 와 동일하게 stale alive 를 막기 위해 행동 직전 재판정한다.
+                        alive = _run_alive(orch)
+                        if alive:
+                            status_msg = "실행 중 — 먼저 s 로 정지하세요"
+                        else:
+                            _, status_msg = _rerun(orch)
+                else:  # detail: 기본은 최신 따라가기, ↑로 보면 멈춤, G 로 다시 따라가기
+                    if c in (ord("b"), 27, curses.KEY_LEFT):
+                        mode = "list"
+                    elif c in (curses.KEY_UP, ord("k")):
+                        detail_follow = False
+                        scroll = max(0, scroll - 1)
+                    elif c in (curses.KEY_DOWN, ord("j")):
+                        # (#8) follow off-by-one 방지: 직전 프레임의 stale max_scroll 대신
+                        #      현재 로그 기준으로 다시 계산한 max_scroll 로 판정한다.
+                        cur_max = _detail_max_scroll(stdscr, board, orch, detail_role)
+                        scroll = min(scroll + 1, cur_max)
+                        detail_follow = scroll >= cur_max  # 맨 아래 도달 시 다시 따라가기
+                    elif c in (ord("G"), curses.KEY_END):
+                        detail_follow = True
             except KeyboardInterrupt:
+                # (#12) board 읽기/draw 중 Ctrl-C 도 추한 traceback 없이 우아하게 종료한다
+                #       (예전엔 getch() 주위만 잡아 그 밖에서 발생하면 그대로 빠져나갔다).
                 break
-            if c == -1:
-                continue
-            if c == ord("q"):
-                break
-            if mode == "backends":
-                if c in (ord("b"), 27, ord("c"), curses.KEY_LEFT):
-                    mode = "list"
-            elif mode == "artifacts":
-                if c in (ord("b"), 27, ord("a"), curses.KEY_LEFT):
-                    mode = "list"
-                elif c in (curses.KEY_DOWN, ord("j")):
-                    scroll += 1
-                elif c in (curses.KEY_UP, ord("k")):
-                    scroll = max(0, scroll - 1)
-            elif mode == "list":
-                if c in (curses.KEY_DOWN, ord("j")):
-                    sel = min(len(roles) - 1, sel + 1)
-                elif c in (curses.KEY_UP, ord("k")):
-                    sel = max(0, sel - 1)
-                elif c in (curses.KEY_ENTER, 10, 13, curses.KEY_RIGHT):
-                    mode, detail_role, scroll, detail_follow = "detail", roles[sel], 0, True
-                elif c == ord("a"):
-                    mode, scroll = "artifacts", 0
-                elif c == ord("c"):
-                    mode = "backends"
-                elif c == ord("s"):  # 정지 (실행 중일 때만)
-                    if alive:
-                        status_msg = (
-                            "정지 요청됨 (SIGTERM→SIGKILL)" if _stop_run(orch) else "정지 실패"
-                        )
-                    else:
-                        status_msg = "이미 정지 상태"
-                elif c == ord("r"):  # 재실행 (정지 상태에서만)
-                    if alive:
-                        status_msg = "실행 중 — 먼저 s 로 정지하세요"
-                    else:
-                        _, status_msg = _rerun(orch)
-            else:  # detail: 기본은 최신 따라가기, ↑로 보면 멈춤, G 로 다시 따라가기
-                if c in (ord("b"), 27, curses.KEY_LEFT):
-                    mode = "list"
-                elif c in (curses.KEY_UP, ord("k")):
-                    detail_follow = False
-                    scroll = max(0, scroll - 1)
-                elif c in (curses.KEY_DOWN, ord("j")):
-                    scroll = min(scroll + 1, max_scroll)
-                    detail_follow = scroll >= max_scroll  # 맨 아래 도달 시 다시 따라가기
-                elif c in (ord("G"), curses.KEY_END):
-                    detail_follow = True
 
     curses.wrapper(_loop)
 
@@ -877,6 +1018,5 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    import sys
-
+    # #N04: sys 는 모듈 상단에서 이미 import 됨 → 중복 import 제거.
     sys.exit(main())

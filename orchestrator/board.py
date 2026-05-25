@@ -27,6 +27,16 @@ _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 _MAX_BODY_CHARS = 20000
 
 
+def _ts() -> str:
+    """이벤트/디렉티브/에이전트 블록용 타임스탬프.
+
+    예전에는 '%H:%M:%S' (시:분:초)만 써서 자정/장기 run 을 넘나들면 타임스탬프가
+    비-단조(non-monotonic)로 보였다. 날짜를 포함(ISO 8601, '%Y-%m-%d %H:%M:%S')해
+    여러 날에 걸친 로그도 정렬·진단이 가능하게 한다.
+    """
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _truncate_body(text: str) -> str:
     """본문을 _MAX_BODY_CHARS 로 잘라 '…(truncated)' 마커를 붙임 (runaway 파일 증가 방지)."""
     s = str(text)
@@ -195,6 +205,9 @@ class Board:
         self.events_path = self.orch_dir / "events.log"
         self.directives_path = self.orch_dir / "directives.md"
         self._lock = asyncio.Lock()
+        # events.log / directives.md 의 append-only 쓰기 전용 락. 무거운 _flush(fsync x2)를
+        # 잡는 self._lock 과 분리해, 로그/디렉티브 기록이 보드 변형과 직렬화 경합하지 않게 한다.
+        self._log_lock = asyncio.Lock()
         self._data: dict[str, Any] = {"units": [], "agents": {}}
         self.spec_text: str = ""
 
@@ -229,11 +242,48 @@ class Board:
             # 디렉터리 fsync 미지원 플랫폼/디렉터리는 조용히 건너뛴다 (atomic rename 자체는 유지됨).
             pass
 
+    @staticmethod
+    def _atomic_write_text(path: Path, text: str) -> None:
+        """report.md / DELIVERABLES*.md 를 원자적으로 기록 (temp→os.replace).
+
+        plain write_text 는 비-원자적이라 크래시/정전 시 부분 파일이 남을 수 있다. _flush 와
+        동일하게 같은 디렉터리에 tmp 로 쓰고 flush()+fsync 후 os.replace 로 교체한다.
+        """
+        tmp = path.with_name(path.name + ".tmp")
+        # #M07: 쓰기 도중 예외가 나면 stale .tmp 가 남는다. 어떤 예외든 tmp 를 정리한 뒤
+        # 재던지고, replace 성공 후에는 _flush 와 동일하게 상위 디렉터리도 fsync 해
+        # rename 메타데이터를 영속화한다 (best-effort, 미지원 플랫폼은 건너뜀).
+        try:
+            with tmp.open("w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())  # tmp 본문을 디스크에 강제 반영 (rename 전 내구성 확보)
+            os.replace(tmp, path)  # 원자적 교체
+        except BaseException:
+            tmp.unlink(missing_ok=True)  # stale tmp 제거 후 재던짐
+            raise
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            # 디렉터리 fsync 미지원 플랫폼/디렉터리는 조용히 건너뛴다 (atomic rename 자체는 유지됨).
+            pass
+
     async def init(self, spec_text: str, stack: dict) -> None:
         async with self._lock:
             self.orch_dir.mkdir(parents=True, exist_ok=True)
             self.results_dir.mkdir(parents=True, exist_ok=True)
             self.agents_dir.mkdir(parents=True, exist_ok=True)
+            # #H08: 재사용 project-dir 에서 이전 run 의 per-agent 로그가 누적되지 않도록 run 시작 시
+            # 비운다. 이후 backend tee 는 append 모드(PROMPT 블록·retry 로그 보존)로 쌓는다.
+            for _log in self.agents_dir.glob("*.log"):
+                try:
+                    _log.unlink()
+                except OSError:
+                    pass
             self._data = {
                 "created_at": time.time(),
                 "spec_excerpt": spec_text[:2000],
@@ -258,7 +308,9 @@ class Board:
         collision_warnings: list[str] = []
         skipped_warnings: list[str] = []
         async with self._lock:
-            existing = {u["id"] for u in self._data["units"]}
+            # 외부에서 board.json 이 손상돼 id 가 없는 unit 이 끼어 있어도 KeyError 로
+            # 단일 writer 가 죽지 않게 .get() 으로 안전하게 수집(손상 엔트리는 건너뜀).
+            existing = {uid for u in self._data["units"] if (uid := u.get("id"))}
             # 이번 호출에서 본 raw id(문자열화) 집합: 동일 raw 의 재투입은 진짜 중복 → skip.
             # str() 로 키를 만들어 dict/list/숫자 같은 비정상 입력에도 해시 안전하다.
             seen_raw: set[str] = set()
@@ -355,11 +407,13 @@ class Board:
         matched = False
         async with self._lock:
             for u in self._data["units"]:
-                if u["id"] == unit_id:
+                # 손상된 보드(id/notes 누락)에서도 KeyError 로 죽지 않게 .get() 사용
+                if u.get("id") == unit_id:
                     u["status"] = status
                     if note:
-                        u["notes"].append(note)
+                        u.setdefault("notes", []).append(note)
                     matched = True
+                    break  # id 는 유일하므로 매칭 후 즉시 종료
             self._flush()
         if matched:
             # 실제로 unit 이 갱신된 경우에만 상태 전이를 기록 (거짓 성공 방지)
@@ -378,11 +432,14 @@ class Board:
         matched = False
         async with self._lock:
             for u in self._data["units"]:
-                if u["id"] == unit_id:
+                # 손상된 보드(id/artifacts 누락)에서도 KeyError 로 죽지 않게 .get()/setdefault 사용
+                if u.get("id") == unit_id:
                     matched = True
+                    arts = u.setdefault("artifacts", [])
                     for a in clean:
-                        if a not in u["artifacts"]:
-                            u["artifacts"].append(a)
+                        if a not in arts:
+                            arts.append(a)
+                    break  # id 는 유일하므로 매칭 후 즉시 종료
             self._flush()
         if not matched:
             # 알 수 없는 unit id → 아티팩트가 조용히 사라지지 않도록 경고 기록
@@ -394,9 +451,11 @@ class Board:
         matched = False
         async with self._lock:
             for u in self._data["units"]:
-                if u["id"] == unit_id:
+                # 손상된 보드(id 누락)에서도 KeyError 로 죽지 않게 .get() 사용
+                if u.get("id") == unit_id:
                     u["test_status"] = test_status
                     matched = True
+                    break  # id 는 유일하므로 매칭 후 즉시 종료
             self._flush()
         if not matched:
             # 알 수 없는 unit id → 테스트 결과가 조용히 유실되지 않도록 경고 기록
@@ -436,7 +495,9 @@ class Board:
         if val < 0:
             return
         async with self._lock:
-            self._data["total_cost_usd"] = self._data.get("total_cost_usd", 0.0) + val
+            # 기존 저장값이 손상돼 비-숫자(문자열 등)면 TypeError 가 나므로 누적 전에 강제 변환
+            cur = _coerce_finite_float(self._data.get("total_cost_usd", 0.0))
+            self._data["total_cost_usd"] = cur + val
             self._flush()
 
     # ---- per-agent live state (for the monitor TUI) ----
@@ -474,7 +535,10 @@ class Board:
             )
             if status is not None:
                 a["status"] = status
-            if unit is not None or status == "running":
+            # #L11: current_unit 은 unit 이 실제로 주어졌을 때만 갱신한다. status=="running"
+            # 인데 unit 이 None 인 갱신(예: cost/메시지만 보내는 호출)이 진행 중인 unit 을
+            # 지우지 않도록 한다. 비우는 것은 terminal(non-running) 상태일 때만.
+            if unit is not None:
                 a["current_unit"] = unit
             elif status is not None and status != "running":
                 a["current_unit"] = None
@@ -487,7 +551,8 @@ class Board:
                 add = _coerce_finite_float(cost_add)
                 # per-agent 비용도 누적만 가능 → 음수는 무시(비용이 감소하지 않게)
                 if add > 0:
-                    a["cost_usd"] = a["cost_usd"] + add
+                    # 기존 저장값이 손상돼 비-숫자면 TypeError → 누적 전에 강제 변환
+                    a["cost_usd"] = _coerce_finite_float(a.get("cost_usd", 0.0)) + add
             if cost_est:
                 a["cost_est"] = True
                 self._data["cost_estimated"] = True
@@ -496,8 +561,11 @@ class Board:
                 add_t = _coerce_int(tokens_add)
                 # 토큰도 비용처럼 누적만 가능 → 음수는 no-op(per-agent/total 둘 다 감소 금지)
                 if add_t > 0:
-                    a["tokens"] = a.get("tokens", 0) + add_t
-                    self._data["total_tokens"] = self._data.get("total_tokens", 0) + add_t
+                    # 기존 저장값이 손상돼 비-정수(문자열 등)면 TypeError → 누적 전에 강제 변환
+                    a["tokens"] = _coerce_int(a.get("tokens", 0)) + add_t
+                    self._data["total_tokens"] = (
+                        _coerce_int(self._data.get("total_tokens", 0)) + add_t
+                    )
             if message is not None:
                 a["last_message"] = str(message)[:500]
             if call:
@@ -515,7 +583,8 @@ class Board:
     def _append_agent_log(self, role: str, text: str) -> None:
         self.agents_dir.mkdir(parents=True, exist_ok=True)
         with self._log_path(role).open("a", encoding="utf-8") as f:
-            f.write(f"{time.strftime('%H:%M:%S')} {text}\n")
+            # 날짜 포함 타임스탬프(자정/장기 run 넘나듦에도 단조 정렬 가능)
+            f.write(f"{_ts()} {text}\n")
 
     def write_agent_block(self, role: str, title: str, body: str) -> None:
         """프롬프트/결과 같은 상세 블록을 per-agent 로그에 기록 (실시간 상세 로그용)."""
@@ -524,10 +593,13 @@ class Board:
         # 단일 프롬프트/결과가 로그를 폭증시키지 않도록 본문 크기 제한
         body = _truncate_body(body)
         with self._log_path(role).open("a", encoding="utf-8") as f:
-            f.write(f"\n{bar}\n{time.strftime('%H:%M:%S')} {title}\n{bar}\n{body}\n")
+            # 날짜 포함 타임스탬프(자정/장기 run 넘나듦에도 단조 정렬 가능)
+            f.write(f"\n{bar}\n{_ts()} {title}\n{bar}\n{body}\n")
 
     def agents(self) -> dict:
-        return json.loads(json.dumps(self._data.get("agents", {}), default=str))
+        # #N01: snapshot() 과 일관되게 ensure_ascii=False (한글 등 비-ASCII 를 이스케이프하지
+        # 않아 round-trip 이 가볍고 동일 동작).
+        return json.loads(json.dumps(self._data.get("agents", {}), ensure_ascii=False, default=str))
 
     def agent_log_tail(self, role: str, n: int = 200) -> str:
         # 쓰기 경로와 동일하게 안전화된 파일명을 사용해 일관되게 읽기
@@ -541,8 +613,9 @@ class Board:
         """Write a human-readable run report to .orchestrator/report.md."""
         d = self._data
         units = d.get("units", [])
-        done = sum(1 for u in units if u["status"] in TERMINAL_OK)
-        failed = [u for u in units if u["status"] in (BLOCKED, FAILED)]
+        # 손상된 보드(status 누락)에서도 KeyError 로 리포트 작성이 깨지지 않게 .get() 사용
+        done = sum(1 for u in units if u.get("status") in TERMINAL_OK)
+        failed = [u for u in units if u.get("status") in (BLOCKED, FAILED)]
         warnings = d.get("warnings") or []
         if failed:
             result = f"❌ failed ({len(failed)} unit)"
@@ -573,13 +646,15 @@ class Board:
             "|----|--------|------|-----------|-------|",
         ]
         for u in units:
+            # 손상된 보드(id/status 누락)에서도 KeyError 로 죽지 않게 .get() 사용
             lines.append(
-                f"| {_md_cell(u['id'])} | {_md_cell(u['status'])} | "
+                f"| {_md_cell(u.get('id', ''))} | {_md_cell(u.get('status'))} | "
                 f"{_md_cell(u.get('test_status'))} | "
                 f"{len(u.get('artifacts', []))} | {_md_cell(u.get('title', ''))} |"
             )
         report = self.orch_dir / "report.md"
-        report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        # report.md 도 board.json 과 동일하게 원자적(temp→os.replace)으로 기록
+        self._atomic_write_text(report, "\n".join(lines) + "\n")
         return report
 
     def write_deliverables(self) -> list[str]:
@@ -591,7 +666,8 @@ class Board:
         """
         d = self._data
         units = d.get("units", [])
-        done = sum(1 for u in units if u["status"] in TERMINAL_OK)
+        # 손상된 보드(status 누락)에서도 KeyError 로 산출물 문서 작성이 깨지지 않게 .get() 사용
+        done = sum(1 for u in units if u.get("status") in TERMINAL_OK)
         artifacts = d.get("artifacts", [])
         docs_dir = self.project_dir / "docs"
         docs_dir.mkdir(parents=True, exist_ok=True)
@@ -599,8 +675,9 @@ class Board:
         def table(headers):
             out = ["| " + " | ".join(headers) + " |", "|" + "|".join(["---"] * len(headers)) + "|"]
             for u in units:
+                # 손상된 보드(id/status 누락)에서도 KeyError 로 죽지 않게 .get() 사용
                 out.append(
-                    f"| {_md_cell(u['id'])} | {_md_cell(u['status'])} | "
+                    f"| {_md_cell(u.get('id', ''))} | {_md_cell(u.get('status'))} | "
                     f"{_md_cell(u.get('test_status'))} | "
                     f"{len(u.get('artifacts', []))} | {_md_cell(u.get('title', ''))} |"
                 )
@@ -610,10 +687,10 @@ class Board:
             out = []
             for u in units:
                 if u.get("artifacts"):
-                    # id/title 이스케이프: LLM 제공 값이 마크다운 구조를 깨지 못하게
-                    out.append(f"### {_md_cell(u['id'])} — {_md_cell(u.get('title', ''))}")
+                    # id/title 이스케이프: LLM 제공 값이 마크다운 구조를 깨지 못하게(id 누락 방어)
+                    out.append(f"### {_md_cell(u.get('id', ''))} — {_md_cell(u.get('title', ''))}")
                     # 아티팩트도 최소한 개행을 중화해 문서 주입 방지
-                    out += [f"- {_md_cell(a)}" for a in u["artifacts"]]
+                    out += [f"- {_md_cell(a)}" for a in u.get("artifacts", [])]
                     out.append("")
             return out
 
@@ -661,10 +738,11 @@ class Board:
         # 파일이 없을 때만 보드 요약을 써서 항상 fallback 이 존재하도록 보장한다.
         en_path = docs_dir / "DELIVERABLES.md"
         ko_path = docs_dir / "DELIVERABLES.ko.md"
+        # board.json 과 동일하게 원자적(temp→os.replace)으로 기록(부분 파일 방지)
         if not en_path.exists():
-            en_path.write_text("\n".join(en) + "\n", encoding="utf-8")
+            self._atomic_write_text(en_path, "\n".join(en) + "\n")
         if not ko_path.exists():
-            ko_path.write_text("\n".join(ko) + "\n", encoding="utf-8")
+            self._atomic_write_text(ko_path, "\n".join(ko) + "\n")
         # 실제로 존재하는 경로만 반환(에이전트가 쓴 것이든 보드가 쓴 것이든 모두 포함).
         written: list[str] = []
         if en_path.exists():
@@ -684,8 +762,10 @@ class Board:
 
     # ---- logs / directives ----
     async def log_event(self, who: str, msg: str) -> None:
-        line = f"{time.strftime('%H:%M:%S')} [{who}] {msg}\n"
-        async with self._lock:
+        # 날짜 포함 타임스탬프(자정/장기 run 넘나듦에도 단조 정렬 가능)
+        line = f"{_ts()} [{who}] {msg}\n"
+        # 무거운 _flush 를 잡는 self._lock 과 분리된 _log_lock 사용(append 경합 제거)
+        async with self._log_lock:
             with self.events_path.open("a", encoding="utf-8") as f:
                 f.write(line)
 
@@ -695,8 +775,10 @@ class Board:
 
     async def append_directive(self, who: str, text: str) -> None:
         # 대량/이상 LLM 출력이 directives.md 를 무한히 키우지 않도록 본문 크기 제한
-        block = f"\n### {time.strftime('%H:%M:%S')} — {who}\n{_truncate_body(text)}\n"
-        async with self._lock:
+        # 날짜 포함 타임스탬프(자정/장기 run 넘나듦에도 단조 정렬 가능)
+        block = f"\n### {_ts()} — {who}\n{_truncate_body(text)}\n"
+        # 무거운 _flush 를 잡는 self._lock 과 분리된 _log_lock 사용(append 경합 제거)
+        async with self._log_lock:
             with self.directives_path.open("a", encoding="utf-8") as f:
                 f.write(block)
 
@@ -717,8 +799,11 @@ class Board:
             return ""
         text = chunk.decode("utf-8", errors="ignore")
         if start > 0:
-            # 줄 중간에서 시작했을 수 있으니 첫 불완전 줄은 버리고, 생략 사실을 명시한다.
+            # 줄 중간에서 시작했을 수 있으니 첫 불완전 줄은 버린다. 단, #L09: 청크 전체가
+            # 개행 없는 단일 >limit 블록이면 _tail_lines 처럼 통째로 버리지 말고 보존한다(빈
+            # 결과보다 불완전 tail 이 복구/진단에 유용).
             nl = text.find("\n")
-            text = text[nl + 1 :] if nl != -1 else ""
+            if nl != -1:
+                text = text[nl + 1 :]
             text = "…(오래된 directives 생략)\n" + text
         return text

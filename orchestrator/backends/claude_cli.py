@@ -7,7 +7,6 @@ ANTHROPIC_API_KEY 미설정 시 로그인된 구독을 사용한다. cwd 의 CLA
 from __future__ import annotations
 
 import json
-import os
 import shutil
 
 from .base import Backend, RoleRequest, RoleResult, run_subprocess
@@ -45,7 +44,10 @@ def claude_stream_line(line_bytes: bytes) -> str | None:
                 out.append("💭 [thinking redacted]")
         return "\n".join(out) or None
     if t == "result":
-        return f"✓ result (${o.get('total_cost_usd', 0)})"
+        # #10(audit9): total_cost_usd 가 없으면(구독 모드) '$0' 처럼 보여 '0달러 썼다'로 오인된다.
+        # 보고되지 않은 경우 '(n/a)' 로 표기해 '비용 미보고'와 '실제 0달러'를 구분한다.
+        c = o.get("total_cost_usd")
+        return f"✓ result (${c})" if c is not None else "✓ result (cost n/a)"
     return None
 
 
@@ -98,6 +100,32 @@ def budget_arg(value) -> str:
     return s
 
 
+# #1(audit9): 설치된 claude CLI 가 '--max-budget-usd' 플래그를 모르면 rc!=0 으로 깨진다
+# (구버전/배포판 차이). stderr 에서 '알 수 없는 옵션' 신호를 감지해, 그 플래그만 빼고 한 번
+# 재시도할 수 있게 한다. SDK 백엔드의 'dropped flag' graceful 메커니즘과 같은 취지.
+_UNKNOWN_OPTION_HINTS = (
+    "unknown option",
+    "unrecognized option",
+    "unrecognized argument",
+    "no such option",
+    "unexpected option",
+    "unknown argument",
+    "did you mean",
+)
+
+
+def _is_unknown_budget_flag_error(stderr: str) -> bool:
+    """stderr 가 '--max-budget-usd' 를 모르는 CLI 의 에러 신호를 담고 있으면 True.
+
+    플래그 이름과 'unknown/unrecognized/no such option' 류 힌트가 함께 보일 때만 True 로 판정해,
+    예산 초과 등 무관한 에러를 오인하지 않는다(보수적 매칭).
+    """
+    low = (stderr or "").lower()
+    if "--max-budget-usd" not in low and "max-budget-usd" not in low:
+        return False
+    return any(hint in low for hint in _UNKNOWN_OPTION_HINTS)
+
+
 class ClaudeCLIBackend(Backend):
     name = "claude-cli"
 
@@ -109,7 +137,7 @@ class ClaudeCLIBackend(Backend):
         return True, "binary present (auth NOT verified: 로그인 구독 또는 ANTHROPIC_API_KEY 필요)"
 
     async def run_role(self, req: RoleRequest) -> RoleResult:
-        cmd = [
+        base_cmd = [
             "claude",
             "-p",
             req.prompt,
@@ -124,12 +152,12 @@ class ClaudeCLIBackend(Backend):
             "acceptEdits",
         ]
         if req.model:
-            cmd += ["--model", req.model]
+            base_cmd += ["--model", req.model]
         # #24(#116): 검증 결과 설치된 claude CLI(v2.1.x)에는 '--max-budget-usd <amount>' 플래그가
         # 실재한다(-p/--print 전용). 따라서 req.budget 이 명시되면 per-call 예산 캡을 실제로
         # 전달해 강제한다. budget 미지정이면 추가하지 않는다(기존 동작 유지).
-        if req.budget is not None:
-            cmd += ["--max-budget-usd", budget_arg(req.budget)]
+        budget_flag = ["--max-budget-usd", budget_arg(req.budget)] if req.budget is not None else []
+        cmd = base_cmd + budget_flag
         # #25(#117): 그러나 동일 CLI 에 turn-limit 플래그(--max-turns 등)는 존재하지 않는다
         # (claude --help 로 검증: 0건). 없는 플래그를 넘기면 매 호출이 'unknown option'으로
         # 깨지므로 추가하지 않는다 — req.max_turns 강제는 이 백엔드에서 불가(KEEP-DOCUMENTED).
@@ -141,6 +169,26 @@ class ClaudeCLIBackend(Backend):
         except Exception as e:
             return RoleResult(ok=False, error=str(e))
 
+        # #1(audit9): 설치된 claude CLI 가 '--max-budget-usd' 를 모르면(구버전/배포판 차이) rc!=0 로
+        # 깨진다. stderr 가 '알 수 없는 옵션' 신호를 담으면, 그 플래그만 빼고 한 번 재시도한다
+        # (SDK 의 dropped-flag graceful 메커니즘과 동일 취지). 재시도해도 실패하면 그 결과를 쓴다.
+        if (
+            budget_flag
+            and not timed_out
+            and rc != 0
+            and _is_unknown_budget_flag_error(err.decode(errors="replace"))
+        ):
+            try:
+                rc, out, err, timed_out = await run_subprocess(
+                    base_cmd,
+                    str(req.cwd),
+                    req.timeout,
+                    req.live_log_path,
+                    line_render=claude_stream_line,
+                )
+            except Exception as e:
+                return RoleResult(ok=False, error=str(e))
+
         if timed_out:
             return RoleResult(ok=False, error=f"claude-cli timed out after {req.timeout}s")
         if rc != 0:
@@ -149,6 +197,10 @@ class ClaudeCLIBackend(Backend):
             return RoleResult(ok=False, error=err.decode(errors="replace")[-4000:] or f"exit {rc}")
 
         final, cost, model, tokens = parse_stream_result(out)
+        # #L14: cost_estimated 는 env var 가 아니라 CLI 가 실제로 total_cost_usd 를 보고했는지로
+        # 판정한다. parse_stream_result 가 cost 를 채웠으면(CLI 보고) 추정 아님, None 이면(미보고/
+        # 구독 모드 등) 추정으로 표기한다.
+        cost_estimated = cost is None
         if stream_result_has_error(out):
             return RoleResult(
                 ok=False,
@@ -157,7 +209,7 @@ class ClaudeCLIBackend(Backend):
                 cost_usd=cost,
                 model=model or req.model,
                 tokens=tokens,
-                cost_estimated=not os.environ.get("ANTHROPIC_API_KEY"),
+                cost_estimated=cost_estimated,
             )
         return RoleResult(
             ok=True,
@@ -165,5 +217,5 @@ class ClaudeCLIBackend(Backend):
             cost_usd=cost,
             model=model or req.model,
             tokens=tokens,
-            cost_estimated=not os.environ.get("ANTHROPIC_API_KEY"),  # 구독이면 추정치
+            cost_estimated=cost_estimated,  # CLI 미보고면 추정치
         )

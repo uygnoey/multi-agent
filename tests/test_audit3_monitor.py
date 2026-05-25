@@ -98,6 +98,30 @@ def test_rerun_argv_still_rejects_non_list_and_abspath():
     assert _validate_rerun_argv(["rm"])[0] is False  # 비플래그 첫 토큰
 
 
+# ---- #H01: --completion-level 화이트리스트 + enum 검증 ----
+def test_rerun_argv_allows_completion_level():
+    # production 빌드 rerun argv 에는 --completion-level 가 들어간다 → 거부되면 안 됨.
+    assert _validate_rerun_argv(["--spec", "s.md", "--completion-level", "production"])[0] is True
+    assert _validate_rerun_argv(["--completion-level", "mvp", "--mock"])[0] is True
+    assert _validate_rerun_argv(["--completion-level=production"])[0] is True
+
+
+def test_rerun_argv_rejects_bad_completion_level():
+    ok, why = _validate_rerun_argv(["--completion-level", "bogus"])
+    assert ok is False
+    assert "completion-level" in why
+
+
+# ---- #H02: --max-attempts 0 허용 (완주/무제한 모드는 기본값) ----
+def test_rerun_argv_allows_max_attempts_zero():
+    assert _validate_rerun_argv(["--spec", "s.md", "--max-attempts", "0"])[0] is True
+    assert _validate_rerun_argv(["--max-attempts=0", "--mock"])[0] is True
+    # 양의 정수도 여전히 허용.
+    assert _validate_rerun_argv(["--max-attempts", "3"])[0] is True
+    # 음수는 거부(0 이상 정수만).
+    assert _validate_rerun_argv(["--max-attempts", "-1"])[0] is False
+
+
 # ---------------- #40 생성 마커 기반 보존/갱신 ----------------
 
 

@@ -10,6 +10,7 @@ import asyncio
 import codecs
 import os
 import signal
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -86,7 +87,13 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None):
     f = None
     if log_path is not None:
         try:
+            # #H08: "w"(truncate)는 같은 파일(agents_dir/{role}.log)에 runner 가 백엔드 호출 직전
+            # 기록한 PROMPT 블록과 직전 retry/failover 로그까지 지워 장애 분석성을 떨어뜨린다.
+            # "a"(append)로 보존하되, 호출마다 구분자 헤더를 1줄 남겨 시도 경계를 표시한다.
+            # (재사용 project-dir 의 과거 run 로그는 board.init 이 run 시작 시 1회 비운다.)
             f = open(log_path, "a", encoding="utf-8")  # noqa: SIM115 (수동 close)
+            f.write(f"\n===== backend run @ {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+            f.flush()
         except Exception:
             f = None
 

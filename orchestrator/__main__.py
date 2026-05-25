@@ -43,6 +43,57 @@ def _pos_float(raw: str) -> float:
     return v
 
 
+def _nonneg_finite_float(raw: str) -> float:
+    """--timeout/--budget 검증: 유한하고 음수가 아닌 실수만 허용 (#audit9-16/17).
+
+    inf/NaN/음수를 CLI 단에서 친절히 거부한다. 0 은 유효(0=무제한/무비용 의미)하며 canonical
+    정규화는 RunConfig 가 수행한다(이중 정규화 제거: __main__ 에서 미리 손대지 않는다).
+    """
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"유한한 실수여야 합니다: {raw!r}") from None
+    if not math.isfinite(v) or v < 0:
+        raise argparse.ArgumentTypeError(f"0 이상의 유한한 값이어야 합니다: {raw!r}")
+    return v
+
+
+def _pos_int(raw: str) -> int:
+    """--concurrency 검증: 1 이상의 정수만 허용 (#audit9-17)."""
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"정수여야 합니다: {raw!r}") from None
+    if v < 1:
+        raise argparse.ArgumentTypeError(f"1 이상의 정수여야 합니다: {v}")
+    return v
+
+
+def _nonneg_int(raw: str) -> int:
+    """--max-attempts/--retries 검증: 0 이상의 정수만 허용 (#audit9-17). 0 은 유효(특수 의미)."""
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"정수여야 합니다: {raw!r}") from None
+    if v < 0:
+        raise argparse.ArgumentTypeError(f"0 이상의 정수여야 합니다: {v}")
+    return v
+
+
+def _pos_int_units(raw: str) -> int:
+    """--max-units 검증: 1 이상의 정수만 허용 (#audit9-17). 0/음수는 '전체'를 뜻하지만
+    CLI 로 명시한 0/음수는 실수일 가능성이 높아 거부한다(전체를 원하면 플래그 생략)."""
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"정수여야 합니다: {raw!r}") from None
+    if v < 1:
+        raise argparse.ArgumentTypeError(
+            f"1 이상의 정수여야 합니다(전체 처리는 --max-units 생략): {v}"
+        )
+    return v
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="orchestrator",
@@ -79,11 +130,20 @@ def parse_args(argv=None) -> argparse.Namespace:
         metavar="ROLE=B1[,B2,...]",
         help="역할별 백엔드(우선순위 리스트) override. 반복 가능",
     )
-    p.add_argument("--max-units", type=int, help="처리할 unit 수 상한")
-    p.add_argument("--concurrency", type=int, default=3, help="동시 처리 unit 수")
-    p.add_argument("--budget", type=float, help="세션당 예산(USD) 상한 (지원 백엔드)")
+    p.add_argument("--max-units", type=_pos_int_units, help="처리할 unit 수 상한 (1 이상)")
+    p.add_argument("--concurrency", type=_pos_int, default=3, help="동시 처리 unit 수 (1 이상)")
+    p.add_argument(
+        "--budget", type=_nonneg_finite_float, help="세션당 예산(USD) 상한 (지원 백엔드, 0 이상)"
+    )
     p.add_argument("--model", help="모델 override (미지정 시 백엔드 기본값)")
-    p.add_argument("--poll-interval", type=float, default=20.0, help="PM/PL 감독 주기(초)")
+    # #L15: 다른 수치 인자(--timeout/--budget)와 동일하게 inf/NaN/음수를 CLI 단에서 거부한다
+    # (poll-interval 은 0 이상 허용 → _nonneg_finite_float).
+    p.add_argument(
+        "--poll-interval",
+        type=_nonneg_finite_float,
+        default=20.0,
+        help="PM/PL 감독 주기(초)",
+    )
     p.add_argument(
         "--delegate",
         action="store_true",
@@ -107,14 +167,16 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument(
         "--max-attempts",
-        type=int,
+        type=_nonneg_int,
         default=0,
         help="unit별 dev→test→qa 재작업 상한. 0=고쳐질 때까지(기본)",
     )
-    p.add_argument("--retries", type=int, default=1, help="역할 호출 전이성 실패 재시도 횟수")
+    p.add_argument(
+        "--retries", type=_nonneg_int, default=1, help="역할 호출 전이성 실패 재시도 횟수 (0 이상)"
+    )
     p.add_argument(
         "--timeout",
-        type=float,
+        type=_nonneg_finite_float,
         default=1200.0,
         help="역할 호출 1회 최대 시간(초). 0=무제한 (기본 1200)",
     )
@@ -174,23 +236,7 @@ def build_config(a: argparse.Namespace) -> RunConfig:
         if role not in ROLES:
             raise SystemExit(f"알 수 없는 역할: {role} (가능: {', '.join(ROLES)})")
         role_priority[role] = _parse_backend_list(backends)
-    if a.cross_check and not a.mock:
-        # 교차검증 풀 = --backends + 역할핀(role_priority) 값 (RunConfig._cross_pool 동일 규칙).
-        # 풀의 distinct 백엔드가 2종 미만일 때만 경고한다(역할핀으로 2종이 되면 교차가 성립).
-        base_pool = backend_priority if backend_priority else [resolve(a.backend)]
-        pool = list(base_pool)
-        for picks in role_priority.values():
-            for p in picks:
-                if p not in pool:
-                    pool.append(p)
-        if len(set(pool)) < 2:
-            print(
-                "⚠️  --cross-check 는 백엔드가 2개 이상이어야 동작합니다 "
-                "(--backends 또는 --role-backend 로 2종 이상 지정). "
-                "지금은 교차 배치가 적용되지 않습니다.",
-                file=sys.stderr,
-            )
-    return RunConfig(
+    cfg = RunConfig(
         spec_path=a.spec.resolve(),
         project_dir=a.project_dir.resolve(),
         default_backend=resolve(a.backend),
@@ -210,8 +256,21 @@ def build_config(a: argparse.Namespace) -> RunConfig:
         completion_level=a.completion_level,
         max_attempts=a.max_attempts,
         retries=a.retries,
-        session_timeout=(a.timeout if a.timeout and a.timeout > 0 else None),
+        # RunConfig 가 canonical 정규화(0/음수/NaN→무제한)를 수행한다. 여기선 그대로 넘긴다.
+        session_timeout=a.timeout,
     )
+    if a.cross_check and not a.mock:
+        # 교차검증 풀 계산은 RunConfig._cross_pool 이 단일 소스다(#audit9-1). 동일 메서드를
+        # 재사용해 role_backend 포함 여부 등에서 backends_for 의 실제 동작과 절대 어긋나지 않게
+        # 한다. 풀의 distinct 백엔드가 2종 미만일 때만 경고한다(역할핀으로 2종이 되면 교차 성립).
+        if len(set(cfg._cross_pool())) < 2:
+            print(
+                "⚠️  --cross-check 는 백엔드가 2개 이상이어야 동작합니다 "
+                "(--backends 또는 --role-backend 로 2종 이상 지정). "
+                "지금은 교차 배치가 적용되지 않습니다.",
+                file=sys.stderr,
+            )
+    return cfg
 
 
 def _print_summary(snap: dict, cfg: RunConfig) -> None:
@@ -222,9 +281,10 @@ def _print_summary(snap: dict, cfg: RunConfig) -> None:
     for u in units:
         if not isinstance(u, dict):
             continue
+        # (#audit9-19) test_status 가 없으면 "None" 대신 빈칸으로 (보고 노이즈 제거).
         print(
             f"  {str(u.get('id', '?')):<6} {str(u.get('status', '?')):<11} "
-            f"test={str(u.get('test_status')):<5} {u.get('title', '')}"
+            f"test={str(u.get('test_status') or ''):<5} {u.get('title', '')}"
         )
     done = sum(1 for u in units if isinstance(u, dict) and u.get("status") in TERMINAL_OK)
     print(f"units       : {done}/{len(units)} done")
@@ -249,6 +309,16 @@ def _print_summary(snap: dict, cfg: RunConfig) -> None:
 
 def main(argv=None) -> int:
     a = parse_args(argv)
+    # (#audit9-18) 모드 플래그(--check/--web/--watch/일반 실행)는 상호 배타다. 예전엔 if-return
+    # 분기가 암묵적 우선순위(check>web>watch>run)로 동작해, 충돌 플래그를 주면 일부가 조용히
+    # 무시됐다(예: `--check --web` 은 web 무시). 둘 이상 켜졌으면 명확히 거부한다.
+    _modes = (("--check", a.check), ("--web", a.web), ("--watch", a.watch))
+    selected = [name for name, on in _modes if on]
+    if len(selected) > 1:
+        raise SystemExit(
+            f"모드 플래그는 동시에 쓸 수 없습니다: {', '.join(selected)} "
+            "(--check / --web / --watch / 일반 실행 중 하나만 선택하세요)."
+        )
     if a.check:
         return cmd_check()
     if a.web:
@@ -274,7 +344,19 @@ def main(argv=None) -> int:
         raise SystemExit(f"spec 파일을 찾을 수 없음: {a.spec}")
 
     cfg = build_config(a)
-    snap = asyncio.run(Scheduler(cfg).run())
+    # (#audit9-20) 최상위 실행을 감싸 KeyboardInterrupt(사용자 중단)는 친절히 130 으로,
+    # 그 외 예외는 raw traceback 대신 한 줄 메시지 + 비정상 종료(1)로 처리한다. (SystemExit 는
+    # 그대로 통과시켜 위의 사용성 에러 메시지/코드를 보존한다.)
+    try:
+        snap = asyncio.run(Scheduler(cfg).run())
+    except KeyboardInterrupt:
+        print("\n중단되었습니다 (KeyboardInterrupt).", file=sys.stderr)
+        return 130
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"실행 중 오류로 종료합니다: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
     _print_summary(snap, cfg)
     # 비정상 종료 코드(1) 조건 = report.md 의 result != ok 와 일치:
     #   - failed/blocked unit 이 하나라도 있거나

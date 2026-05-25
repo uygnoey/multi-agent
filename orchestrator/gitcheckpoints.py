@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shutil
 import subprocess
@@ -10,6 +11,9 @@ from pathlib import Path
 
 _FALLBACK_NAME = "dev-crew-orchestrator"
 _FALLBACK_EMAIL = "dev-crew-orchestrator@brillianttiger.io"
+_DEFAULT_COMMIT_MESSAGE = "orchestrator: checkpoint"
+
+_log = logging.getLogger(__name__)
 
 
 class GitCheckpointer:
@@ -38,25 +42,47 @@ class GitCheckpointer:
     def _run(self, *args: str, timeout: float = 30.0) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.setdefault("GIT_TERMINAL_PROMPT", "0")
-        return subprocess.run(
-            ["git", "-C", str(self.project_dir), *args],
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-            env=env,
-        )
+        cmd = ["git", "-C", str(self.project_dir), *args]
+        try:
+            return subprocess.run(
+                cmd,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as e:
+            # (#2) timeout 을 호출자마다 다르게(set() vs 전파) 처리하지 않도록 여기서 일관된
+            # "실패한 CompletedProcess" 로 변환한다. returncode != 0 이므로 모든 호출자가 동일하게
+            # 실패로 인식한다(RuntimeError 또는 best-effort set() 둘 다 정상 동작).
+            _log.warning("git %s timed out after %.1fs", " ".join(args), timeout)
+            return subprocess.CompletedProcess(
+                cmd,
+                returncode=124,  # GNU timeout 관례: 124 = timed out
+                stdout=e.stdout or "" if isinstance(e.stdout, str) else "",
+                stderr=f"git {' '.join(args)} timed out after {timeout}s",
+            )
 
     def _status_paths_best_effort(self) -> set[str]:
         if not self.enabled or not self.project_dir.exists():
             return set()
         try:
-            status = self._run("status", "--porcelain", "--untracked-files=all")
-        except Exception:
+            # (#1) -z 로 NUL 구분 출력을 받아 공백/한글/이스케이프 경로를 정확히 파싱한다.
+            status = self._run("status", "--porcelain", "-z", "--untracked-files=all")
+        except Exception as e:
+            # (#5) baseline 캡처 실패를 완전히 삼키지 않고 사유를 기록한다.
+            _log.warning("git status (baseline) failed: %s", e)
             return set()
         if status.returncode != 0:
+            # (#5) 실패 사유를 남긴다(예: timeout/권한). baseline 이 비어도 조용하진 않게.
+            _log.warning(
+                "git status (baseline) returned %s: %s",
+                status.returncode,
+                (status.stderr or status.stdout or "").strip(),
+            )
             return set()
-        return _parse_status_paths(status.stdout)
+        return _parse_status_paths_z(status.stdout)
 
     def _ensure_repo(self) -> None:
         if not shutil.which("git"):
@@ -91,10 +117,11 @@ class GitCheckpointer:
         self._run("config", "--local", "user.email", _FALLBACK_EMAIL)
 
     def _changed_paths(self, paths: list[str] | None = None) -> list[str]:
-        status = self._run("status", "--porcelain", "--untracked-files=all")
+        # (#1) -z 로 NUL 구분 출력 → 공백/한글/이스케이프 경로도 정확히 파싱(한글 파일명 흔함).
+        status = self._run("status", "--porcelain", "-z", "--untracked-files=all")
         if status.returncode != 0:
             raise RuntimeError((status.stderr or status.stdout or "git status failed").strip())
-        changed = _parse_status_paths(status.stdout) - self._baseline_paths
+        changed = _parse_status_paths_z(status.stdout) - self._baseline_paths
         selected = _normalize_paths(paths)
         if selected is not None:
             changed = {p for p in changed if any(p == s or p.startswith(s + "/") for s in selected)}
@@ -109,8 +136,16 @@ class GitCheckpointer:
         raise RuntimeError((diff.stderr or diff.stdout or "git diff --cached failed").strip())
 
     def _reset_paths(self, paths: list[str]) -> None:
+        # (#3) commit 실패 후 staging 롤백. reset 자체가 실패하면 staging 이 남아 다음
+        # 체크포인트를 오염시킬 수 있으므로, 조용히 무시하지 않고 사유를 기록한다.
         for chunk in _chunks(paths, 100):
-            self._run("reset", "-q", "--", *chunk)
+            reset = self._run("reset", "-q", "--", *chunk)
+            if reset.returncode != 0:
+                _log.warning(
+                    "git reset (rollback) failed for %d path(s): %s",
+                    len(chunk),
+                    (reset.stderr or reset.stdout or "").strip(),
+                )
 
     def _stageable_paths(self, paths: list[str]) -> list[str]:
         out: list[str] = []
@@ -137,7 +172,9 @@ class GitCheckpointer:
                 raise RuntimeError((add.stderr or add.stdout or "git add failed").strip())
         if not self._has_staged_changes():
             return False, "no changes"
-        commit = self._run("commit", "-m", message, timeout=60.0)
+        # (#4) 빈/공백뿐인 메시지는 git 에서 nondeterministic(에디터 호출/거부) → 기본값으로 대체.
+        commit_message = message if (message and message.strip()) else _DEFAULT_COMMIT_MESSAGE
+        commit = self._run("commit", "-m", commit_message, timeout=60.0)
         if commit.returncode != 0:
             self._reset_paths(paths)
             raise RuntimeError((commit.stderr or commit.stdout or "git commit failed").strip())
@@ -156,20 +193,38 @@ def _identity_from_env() -> bool:
     return all(os.environ.get(k) for k in keys)
 
 
-def _parse_status_paths(text: str) -> set[str]:
+def _parse_status_paths_z(text: str) -> set[str]:
+    """`git status --porcelain -z` 의 NUL 구분 출력을 파싱한다 (#1).
+
+    -z 모드는 각 엔트리를 NUL(\\0) 로 구분하고 경로를 인용/이스케이프하지 않으므로(원문 바이트
+    그대로), 공백·한글·따옴표가 든 파일명도 손실 없이 처리된다. 일반 엔트리는
+    'XY <path>\\0' 한 레코드지만, rename/copy(R/C) 는 'XY <new>\\0<orig>\\0' 처럼 *두 개*의 NUL
+    레코드로 나뉜다(둘째 레코드 앞에 status 코드가 없다). 따라서 토큰을 순차 소비하며 R/C 일
+    때만 다음 토큰을 origin 경로로 함께 추가한다.
+    """
     paths: set[str] = set()
-    for raw in text.splitlines():
-        if len(raw) < 4:
+    # 마지막 NUL 뒤의 빈 토큰은 버린다. (#N04: 무의미한 리스트 컴프리헨션 제거)
+    tokens = text.split("\0")
+    if tokens and tokens[-1] == "":
+        tokens.pop()
+    i = 0
+    n = len(tokens)
+    while i < n:
+        rec = tokens[i]
+        i += 1
+        if len(rec) < 4:
+            # 형식: 'XY <path>' — 'XY ' (3자) + 경로(>=1자). 너무 짧으면 손상 레코드로 보고 skip.
             continue
-        path = raw[3:]
-        if " -> " in path:
-            old, new = path.split(" -> ", 1)
-            if old:
-                paths.add(old)
-            if new:
-                paths.add(new)
-        elif path:
+        xy = rec[:2]
+        path = rec[3:]  # 'XY ' 다음부터가 경로(공백 포함 가능)
+        if path:
             paths.add(path)
+        # rename/copy 는 새 경로 레코드 다음 NUL 토큰에 원본 경로가 별도로 온다.
+        if ("R" in xy or "C" in xy) and i < n:
+            orig = tokens[i]
+            i += 1
+            if orig:
+                paths.add(orig)
     return paths
 
 

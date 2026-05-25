@@ -237,7 +237,9 @@ def test_dev_role_exception_marks_blocked(tmp_path, sample_spec_path):
 
 
 def test_pipeline_exception_does_not_skip_cleanup(tmp_path, sample_spec_path):
-    sched = _sched(tmp_path, sample_spec_path)
+    # max_attempts=2(유한): dev 가 영구 실패하면 retries 소진 후 FAILED 로 끝나야 검증 가능.
+    # 기본 0(제품 완주 모드)은 의도적으로 무한 수리라 영구 실패 시 종료하지 않는다(#C1).
+    sched = _sched(tmp_path, sample_spec_path, max_attempts=2)
 
     async def design_then_boom(role, unit=None):
         # architect 는 unit 2개 반환, dev 호출은 예외를 던진다.
@@ -264,7 +266,9 @@ def test_pipeline_exception_does_not_skip_cleanup(tmp_path, sample_spec_path):
 
 
 def test_failed_units_reflected_in_phase_and_warnings(tmp_path, sample_spec_path):
-    sched = _sched(tmp_path, sample_spec_path)
+    # max_attempts=2(유한): 영구 실패가 retries 소진 후 FAILED 로 수렴해야 phase/경고 검증 가능.
+    # 기본 0 은 완료까지 무한 수리이므로 영구 실패 시나리오를 종료시키지 않는다(#C1).
+    sched = _sched(tmp_path, sample_spec_path, max_attempts=2)
 
     async def design_then_fail(role, unit=None):
         if unit is None and role == "architecture-engineer":

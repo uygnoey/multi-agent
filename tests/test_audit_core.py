@@ -135,7 +135,9 @@ def test_runconfig_bad_int_does_not_raise(tmp_path):
     assert cfg.concurrency == 3
     assert cfg.max_attempts == 0
     assert cfg.retries == 1
-    assert cfg.max_units == 1
+    # (#audit9-2) malformed max_units 는 0/음수와 동일하게 None(무제한)으로 일관 정규화된다
+    # (예전엔 malformed→1, 0→None 로 정반대 의미였던 드리프트를 제거).
+    assert cfg.max_units is None
 
 
 def test_runconfig_clamps_out_of_range():

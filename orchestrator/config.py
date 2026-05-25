@@ -10,38 +10,73 @@ from pathlib import Path
 
 
 def _coerce_int(raw, default: int) -> int:
-    """정수로 변환하되 비-정수/None/이상값은 default 로 안전화 (raw ValueError 차단; #37)."""
+    """정수로 변환하되 비-정수/None/이상값은 default 로 안전화 (raw ValueError 차단; #37).
+
+    (#audit9-4) float 와 float-유사 문자열을 일관되게 처리한다: float 3.7 은 int() 가
+    3 으로 절단하지만 문자열 "3.7" 은 int("3.7") 가 ValueError 라 예전엔 default 로 빠졌다.
+    이제 직접 int 변환이 실패하면 float() → int() 로 한 번 더 시도해 "3.7" → 3 처럼
+    float 와 동일하게 절단한다. NaN/Inf 는 int() 가 던지므로 default 로 안전화된다.
+    """
     if isinstance(raw, bool):
         return default
     try:
         return int(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: int(float('inf')) 같은 비유한 float 직접 변환.
+        pass
+    # float-유사 문자열(예: "3.7")을 float 절단 의미로 일관 처리.
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
 def _coerce_optional_positive_int(raw) -> int | None:
-    """None/0/음수는 무제한, malformed 값은 안전하게 1개로 제한."""
+    """unit 처리 상한(max_units)을 정규화한다.
+
+    (#audit9-2) None/0/음수/malformed 를 모두 *동일하게* None(무제한)으로 정규화한다.
+    예전엔 malformed 문자열은 1(=1개로 제한)인데 명시적 0 은 None(무제한)이라 두 값이
+    정반대 의미였다 → 드리프트. 이제 "해석 불가하거나 양수가 아니면 제한 없음" 한 가지
+    규칙으로 통일한다. float/float-유사 문자열은 절단 후 양수일 때만 그 값을 쓴다.
+    """
     if raw is None:
         return None
+    if isinstance(raw, bool):
+        return None
+    iv: int | None = None
     try:
-        if isinstance(raw, bool):
-            return 1
         if isinstance(raw, int):
             iv = raw
         elif isinstance(raw, float):
-            if not math.isfinite(raw) or not raw.is_integer():
-                return 1
-            iv = int(raw)
+            iv = int(raw) if math.isfinite(raw) else None
         elif isinstance(raw, str):
             s = raw.strip()
-            if not re.fullmatch(r"[+-]?\d+", s):
-                return 1
-            iv = int(s)
-        else:
-            return 1
-    except Exception:
-        return 1
-    return iv if iv > 0 else None
+            if re.fullmatch(r"[+-]?\d+", s):
+                iv = int(s)
+            else:
+                # "3.7" 같은 float-유사 문자열도 절단 의미로 수용; 그 외는 무제한.
+                fv = float(s)  # 실패 시 ValueError → 아래 except 에서 None
+                iv = int(fv) if math.isfinite(fv) else None
+    except (TypeError, ValueError, OverflowError):
+        iv = None
+    if iv is None or iv <= 0:
+        return None
+    return iv
+
+
+def normalize_completion_level(value) -> str:
+    """완료 수준 문자열을 'mvp' 또는 'production' 으로 정규화 (단일 소스; #audit9-10).
+
+    config.RunConfig 와 prompts.compose_prompt 가 동일 규칙을 중복 구현하던 것을 한 곳으로
+    모은다. '_' → '-' 치환 후 prod/production-ready 별칭을 production 으로 접고, 알 수 없는
+    값은 안전 기본값 'mvp' 로 떨어진다.
+    """
+    level = str(value or "mvp").strip().lower().replace("_", "-")
+    if level in ("prod", "production-ready"):
+        level = "production"
+    if level not in ("mvp", "production"):
+        level = "mvp"
+    return level
 
 
 # 프레임워크 저장소 루트 (이 파일 = orchestrator/config.py)
@@ -284,14 +319,9 @@ class RunConfig:
         self.concurrency = min(64, max(1, _coerce_int(self.concurrency, 3)))
         self.max_attempts = min(20, max(0, _coerce_int(self.max_attempts, 0)))
         self.retries = min(20, max(0, _coerce_int(self.retries, 1)))
-        if self.max_units is not None:
-            self.max_units = _coerce_optional_positive_int(self.max_units)
-        level = str(self.completion_level or "mvp").strip().lower().replace("_", "-")
-        if level in ("prod", "production-ready"):
-            level = "production"
-        if level not in ("mvp", "production"):
-            level = "mvp"
-        self.completion_level = level
+        # None/0/음수/malformed 는 모두 None(무제한)으로 일관 정규화 (#audit9-2).
+        self.max_units = _coerce_optional_positive_int(self.max_units)
+        self.completion_level = normalize_completion_level(self.completion_level)
         # poll_interval 을 안전 하한으로 클램프 (#33). 웹은 poll_interval=0 을 허용하는데,
         # 0/음수/비-숫자/이상값이 그대로 _supervise 의 asyncio.wait_for 로 들어가면 PM/PL 감독이
         # tight busy-loop 를 돌며 CPU 를 태우고 비싼 LLM 호출을 반복한다. 0/음수는 안전 바닥(5초)
@@ -314,6 +344,11 @@ class RunConfig:
         # (#8) budget: NaN/Inf 는 비교를 무력화한다(예: committed >= nan 은 항상 False 라 예산
         # enforcement 가 조용히 꺼진다). 비유한/비-숫자 예산은 None(예산 없음)으로 정규화해
         # "깨진 예산 = 예산 없음" 을 명시적으로 만든다. 웹 검증과 더불어 방어적 2중 가드.
+        #
+        # (#audit9-3) budget<=0 은 None(비활성)으로 *바꾸지 않고* 유한값 그대로 보존한다.
+        # 0/음수는 "첫 호출부터 모든 비용을 차단" 하는 유효한 의도(예: 무비용 강제)로 보며,
+        # 기존 계약(test_audit5_config.test_budget_finite_value_preserved: 0.0→0.0)과 일치시킨다.
+        # 깨진 예산(NaN/Inf/비-숫자)만 None 으로 안전화한다.
         if self.budget is not None:
             try:
                 if isinstance(self.budget, bool):
@@ -396,6 +431,10 @@ class RunConfig:
         # 정규화 과정에서 발생한 경고를 보존(웹/CLI 에서 노출 가능). raise 하지 않는다.
         self.backend_warnings = warnings
 
+    def _base_pool(self) -> list[str]:
+        """교차/분산의 기준이 되는 base 백엔드 목록 (backend_priority 우선, 없으면 단일 기본)."""
+        return list(self.backend_priority) if self.backend_priority else [self.default_backend]
+
     def backends_for(self, role: str) -> list[str]:
         """역할에 대한 백엔드 후보를 우선순위 순서로 반환 (폴오버용)."""
         if self.mock:
@@ -404,9 +443,10 @@ class RunConfig:
             return list(self.role_priority[role])
         if role in self.role_backend:
             return [self.role_backend[role]]
-        base = list(self.backend_priority) if self.backend_priority else [self.default_backend]
+        base = self._base_pool()
         if self.cross_check:
-            # 풀을 역할별 선택값까지 합쳐 추론 (예: 기본 claude + QA=codex → {claude, codex})
+            # 풀을 역할별 선택값까지 합쳐 추론 (예: 기본 claude + QA=codex → {claude, codex}).
+            # _cross_pool 이 교차 풀 계산의 단일 소스다(backends_for·__main__ 경고 공용; #audit9-1).
             pool = self._cross_pool(base)
             if len(pool) >= 2:
                 # 핀(role_priority/role_backend)은 위에서 early-return. 여기 오는 역할은
@@ -428,13 +468,19 @@ class RunConfig:
         """역할이 명시적으로 핀되었는지 여부 (role_priority 또는 레거시 role_backend; #138)."""
         return bool(self.role_priority.get(role)) or role in self.role_backend
 
-    def _cross_pool(self, base: list[str]) -> list[str]:
+    def _cross_pool(self, base: list[str] | None = None) -> list[str]:
         """교차 배치용 백엔드 풀 = base + 역할별 명시 선택값(중복 제거, 순서 유지).
 
         단일 백엔드 + 일부 역할만 지정한 경우에도 교차가 성립하도록 풀을 넓힌다.
         role_priority 뿐 아니라 레거시 role_backend(역할별 단일 핀)도 풀에 포함해
         프로그래매틱 호출부(role_backend)와 CLI/웹(role_priority)의 교차 분포를 일치시킨다 (#137).
+
+        (#audit9-1) 교차 풀 계산의 *단일 소스*다. base 를 생략하면 self._base_pool() 을 쓰므로
+        __main__ 의 --cross-check 경고도 이 메서드를 재사용해 role_backend 포함 여부 등에서
+        backends_for 와 절대 어긋나지 않는다.
         """
+        if base is None:
+            base = self._base_pool()
         pool = list(base)
         for picks in self.role_priority.values():
             for p in picks:
@@ -450,4 +496,6 @@ class RunConfig:
 
     def model_for(self, backend: str) -> str | None:
         # 명시 모델만 전달. 미지정 시 각 백엔드 기본값을 쓰도록 None.
+        # (#audit9-5) `backend` 인자는 의도적으로 무시한다(현재는 전역 단일 모델). 호출부가 항상
+        # 백엔드명을 넘기므로 시그니처는 유지 — 향후 백엔드별 모델 분기를 위한 forward-compat 훅.
         return self.model

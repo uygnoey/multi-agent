@@ -119,7 +119,9 @@ def test_print_summary_numeric_cost_formatted(tmp_path, sample_spec_path, capsys
 
 
 def test_broken_build_runs_cicd_docs_but_phase_failed(tmp_path, sample_spec_path):
-    cfg = _cfg(tmp_path, sample_spec_path)
+    # max_attempts=2(유한): 영구 실패 dev 가 retries 소진 후 FAILED 로 수렴해야 phase=failed 를
+    # 검증할 수 있다. 기본 0(제품 완주 모드)은 완료까지 무한 수리라 종료하지 않는다(#C1).
+    cfg = _cfg(tmp_path, sample_spec_path, max_attempts=2)
     sched = Scheduler(cfg)
 
     ran: list[str] = []
