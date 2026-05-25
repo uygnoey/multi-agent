@@ -48,6 +48,11 @@ class ClaudeTeamBackend(Backend):
             "--permission-mode",
             "acceptEdits",
         ]
+        # #audit18(A6): claude_cli 와 달리 claude_team 은 역할 system_prompt 를 전혀 전달하지 않아
+        # 제약·출력 계약 등 역할 지침이 유실됐다. claude_cli 와 동일하게 --append-system-prompt 로
+        # 리드 세션에 주입한다(서브에이전트 dispatch 맥락에도 역할 지침이 반영되게).
+        if req.system_prompt:
+            base_cmd += ["--append-system-prompt", req.system_prompt]
         if req.model:
             base_cmd += ["--model", req.model]
         # #24(#116): 검증 결과 설치된 claude CLI(v2.1.x)에는 '--max-budget-usd' 플래그가 실재한다

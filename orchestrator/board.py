@@ -607,15 +607,12 @@ class Board:
             self._flush()
 
     async def add_cost(self, amount: float) -> None:
-        # NaN/Inf 같은 비정상 float 는 JSON 에 NaN/Infinity 로 새지 않도록 무시 (0 처리)
-        try:
-            val = float(amount)
-        except (TypeError, ValueError):
-            return
-        if not math.isfinite(val):
-            return
-        # 비용은 누적만 가능하며 절대 감소하면 안 됨 → 음수 입력은 무시(0 처리)
-        if val < 0:
+        # #audit18(A8): _coerce_finite_float 로 정규화한다 — bool/NaN/Inf/비-숫자는 0.0.
+        # 예전 bare float(amount) 는 float(True)==1.0 이라 add_cost(True) 가 $1.00 을 누적했다
+        # (agent_update 경로는 audit17 N3 로 막혔는데 총비용 누적기만 누락됐다). 비용은 누적만
+        # 가능하므로 음수/0(=정규화 실패 포함)은 no-op.
+        val = _coerce_finite_float(amount)
+        if val <= 0:
             return
         async with self._lock:
             # 기존 저장값이 손상돼 비-숫자(문자열 등)면 TypeError 가 나므로 누적 전에 강제 변환

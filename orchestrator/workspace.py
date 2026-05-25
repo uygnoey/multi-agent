@@ -312,10 +312,11 @@ def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
     gi = project_dir / ".gitignore"
     _guard_managed_path(project_dir, gi, allow_unsafe=allow_unsafe, label=".gitignore")
     if gi.exists():
-        # #audit16: 기존 .gitignore 가 비-UTF8(예: Latin-1/이진)이면 read_text 가
-        # UnicodeDecodeError 로 scaffold 전체를 중단시켰다. 관리 템플릿(위)과 동일하게
-        # errors="replace" 로 견고하게 읽는다(시드 패턴 추가는 라인 단위라 영향 없음).
-        cur = gi.read_text(encoding="utf-8", errors="replace")
+        # #audit16/#audit18(A4): 기존 .gitignore 를 *바이트*로 읽는다. 비교용으로만 디코드하고
+        # 원본 바이트는 절대 다시 쓰지 않는다. (audit16 의 errors="replace" + write_text 는 crash 는
+        # 막았지만 비-UTF8 바이트를 �(U+FFFD)로 치환해 사용자 .gitignore 를 손상시켰다.)
+        raw = gi.read_bytes()
+        cur = raw.decode("utf-8", errors="replace")
         # 라인 단위로 실제 ignore 패턴을 확인 (주석/부분일치 오인 방지; #92)
         existing = {ln.strip() for ln in cur.splitlines()}
         # 시드 블록을 통째로 붙이면 이미 있는 패턴(node_modules/, .venv/ 등)이 중복된다 (#21).
@@ -327,6 +328,10 @@ def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
             if pat.strip() and pat.strip() not in existing
         ]
         if missing:
-            gi.write_text(cur.rstrip() + "\n" + "\n".join(missing) + "\n", encoding="utf-8")
+            # 원본 바이트는 보존하고 누락 시드만 바이너리로 append (디코드 재기록 금지).
+            prefix = b"" if (not raw or raw.endswith(b"\n")) else b"\n"
+            addition = prefix + ("\n".join(missing) + "\n").encode("utf-8")
+            with gi.open("ab") as f:
+                f.write(addition)
     else:
         gi.write_text(_GITIGNORE_SEED, encoding="utf-8")

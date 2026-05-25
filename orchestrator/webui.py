@@ -529,6 +529,23 @@ class RunManager:
             running = sum(
                 1 for proc in self._procs.values() if getattr(proc, "poll", lambda: None)() is None
             )
+            # #audit18(A5): 서버 재시작 후 _procs 가 비어도 디스크 pidfile 로 살아있는 외부 run 은
+            # cap 에 포함해야 한다. 안 그러면 재시작마다 cap 이 0 으로 리셋돼 반복 POST 로 프로세스/
+            # 디스크를 고갈시킬 수 있다(cap 의 목적 무력화). _procs 에 없는 live run 만 합산한다.
+            tracked = set(self._procs)
+            try:
+                base = self.base_dir
+                entries = list(base.iterdir()) if base.exists() else []
+            except OSError:
+                entries = []
+            for d in entries:
+                try:
+                    if d.name in tracked or not d.is_dir():
+                        continue
+                    if self._run_alive_cached(d / ".orchestrator"):
+                        running += 1
+                except OSError:
+                    continue
             if running >= self.max_running:
                 raise RuntimeError(f"too many active runs ({running}/{self.max_running})")
             project.mkdir(parents=True, exist_ok=True)

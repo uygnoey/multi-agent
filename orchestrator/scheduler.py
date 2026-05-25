@@ -101,7 +101,12 @@ class Scheduler:
         # #audit15: 외부장애(Tier A) 반복 카운터 — escalation 시그니처(source 포함)와 분리한다.
         # source 가 시그니처에 들어가면 te↔qa 교대 외부장애가 count 를 매번 리셋해 자동중단
         # (>=2)이 안 터지던 회귀를 막기 위해, 외부장애 반복은 source 무관 별도 카운터로 센다.
+        # #audit18(A1): verify(test/qa)용 외부장애 카운터.
         self._external_repeat: dict[str, int] = {}
+        # #audit18(A1): dev 수리(_dev_repair_loop)용 외부장애 카운터를 verify 와 *분리*한다.
+        # 예전엔 둘이 같은 _external_repeat 를 공유해, _test_unit 내부 dev 재작업이 남긴
+        # dev-외부장애 카운트가 verify 루프로 새어(첫 verify 외부장애 1회로 >=2) 조기 BLOCK 했다.
+        self._dev_external_repeat: dict[str, int] = {}
         # test/qa 동시성 캡: dev 와 별개로 test-engineer+qa 호출을 묶는 세마포어.
         # dev 슬롯(sem)만 캡되어 있고 test/qa 는 unit 마다 자유 태스크로 떠서, unit 이 많으면
         # 동시 백엔드 세션이 폭증할 수 있었다(과금/리소스). concurrency 에서 크기를 끌어와
@@ -622,7 +627,8 @@ class Scheduler:
         self._verify_failure_signatures.pop(uid, None)
         self._dev_failure_signatures.pop(uid, None)
         self._last_dev_failure.pop(uid, None)
-        self._external_repeat.pop(uid, None)  # #audit15: 외부장애 카운터도 함께 정리
+        self._external_repeat.pop(uid, None)  # #audit15: verify 외부장애 카운터
+        self._dev_external_repeat.pop(uid, None)  # #audit18(A1): dev 외부장애 카운터도 함께 정리
 
     @staticmethod
     def _escalation_text(count: int, label: str) -> str | None:
@@ -740,15 +746,15 @@ class Scheduler:
                 await self.board.add_warning(f"{uid}: 재작업 직전 의존성 붕괴 → blocked: {broken}")
                 return None
             # #H09/#audit16: 고신뢰 외부/영구 장애가 반복되면(코드 수리 불가) external 로 분류·중단.
-            # test/qa 경로(#audit15)와 동일하게, escalation 시그니처(failure_kind/command 진동에
-            # 취약)와 분리된 별도 _external_repeat 카운터로 센다. 그래야 tool_missing 같은
-            # 외부장애가 매 시도 command 가 달라져도 카운트 리셋 없이 자동중단(>=2)이 발화한다.
+            # #audit18(A1): verify 와 분리된 dev 전용 카운터(_dev_external_repeat)로 센다. 그래야
+            # dev 재작업의 외부장애가 verify 카운터로 새지 않는다(조기 BLOCK 방지). failure_kind/
+            # command 진동에도 source 무관 카운터라 자동중단(>=2)은 정상 발화한다.
             ext = self._external_blocker_reason([self._last_dev_failure.get(uid, {})])
             if ext:
-                ext_repeat = self._external_repeat.get(uid, 0) + 1
-                self._external_repeat[uid] = ext_repeat
+                ext_repeat = self._dev_external_repeat.get(uid, 0) + 1
+                self._dev_external_repeat[uid] = ext_repeat
             else:
-                self._external_repeat.pop(uid, None)
+                self._dev_external_repeat.pop(uid, None)
                 ext_repeat = 0
             if ext and ext_repeat >= 2:
                 self._clear_failure_state(uid)  # #RA5: terminal(BLOCKED) → 시그니처 정리
@@ -759,6 +765,10 @@ class Scheduler:
                 return None
             await self.board.log_event(uid, f"dev 재작업 → attempt {next_attempt}")
             if await self._develop_unit(repair_unit, sem, next_attempt):
+                # #audit18(A1): dev 성공 = 진전 → dev 외부장애 카운터를 비워 다음 dev 수리(또는
+                # verify 루프 복귀)로 누수되지 않게 한다. verify 카운터(_external_repeat)는 별도라
+                # 영향 없음(te↔qa 누적·중단은 audit15 그대로 유지).
+                self._dev_external_repeat.pop(uid, None)
                 return repair_unit
             escalation = self._escalation_note(uid)
             if escalation:
@@ -794,11 +804,13 @@ class Scheduler:
         밖에서 수행해 두 세마포어를 중첩 점유하지 않는다.
         """
         uid = unit["id"]
-        # #audit17(R1): dev→test 경계에서 외부장애 debounce 카운터를 리셋한다. dev 수리 중 쌓인
-        # ext_repeat(예: 1)가 검증 단계로 새어 test 첫 외부장애 1회만으로 >=2 거짓 BLOCK 하던
-        # 회귀(audit16)를 막는다. 검증 루프 내부의 dev 재작업은 이 값을 건드리지 않으므로,
-        # te↔qa 교대 외부장애의 정상 누적·중단(audit15)은 그대로 유지된다.
+        # #audit17(R1)/#audit18(A1): dev→test 경계에서 외부장애 카운터를 리셋한다. verify 카운터
+        # (_external_repeat)는 진입 시 0 에서 시작하고, dev 카운터(_dev_external_repeat)도 비워
+        # 직전 dev 단계의 잔여가 남지 않게 한다. audit18 에서 두 카운터를 분리했으므로 검증 루프
+        # 내부의 dev 재작업(_dev_repair_loop)은 verify 카운터를 건드리지 않는다 → te↔qa 교대
+        # 외부장애 누적·중단(audit15)은 유지하면서, dev→verify 누수로 인한 조기 BLOCK 은 사라진다.
         self._external_repeat.pop(uid, None)
+        self._dev_external_repeat.pop(uid, None)
         target = unit  # 검증 대상 (실패 시 repair_context 가 붙은 unit 으로 갱신)
         skip_te_once = False  # test/config 재작업 직후엔 te 를 생략하고 바로 qa
         while True:

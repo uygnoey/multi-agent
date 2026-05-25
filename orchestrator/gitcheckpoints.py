@@ -62,6 +62,13 @@ class GitCheckpointer:
     def _run(self, *args: str, timeout: float = 30.0) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.setdefault("GIT_TERMINAL_PROMPT", "0")
+        # #audit18(A2): GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE 가 호출 환경(git hook·래퍼 등)에서
+        # 설정돼 있으면 `git -C project_dir` 가 그 env 의 *다른* repo 에서 동작해 무관 저장소를
+        # 오염시키고 nested-repo 가드(rev-parse --show-toplevel)까지 무력화한다. -C 는 이 env 들을
+        # 덮지 못하므로 명시적으로 제거한다. GIT_CONFIG_NOSYSTEM=1 로 시스템 config 영향도 차단.
+        for _var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY"):
+            env.pop(_var, None)
+        env.setdefault("GIT_CONFIG_NOSYSTEM", "1")
         cmd = ["git", "-C", str(self.project_dir), *args]
         try:
             return subprocess.run(

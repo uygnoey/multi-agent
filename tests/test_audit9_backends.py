@@ -521,23 +521,26 @@ def test_mock_architecture_units_no_broken_markdown(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-# #RA-sdkre: 알려진 포인트 버전(4.1/4.5)은 폴백하되, 알 수 없는 미래 포인트 버전은 조용히
-# base 단가로 매핑하지 않고 None 으로 둔다.
+# #RA-sdkre/#audit18(A7): 단일 포인트 릴리스(-1/-5/-7 등)는 base 패밀리 단가로 폴백하고,
+# 다중 세그먼트 garbage(날짜가 아닌 추가 -\d)는 None 으로 둔다.
 def test_anthropic_price_suffix_limits_point_version_segments():
-    # 현행 ID(알려진 포인트 + 선택적 날짜)는 base 단가로 폴백한다.
+    # 현행 ID(포인트 + 선택적 날짜)는 base 단가로 폴백한다.
     assert sdk_mod._anthropic_price_for("claude-opus-4-1") == (15.0, 75.0)
     assert sdk_mod._anthropic_price_for("claude-opus-4-1-20250805") == (15.0, 75.0)
     assert sdk_mod._anthropic_price_for("claude-sonnet-4-5") == (3.0, 15.0)
     assert sdk_mod._anthropic_price_for("claude-sonnet-4-5-20250929") == (3.0, 15.0)
-    # 알려지지 않은 미래 포인트 변형은 폴백하지 않는다 → None.
-    assert sdk_mod._anthropic_price_for("claude-opus-4-2") is None
+    # #audit18(A7): 임의 단일 포인트 릴리스(-2/-7)도 이제 base 단가로 폴백(현행 -7 모델 커버).
+    # 예전엔 -1/-5 만 허용해 claude-opus-4-7 비용이 None 으로 떨어졌다.
+    assert sdk_mod._anthropic_price_for("claude-opus-4-2") == (15.0, 75.0)
+    assert sdk_mod._anthropic_price_for("claude-opus-4-7") == (15.0, 75.0)
+    # 다중 세그먼트 garbage 는 여전히 폴백하지 않는다 → None.
     assert sdk_mod._anthropic_price_for("claude-opus-4-2-3") is None
     assert sdk_mod._anthropic_price_for("claude-opus-4-2-3-4") is None
     assert sdk_mod._anthropic_price_for("claude-opus-4-2-3-4-20260101") is None
-    # 접미사 정규식 자체도 직접 검증(known point 만 허용).
+    # 접미사 정규식 자체도 직접 검증(단일 포인트 허용, 다중 세그먼트 거부).
     assert sdk_mod._ANTHROPIC_DATE_SUFFIX.match("-1")
     assert sdk_mod._ANTHROPIC_DATE_SUFFIX.match("-5-20250101")
-    assert not sdk_mod._ANTHROPIC_DATE_SUFFIX.match("-2")
+    assert sdk_mod._ANTHROPIC_DATE_SUFFIX.match("-7")  # #audit18(A7): 이제 매칭
     assert not sdk_mod._ANTHROPIC_DATE_SUFFIX.match("-1-2-3")
 
 

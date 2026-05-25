@@ -8,6 +8,7 @@ run.pid 에 pid 와 함께 '시작 시각 토큰'을 저장해, OS 가 같은 pi
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import threading
@@ -47,11 +48,16 @@ def _compute_start_token(pid: int) -> str:
             fields = txt[close + 2 :].split()
             # state 가 인덱스 0(=3번째 필드)이므로 starttime(22번째)은 인덱스 19.
             return fields[19] if len(fields) > 19 else ""
+        # #audit18(A3): `ps -o lstart=` 출력은 로케일 의존(예: ko_KR "2026년 5월 26일…" vs
+        # C "Tue May 26…"). writer(스케줄러)와 reader(webui/monitor)의 로케일이 다르거나 중간에
+        # 바뀌면 토큰이 불일치해 pid_is_ours 가 자기 run 을 못 알아보고 stop 이 동작하지 않는다.
+        # LC_ALL=C 로 고정해 로케일 무관 안정 토큰을 만든다.
         out = subprocess.run(
             ["ps", "-o", "lstart=", "-p", str(pid)],
             capture_output=True,
             text=True,
             timeout=2,
+            env={**os.environ, "LC_ALL": "C"},
         )
         if out.returncode == 0:
             return out.stdout.strip()

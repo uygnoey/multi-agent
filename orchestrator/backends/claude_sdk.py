@@ -39,12 +39,13 @@ _ANTHROPIC_FALLBACK_PRICING = {
 # 버전 세그먼트를 최대 2개(`{0,2}`)로 제한해, 현행 ID(메이저·마이너 2단계)는 폴백하되 그 이상의
 # 미지 변형은 매칭에서 빠져 None(허위 비용 날조 금지)으로 떨어지게 한다.
 _ANTHROPIC_DATE_SUFFIX = re.compile(
-    # exact base ("") / dated base ("-20250805") / known point-release forms:
-    # - "-1" / "-1-20250805" for opus 4.1 style IDs
-    # - "-5" / "-5-20250929" for sonnet 4.5 style IDs
-    # Unknown bare point releases such as "-2" intentionally do not match; returning
-    # None is safer than silently applying an old base price to a potentially different SKU.
-    r"^(?:-(?:\d{6,8}|latest)|-(?:1|5)(?:-(?:\d{6,8}|latest))?)?$"
+    # #audit18(A7): 포인트 릴리스를 `-\d+` 로 확장한다. 예전엔 `-(?:1|5)` 만 허용해 현행 모델
+    # ID(claude-opus-4-7 / claude-sonnet-4-7 등)가 매칭에서 빠져 비용 추정이 None 으로 떨어졌다.
+    # 매칭 형태: exact base ("") / dated base ("-20250805"|"-latest") / 포인트 릴리스("-7",
+    # "-7-20250805"). 위험: 단가가 다른 미래 SKU 까지 base 패밀리 단가로 매핑할 수 있으나, 같은
+    # 패밀리 베이스 단가는 합리적 근사이고 None(추정 불가)보다 유용하다. 정확한 단가가 필요한
+    # 포인트 릴리스는 _ANTHROPIC_PRICES 에 명시 키를 추가하면 그 키가 우선한다.
+    r"^(?:-(?:\d{6,8}|latest)|-\d+(?:-(?:\d{6,8}|latest))?)?$"
 )
 
 
