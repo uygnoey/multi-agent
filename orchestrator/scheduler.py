@@ -62,6 +62,10 @@ _EXTERNAL_TIER_A_KINDS = {
     "permission_denied",
     "sandbox_unavailable",
 }
+# #RA3: 원문 텍스트 매칭은 '고신뢰 인증/키 부재' 신호로만 좁힌다. "command not found"(vite/pytest
+# 등 고칠 수 있는 의존성·스크립트 문제), "unauthorized"/"permission denied"/"operation not
+# permitted"/"read-only file system" 은 정상 코드 수리 실패에도 나타나 조기 EXTERNAL_BLOCKED 를
+# 유발하므로 제거한다. 구조화된 failure_kind(_EXTERNAL_TIER_A_KINDS)는 그대로 신뢰한다.
 _EXTERNAL_TIER_A_PATTERNS = (
     "missing api key",
     "no api key",
@@ -69,11 +73,6 @@ _EXTERNAL_TIER_A_PATTERNS = (
     "api key not set",
     "invalid api key",
     "authentication failed",
-    "unauthorized",
-    "command not found",
-    "permission denied",
-    "read-only file system",
-    "operation not permitted",
 )
 
 
@@ -409,7 +408,8 @@ class Scheduler:
                     continue
                 normalized_outcomes.append(o)
                 await self.board.add_artifacts(uid, o.get("artifacts", []))
-            failed = any(not o.get("_ok", True) for o in normalized_outcomes)
+            # #RA-devok: _ok 누락 outcome 은 실패로 본다(test/qa 게이트와 동일하게 기본 False).
+            failed = any(not o.get("_ok", False) for o in normalized_outcomes)
             if failed:
                 await self.board.set_status(uid, BLOCKED, "dev failed")
                 self._remember_dev_failure(uid, normalized_outcomes)
@@ -483,12 +483,18 @@ class Scheduler:
             ]
         ).strip()
         # 반복 실패 시 강화 지시를 본문 앞에 붙여 가장 먼저 읽히게 한다(#C1).
+        # #RA4: 예전엔 escalation 을 앞에 붙인 뒤 body[-_MAX:] 로 '끝'을 잘라, 방금 앞에 붙인
+        # 에스컬레이션 헤더가 통째로 잘려나갔다. 헤더는 보존하고 base 본문의 '꼬리'만 자른다.
         if escalation:
-            body = f"{escalation.strip()}\n\n{body}"
+            prefix = escalation.strip() + "\n\n"
+            budget = _MAX_REPAIR_CONTEXT_CHARS - len(prefix)
+            context = prefix + (body[-budget:] if budget > 0 else "")
+        else:
+            context = body[-_MAX_REPAIR_CONTEXT_CHARS:]
         # #M2: dict(unit) 얕은 복사는 deps/roles/notes 등 list 필드를 원본과 공유해, runner/백엔드가
         # repair_unit 을 변형하면 원본 unit 까지 오염됐다. deepcopy 로 완전히 분리한다.
         repaired = copy.deepcopy(unit)
-        repaired["repair_context"] = body[-_MAX_REPAIR_CONTEXT_CHARS:]
+        repaired["repair_context"] = context
         return repaired
 
     def _needs_test_repair(self, outcome: dict) -> bool:
@@ -507,7 +513,8 @@ class Scheduler:
         return any(word in text for word in _TEST_REPAIR_WORDS)
 
     def _remember_dev_failure(self, uid: str, outcomes: list[dict]) -> None:
-        failed = [o for o in outcomes if not o.get("_ok", True)]
+        # #RA-devok: _ok 누락 outcome 은 실패로 본다(_develop_unit 의 판정과 일치).
+        failed = [o for o in outcomes if not o.get("_ok", False)]
         notes: list[str] = []
         blockers: list[str] = []
         fields: dict[str, object] = {}
@@ -568,6 +575,16 @@ class Scheduler:
     def _dev_failure_repeat_count(self, uid: str) -> int:
         """동일 dev 실패가 연속으로 몇 번 반복됐는지(진전 없음 횟수)."""
         return self._dev_failure_signatures.get(uid, ("", 0))[1]
+
+    def _clear_failure_state(self, uid: str) -> None:
+        """unit 이 terminal(DONE/FAILED/BLOCKED)에 도달하면 누적 실패 시그니처를 정리한다(#RA5).
+
+        dev/verify 실패 추적 dict 들이 종료된 unit 의 키를 계속 들고 있으면 메모리 누수이고,
+        같은 uid 가 재진입할 경우 이전 카운트가 남아 에스컬레이션 게이트를 오염시킨다.
+        """
+        self._verify_failure_signatures.pop(uid, None)
+        self._dev_failure_signatures.pop(uid, None)
+        self._last_dev_failure.pop(uid, None)
 
     @staticmethod
     def _escalation_text(count: int, label: str) -> str | None:
@@ -674,17 +691,20 @@ class Scheduler:
         uid = unit["id"]
         while self._can_repair(next_attempt - 1) and not self._stop.is_set():
             if self._budget_exhausted():
+                self._clear_failure_state(uid)  # #RA5: terminal(BLOCKED) → 시그니처 정리
                 await self.board.set_status(uid, BLOCKED, "repair stopped: budget exhausted")
                 await self.board.add_warning(f"{uid}: 예산 소진으로 자동 수리 중단")
                 return None
             broken = self._broken_deps(unit)
             if broken:
+                self._clear_failure_state(uid)  # #RA5: terminal(BLOCKED) → 시그니처 정리
                 await self.board.set_status(uid, BLOCKED, f"rework aborted: deps broken {broken}")
                 await self.board.add_warning(f"{uid}: 재작업 직전 의존성 붕괴 → blocked: {broken}")
                 return None
             # #H09: 고신뢰 외부/영구 장애가 반복되면(코드 수리 불가) external 로 분류·중단.
             ext = self._external_blocker_reason([self._last_dev_failure.get(uid, {})])
             if ext and self._dev_failure_repeat_count(uid) >= 2:
+                self._clear_failure_state(uid)  # #RA5: terminal(BLOCKED) → 시그니처 정리
                 await self.board.set_status(uid, BLOCKED, f"external blocker: {ext}")
                 await self.board.add_warning(
                     f"{uid}: 외부/환경 장애로 자동 수리 중단 (external: {ext})"
@@ -705,6 +725,7 @@ class Scheduler:
             )
             repair_unit = self._with_repair_context(unit, outcome, "dev", escalation=escalation)
             next_attempt += 1
+        self._clear_failure_state(uid)  # #RA5: terminal(FAILED) → 시그니처 정리
         await self.board.set_status(uid, FAILED, "dev repair failed after retries")
         return None
 
@@ -750,6 +771,7 @@ class Scheduler:
                     passed = qa.get("_ok", False) and qa.get("status") != "failed"  # #H3
                     await self.board.set_test_status(uid, "pass" if passed else "fail")
                     if passed:
+                        self._clear_failure_state(uid)  # #RA5: terminal(DONE) → 시그니처 정리
                         await self.board.set_status(uid, DONE)
                         await self._checkpoint(
                             f"orchestrator: {uid} verified", [*test_paths, *qa_paths]
@@ -758,12 +780,14 @@ class Scheduler:
                     outcome, source = qa, "qa"
             # ---- 검증 실패 (_test_sem 해제됨) ----
             if not self._can_repair(attempt):
+                self._clear_failure_state(uid)  # #RA5: terminal(FAILED) → 시그니처 정리
                 await self.board.set_status(uid, FAILED, f"{source} failed after retries")
                 return
             count = self._remember_verify_failure(uid, outcome)  # #H04 진행 추적
             # #H09: 고신뢰 외부/영구 장애가 반복되면 분류·중단.
             ext = self._external_blocker_reason([outcome])
             if ext and count >= 2:
+                self._clear_failure_state(uid)  # #RA5: terminal(BLOCKED) → 시그니처 정리
                 await self.board.set_status(uid, BLOCKED, f"external blocker: {ext}")
                 await self.board.add_warning(
                     f"{uid}: 외부/환경 장애로 자동 수리 중단 (external: {ext})"
@@ -773,11 +797,13 @@ class Scheduler:
                 await self.board.log_event(uid, "stop requested → skip rework")
                 return
             if self._budget_exhausted():
+                self._clear_failure_state(uid)  # #RA5: terminal(BLOCKED) → 시그니처 정리
                 await self.board.set_status(uid, BLOCKED, "repair stopped: budget exhausted")
                 await self.board.add_warning(f"{uid}: 예산 소진으로 자동 수리 중단")
                 return
             broken = self._broken_deps(unit)
             if broken:
+                self._clear_failure_state(uid)  # #RA5: terminal(BLOCKED) → 시그니처 정리
                 await self.board.set_status(uid, BLOCKED, f"rework aborted: deps broken {broken}")
                 await self.board.add_warning(f"{uid}: 재작업 직전 의존성 붕괴 → blocked: {broken}")
                 return

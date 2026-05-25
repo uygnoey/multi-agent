@@ -101,9 +101,18 @@ def load_agent(role: str) -> AgentDef:
         # tools 를 폴백으로 쓰고(= supervisor 는 RO_TOOLS), 모르는 역할만 DEV_TOOLS 로 둔다.
         default_tools = list(ROLES[role].tools) if role in ROLES else list(DEV_TOOLS)
         return AgentDef(role, role, default_tools, None, f"You are the {role} agent.")
-    fm, body = _split_frontmatter(path.read_text(encoding="utf-8"))
+    # #RA-agread: 손상/비-UTF8 .md 가 UnicodeDecodeError 로 죽지 않게, workspace.expose_team_agents
+    # 와 동일하게 errors="replace" 로 견고하게 읽는다.
+    fm, body = _split_frontmatter(path.read_text(encoding="utf-8", errors="replace"))
     meta = _parse_meta(fm)
     tools = _as_tools(meta.get("tools"))
+    # #RA-tools: supervisor(PM/PL=RO_TOOLS) 같이 ROLES 가 선언한 역할은 .md frontmatter 가
+    # 권한을 *추가* 하지 못하게 한다(변조/과대 .md 로 RO 역할이 Write/Bash 를 얻는 권한 상승 방지).
+    # 효과적 tools = .md tools 와 ROLES[role].tools 의 교집합(순서/중복은 .md 기준). dev 역할은
+    # 자신의 전체 tool 셋이 그대로 유지된다(교집합이 동일). 알 수 없는 역할만 .md 를 그대로 신뢰.
+    if role in ROLES:
+        allowed = set(ROLES[role].tools)
+        tools = [t for t in tools if t in allowed]
     return AgentDef(
         name=str(meta.get("name", role)),
         description=str(meta.get("description", "")),

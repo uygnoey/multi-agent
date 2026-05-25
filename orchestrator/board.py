@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,29 @@ def _coerce_finite_float(raw) -> float:
     except (TypeError, ValueError):
         return 0.0
     return val if math.isfinite(val) else 0.0
+
+
+def _json_safe(obj):
+    # #RA-nan: NaN/Infinity 는 표준 JSON 토큰이 아니어서 JS JSON.parse(webui)가 깨진다.
+    # dict/list 를 재귀 순회하며 비-유한(float NaN/±Inf)만 0.0 으로 치환한 새 구조를 만든다.
+    # (그 외 값은 그대로 두고, json.dumps 의 allow_nan=False 폴백 경로에서만 호출한다.)
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else 0.0
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
+def _dumps_safe(data, **kw) -> str:
+    # #RA-nan: allow_nan=False 로 우선 직렬화해 NaN/Inf 가 없으면 그대로 통과.
+    # NaN/Inf 가 섞여 있으면 json.dumps 가 ValueError 를 던지는데, 그 예외로 단일 writer 를
+    # 죽이지 않고 _json_safe 로 살균한 구조를 다시 allow_nan=False 로 직렬화한다.
+    try:
+        return json.dumps(data, ensure_ascii=False, allow_nan=False, **kw)
+    except ValueError:
+        return json.dumps(_json_safe(data), ensure_ascii=False, allow_nan=False, **kw)
 
 
 def _coerce_int(raw) -> int:
@@ -208,6 +232,11 @@ class Board:
         # events.log / directives.md 의 append-only 쓰기 전용 락. 무거운 _flush(fsync x2)를
         # 잡는 self._lock 과 분리해, 로그/디렉티브 기록이 보드 변형과 직렬화 경합하지 않게 한다.
         self._log_lock = asyncio.Lock()
+        # #RA-loglock: per-agent .log 추가쓰기 전용 동기 락. _append_agent_log/write_agent_block 은
+        # SYNC 메서드인데 runner 가 async 코루틴에서 await 없이 호출한다(runner.py:262/268).
+        # asyncio.Lock 은 동기 컨텍스트에서 못 잡으므로, 동일 agent 로그를 동시에 쓰는
+        # 코루틴/스레드의 줄 인터리빙을 막기 위해 별도 threading.Lock 으로 직렬화한다.
+        self._agent_log_lock = threading.Lock()
         self._data: dict[str, Any] = {"units": [], "agents": {}}
         self.spec_text: str = ""
 
@@ -224,7 +253,9 @@ class Board:
         # 죽이지 않고 문자열로 격하시킨다. (안 그러면 in-memory 상태는 변형됐는데 영속화는 실패해
         # 디버전스가 나고 이후 모든 변형도 실패한다.)
         tmp = self.path.with_suffix(".json.tmp")
-        payload = json.dumps(self._data, ensure_ascii=False, indent=2, default=str)
+        # #RA-nan: allow_nan=False + NaN/Inf 폴백 살균을 거쳐 board.json 에 표준-비준수
+        # NaN/Infinity 토큰이 새지 않게 한다(webui 의 JSON.parse 보호).
+        payload = _dumps_safe(self._data, indent=2, default=str)
         with tmp.open("w", encoding="utf-8") as f:
             f.write(payload)
             f.flush()
@@ -582,9 +613,11 @@ class Board:
 
     def _append_agent_log(self, role: str, text: str) -> None:
         self.agents_dir.mkdir(parents=True, exist_ok=True)
-        with self._log_path(role).open("a", encoding="utf-8") as f:
-            # 날짜 포함 타임스탬프(자정/장기 run 넘나듦에도 단조 정렬 가능)
-            f.write(f"{_ts()} {text}\n")
+        # #RA-loglock: 동기 threading 락으로 동시 추가쓰기의 줄 인터리빙을 차단
+        with self._agent_log_lock:
+            with self._log_path(role).open("a", encoding="utf-8") as f:
+                # 날짜 포함 타임스탬프(자정/장기 run 넘나듦에도 단조 정렬 가능)
+                f.write(f"{_ts()} {text}\n")
 
     def write_agent_block(self, role: str, title: str, body: str) -> None:
         """프롬프트/결과 같은 상세 블록을 per-agent 로그에 기록 (실시간 상세 로그용)."""
@@ -592,14 +625,17 @@ class Board:
         bar = "─" * 56
         # 단일 프롬프트/결과가 로그를 폭증시키지 않도록 본문 크기 제한
         body = _truncate_body(body)
-        with self._log_path(role).open("a", encoding="utf-8") as f:
-            # 날짜 포함 타임스탬프(자정/장기 run 넘나듦에도 단조 정렬 가능)
-            f.write(f"\n{bar}\n{_ts()} {title}\n{bar}\n{body}\n")
+        # #RA-loglock: 동기 threading 락으로 동시 추가쓰기의 줄/블록 인터리빙을 차단
+        with self._agent_log_lock:
+            with self._log_path(role).open("a", encoding="utf-8") as f:
+                # 날짜 포함 타임스탬프(자정/장기 run 넘나듦에도 단조 정렬 가능)
+                f.write(f"\n{bar}\n{_ts()} {title}\n{bar}\n{body}\n")
 
     def agents(self) -> dict:
         # #N01: snapshot() 과 일관되게 ensure_ascii=False (한글 등 비-ASCII 를 이스케이프하지
         # 않아 round-trip 이 가볍고 동일 동작).
-        return json.loads(json.dumps(self._data.get("agents", {}), ensure_ascii=False, default=str))
+        # #RA-nan: snapshot() 과 동일하게 allow_nan=False 살균 후 round-trip (webui 보호).
+        return json.loads(_dumps_safe(self._data.get("agents", {}), default=str))
 
     def agent_log_tail(self, role: str, n: int = 200) -> str:
         # 쓰기 경로와 동일하게 안전화된 파일명을 사용해 일관되게 읽기
@@ -758,7 +794,8 @@ class Board:
         return [copy.deepcopy(u) for u in self._data.get("units", [])]
 
     def snapshot(self) -> dict:
-        return json.loads(json.dumps(self._data, ensure_ascii=False, default=str))
+        # #RA-nan: allow_nan=False + NaN/Inf 살균을 거쳐 webui 가 NaN 토큰을 받지 않게 한다.
+        return json.loads(_dumps_safe(self._data, default=str))
 
     # ---- logs / directives ----
     async def log_event(self, who: str, msg: str) -> None:

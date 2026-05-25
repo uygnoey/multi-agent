@@ -257,6 +257,71 @@ def test_sanitize_run_opts_clamps_numbers_and_model():
     assert out["model"] is None
 
 
+def test_sanitize_run_opts_clamps_upper_and_drops_bad_floats():
+    # #RA-numclamp: 상한 클램프(concurrency 10**9→64) + 음수/비유한 실수 정리.
+    out = webui.sanitize_run_opts(
+        {
+            "concurrency": 10**9,  # → 64 (RunConfig 상한)
+            "max_attempts": 10**9,  # → 1000 (sane cap)
+            "retries": 5000,  # → 1000
+            "max_units": 10**12,  # → 1000
+            "budget": -2,  # 음수 → 키 제거(build_command 가 생략)
+            "timeout": -1,  # 음수 → 키 제거
+            "poll_interval": -3,  # 음수 → 0 (RunConfig 가 안전 하한 클램프)
+        }
+    )
+    assert out["concurrency"] == 64
+    assert out["max_attempts"] == 1000
+    assert out["retries"] == 1000
+    assert out["max_units"] == 1000
+    assert "budget" not in out
+    assert "timeout" not in out
+    assert out["poll_interval"] == 0
+    # 정리된 opts 가 build_command 를 깨지 않고 음수 인자도 만들지 않는다.
+    from pathlib import Path
+
+    cmd = webui.build_command("py", Path("/s"), Path("/p"), out)
+    assert "--budget" not in cmd
+    assert "--timeout" not in cmd
+    assert cmd[cmd.index("--concurrency") + 1] == "64"
+
+
+def test_sanitize_run_opts_drops_non_finite_floats():
+    # #RA-numclamp: inf/nan poll_interval/timeout/budget 도 정리(스폰 프로세스 검증 에러 방지).
+    out = webui.sanitize_run_opts(
+        {"poll_interval": float("inf"), "timeout": float("nan"), "budget": float("inf")}
+    )
+    assert out["poll_interval"] == 0  # 비유한 → 0 폴백
+    assert "timeout" not in out  # 비유한 → 키 제거
+    assert "budget" not in out
+
+
+def test_sanitize_run_opts_keeps_valid_floats():
+    # #RA-numclamp: 정상 실수값(1.5 같은 소수)은 그대로 보존한다.
+    out = webui.sanitize_run_opts({"poll_interval": 1.5, "timeout": 30, "budget": 2.0})
+    assert out["poll_interval"] == 1.5
+    assert out["timeout"] == 30
+    assert out["budget"] == 2.0
+
+
+def test_read_agent_logs_matches_safe_unit_id_write(tmp_path):
+    # #RA2: board 는 _safe_unit_id 로 정규화한 파일명에 로그를 쓰므로, 읽기도 같은 규칙을
+    #       써야 한다. 공백/특수문자가 든 역할명으로 쓴 로그를 _read_agent_logs 가 찾는다.
+    from orchestrator.board import _safe_unit_id
+
+    orch = tmp_path / ".orchestrator"
+    agents = orch / "agents"
+    agents.mkdir(parents=True)
+    raw_role = "qa engineer"  # 공백 포함 → _safe_unit_id → "qa-engineer"
+    safe = _safe_unit_id(raw_role)
+    assert safe == "qa-engineer"
+    (agents / f"{safe}.log").write_text("line-a\nline-b\n", encoding="utf-8")
+    out = webui._read_agent_logs(orch, [raw_role])
+    # RAW role 키로 반환되며, 정규화된 파일을 제대로 읽었다.
+    assert raw_role in out
+    assert "line-b" in out[raw_role]
+
+
 def test_sanitize_run_opts_role_backends_cleaned():
     out = webui.sanitize_run_opts(
         {

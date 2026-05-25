@@ -514,3 +514,164 @@ def test_mock_architecture_units_no_broken_markdown(tmp_path):
     assert unit_lines  # 최소 하나의 유닛 라인
     for ln in unit_lines:
         assert '"' not in ln  # 따옴표 제거
+
+
+# ---------------------------------------------------------------------------
+# 감사 후속(RA): SDK 단가 정규식 / 0-토큰 비용 / 버퍼 / 거대 프롬프트 stdin.
+# ---------------------------------------------------------------------------
+
+
+# #RA-sdkre: base 키 뒤 포인트 버전 세그먼트를 최대 2개로 제한 — 현행 ID 는 폴백, 그 이상의
+# 미지 변형(가격이 다를 수 있음)은 조용히 base 단가로 매핑하지 않고 None 으로 둔다.
+def test_anthropic_price_suffix_limits_point_version_segments():
+    # 현행 ID(접미사 1~2개 + 선택적 날짜)는 base 단가로 폴백한다.
+    assert sdk_mod._anthropic_price_for("claude-opus-4-1") == (15.0, 75.0)
+    assert sdk_mod._anthropic_price_for("claude-opus-4-1-20250805") == (15.0, 75.0)
+    assert sdk_mod._anthropic_price_for("claude-opus-4-2-3") == (15.0, 75.0)
+    # base 키 뒤 포인트 세그먼트가 3개 이상이면(미지의 미래 변형) 폴백하지 않는다 → None.
+    assert sdk_mod._anthropic_price_for("claude-opus-4-2-3-4") is None
+    assert sdk_mod._anthropic_price_for("claude-opus-4-2-3-4-20260101") is None
+    # 접미사 정규식 자체도 직접 검증(0~2개 허용, 3개부터 거부).
+    assert sdk_mod._ANTHROPIC_DATE_SUFFIX.match("-1-2")
+    assert sdk_mod._ANTHROPIC_DATE_SUFFIX.match("-1-2-20250101")
+    assert not sdk_mod._ANTHROPIC_DATE_SUFFIX.match("-1-2-3")
+
+
+# #RA-0tok: usage 가 truthy 라도 토큰이 전부 0 이면 추정 비용 0.0 은 None 으로 접는다(SDK).
+def test_estimate_anthropic_cost_zero_tokens_is_none():
+    # 모델/단가는 알지만 in/out 토큰이 0 → 0.0 이 아니라 None(허위 $0 추정 금지).
+    assert sdk_mod._estimate_anthropic_cost("claude-sonnet-4", 0, 0) is None
+    # 양수 토큰은 그대로 추정치를 낸다(접지 않음).
+    assert sdk_mod._estimate_anthropic_cost("claude-sonnet-4", 1_000_000, 0) == 3.0
+
+
+def test_sdk_run_role_zero_tokens_reports_no_cost(tmp_path, monkeypatch):
+    # usage 는 truthy 지만 in/out 토큰이 전부 0(예: reasoning 만 잡힌 경우) → cost 는 None.
+    class _Usage:
+        input_tokens = 0
+        output_tokens = 0
+        total_tokens = 0
+        reasoning_tokens = 123  # 우리가 비용에 쓰지 않는 토큰만 존재
+
+    class _Msg:
+        content = "done"
+        usage = _Usage()  # total_cost_usd / model 없음(구독 모드)
+
+    async def _fake_query(prompt, options):
+        yield _Msg()
+
+    class _FakeOptions:
+        def __init__(self, **kw):
+            pass
+
+    import types
+
+    fake = types.ModuleType("claude_agent_sdk")
+    fake.ClaudeAgentOptions = _FakeOptions
+    fake.query = _fake_query
+    monkeypatch.setitem(__import__("sys").modules, "claude_agent_sdk", fake)
+
+    req = _req(tmp_path, model="claude-sonnet-4", budget=None, timeout=30)
+    res = asyncio.run(sdk_mod.ClaudeSDKBackend().run_role(req))
+    assert res.ok is True
+    assert res.cost_usd is None  # #RA-0tok: 0.0 이 아니라 None — "$0.00 추정" 오해 방지
+
+
+# #RA-0tok: codex 도 usage 가 truthy 라도 토큰 전부 0 이면 cost None + cost_estimated False.
+def test_codex_zero_token_usage_reports_no_cost(tmp_path, monkeypatch):
+    async def fake_run(cmd, cwd, timeout, log_path=None):
+        # turn.completed 는 있으나 토큰이 전부 0 → usage dict 는 truthy, 비용 추정은 0.0.
+        out = b'{"type":"turn.completed","usage":{"input_tokens":0,"output_tokens":0}}\n'
+        return 0, out, b"", False
+
+    monkeypatch.setattr(codex_cli, "run_subprocess", fake_run)
+    req = _req(tmp_path, model="gpt-5.5", timeout=30)
+    res = asyncio.run(CodexCLIBackend().run_role(req))
+    assert res.ok is True
+    assert res.cost_usd is None  # 0.0 이 아니라 None
+    assert res.cost_estimated is False  # $0 추정치를 보고하지 않으므로 estimated 도 아님
+
+
+# #RA-buf: 오버사이즈 라인이 들어와도 누적 라인을 clear() 로 통째로 버리지 않는다. 트림 루프는
+# 가장 오래된 라인부터 떨어뜨리므로, 오버사이즈 라인 '이후'에 들어온 최신 result/usage 라인은
+# 보존된다(예전 clear() 버그였다면 오버사이즈 라인이 append 시점에 prior 를 전부 날렸다).
+def test_bounded_buffer_oversized_line_does_not_wipe_later_lines():
+    buf = base_mod._BoundedBuffer(max_bytes=200)
+    buf.append(b"{usage-event}\n")  # prior 작은 이벤트
+    buf.append(b"X" * 1000 + b"\n")  # 오버사이즈 → 자기 자신만 절단(=max 로)
+    buf.append(b"{result-event}\n")  # 오버사이즈 이후 들어온 최신 이벤트
+    data = buf.getvalue()
+    # 총 보관량은 상한 근처로 묶인다(폭주 방지).
+    assert len(data) <= 200 + len(b"{result-event}\n")
+    # 오버사이즈 라인이 append 시점에 buffer 를 비우지 않았으므로, 그 뒤의 최신 이벤트가 살아있다.
+    assert b"{result-event}" in data
+    # 오버사이즈가 발생했으니 dropped 플래그는 선다.
+    assert buf.dropped is True
+
+
+def test_bounded_buffer_oversized_line_truncates_itself_not_clears():
+    # 상한 대비 적당히 큰 라인 하나만 들어와도, 가장 최근(=그 라인)은 절단된 채로 보존되고
+    # 버퍼가 통째로 비지 않는다(clear() 제거 검증). JSON 형태가 아니므로 tail 을 보존한다.
+    buf = base_mod._BoundedBuffer(max_bytes=100)
+    buf.append(b"prior-A\n")
+    buf.append(b"prior-B\n")
+    buf.append(b"Z" * 500 + b"TAIL\n")  # 오버사이즈, non-JSON → tail 절단
+    data = buf.getvalue()
+    assert buf.dropped is True
+    # 절단된 오버사이즈 라인의 tail(끝부분)이 보존된다 — head 가 아니라 tail.
+    assert data.endswith(b"TAIL\n")
+    # 총 보관량은 상한 근처로 묶인다.
+    assert len(data) <= 100 + len(b"prior-A\nprior-B\n")
+
+
+# #RA-e2big: 거대 프롬프트는 argv 대신 stdin('-')으로 넘겨 ARG_MAX(E2BIG) 를 회피한다.
+def test_codex_large_prompt_uses_stdin(tmp_path, monkeypatch):
+    captured = {}
+
+    async def fake_run(cmd, cwd, timeout, log_path=None, line_render=None, stdin_data=None):
+        captured["cmd"] = cmd
+        captured["stdin_data"] = stdin_data
+        return 0, b'{"type":"turn.completed","usage":{}}\n', b"", False
+
+    monkeypatch.setattr(codex_cli, "run_subprocess", fake_run)
+    big = "A" * (codex_cli._PROMPT_STDIN_THRESHOLD + 10)  # 임계치 초과 프롬프트
+    req = _req(tmp_path, prompt=big, model="gpt-5.5", timeout=30)
+    res = asyncio.run(CodexCLIBackend().run_role(req))
+    assert res.ok is True
+    # positional 프롬프트 자리에는 '-' 가 들어가고(거대 프롬프트는 argv 에 없음),
+    assert captured["cmd"][2] == "-"
+    # 실제 프롬프트는 stdin 으로 전달된다(bytes).
+    assert captured["stdin_data"] is not None
+    assert big.encode("utf-8") in captured["stdin_data"]
+
+
+def test_codex_small_prompt_stays_positional(tmp_path, monkeypatch):
+    captured = {}
+
+    # 작은 프롬프트는 기존 4-인자 호출 그대로 — stdin_data 를 넘기지 않는다(fake 시그니처도 4-인자).
+    async def fake_run(cmd, cwd, timeout, log_path=None):
+        captured["cmd"] = cmd
+        return 0, b'{"type":"turn.completed","usage":{}}\n', b"", False
+
+    monkeypatch.setattr(codex_cli, "run_subprocess", fake_run)
+    req = _req(tmp_path, prompt="tiny", model="gpt-5.5", timeout=30)
+    res = asyncio.run(CodexCLIBackend().run_role(req))
+    assert res.ok is True
+    # 작은 프롬프트는 여전히 positional argv 로 들어간다('-' 가 아님).
+    assert captured["cmd"][2] != "-"
+    assert "[TASK]\ntiny" in captured["cmd"][2]
+
+
+def test_run_subprocess_feeds_stdin_to_child(tmp_path):
+    # base.run_subprocess 가 stdin_data 를 실제 자식 stdin 으로 흘리는지 확인(에코 프로그램).
+    import sys
+
+    prog = "import sys; sys.stdout.write(sys.stdin.read())"
+    rc, out, err, timed_out = asyncio.run(
+        base_mod.run_subprocess(
+            [sys.executable, "-c", prog], str(tmp_path), 30, stdin_data=b"hello-stdin"
+        )
+    )
+    assert rc == 0
+    assert timed_out is False
+    assert b"hello-stdin" in out

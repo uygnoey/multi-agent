@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from orchestrator.board import BLOCKED, DONE
+from orchestrator.board import BLOCKED, DONE, FAILED
 from orchestrator.config import DEV_ROLES, RunConfig
 from orchestrator.scheduler import Scheduler
 
@@ -196,8 +196,11 @@ def test_qa_repeated_failure_escalates_and_completes_without_recursion(tmp_path,
 
 
 def test_external_blocker_classified_and_stops(tmp_path, sample_spec_path):
-    """#H09: 코드 수리로 못 고치는 고신뢰 외부 장애(command not found)가 반복되면 무한 반복 대신
-    external 로 분류·중단(BLOCKED)한다. (단, 반복 게이트 2회 후 — 단발 실패로는 포기하지 않음.)"""
+    """#H09: 코드 수리로 못 고치는 고신뢰 외부 장애(구조화된 failure_kind=tool_missing)가 반복되면
+    무한 반복 대신 external 로 분류·중단(BLOCKED)한다. (반복 게이트 2회 후 — 단발로는 포기 X.)
+
+    #RA3: 원문 텍스트 "command not found" 는 더 이상 external 신호가 아니므로(고칠 수 있는 의존성·
+    스크립트 문제), 구조화된 failure_kind 로 고신뢰 외부 분류가 여전히 동작함을 검증한다."""
 
     async def scenario():
         sched = Scheduler(_cfg(tmp_path, sample_spec_path, max_attempts=0))
@@ -212,7 +215,8 @@ def test_external_blocker_classified_and_stops(tmp_path, sample_spec_path):
                 "_ok": False,
                 "status": "failed",
                 "artifacts": [],
-                "blockers": ["npx: command not found"],  # Tier A 고신뢰 외부 신호
+                "failure_kind": "tool_missing",  # Tier A 구조화 신호(신뢰)
+                "blockers": ["npx: command not found"],
             }
 
         sched.runner.run_role = fake
@@ -225,3 +229,134 @@ def test_external_blocker_classified_and_stops(tmp_path, sample_spec_path):
     assert snap["units"][0]["status"] == BLOCKED
     assert any("external" in (w or "").lower() for w in snap.get("warnings", []))
     assert calls < 10  # 무한 루프가 아니라 반복 게이트 후 분류·중단
+
+
+def test_command_not_found_text_is_not_external_blocker(tmp_path, sample_spec_path):
+    """#RA3: 원문 "command not found"(vite/pytest 등 고칠 수 있는 의존성·스크립트 문제)는 더 이상
+    external 텍스트 신호가 아니다 — 구조화된 failure_kind 가 없으면 EXTERNAL_BLOCKED 로 단정하지
+    않고 계속 수리한다(조기 포기 방지)."""
+    sched = Scheduler(_cfg(tmp_path, sample_spec_path, max_attempts=0))
+    # 좁아진 텍스트 패턴은 더 이상 잡지 않는다.
+    for txt in (
+        "npx: command not found",
+        "unauthorized",
+        "permission denied",
+        "operation not permitted",
+        "read-only file system",
+    ):
+        assert sched._external_blocker_reason([{"blockers": [txt]}]) is None
+    # 고신뢰 인증/키 텍스트는 여전히 external 로 잡는다.
+    assert sched._external_blocker_reason([{"blockers": ["missing api key"]}]) == "missing api key"
+    assert sched._external_blocker_reason([{"notes": ["authentication failed"]}]) is not None
+    # 구조화된 failure_kind 는 그대로 Tier A(신뢰).
+    assert sched._external_blocker_reason([{"failure_kind": "tool_missing"}]) == "tool_missing"
+    assert sched._external_blocker_reason([{"failure_kind": "permission_denied"}]) is not None
+
+
+def test_dev_outcome_missing_ok_is_treated_as_failed(tmp_path, sample_spec_path):
+    """#RA-devok: _ok 키가 빠진(악성/누락) dev outcome 은 성공이 아니라 실패로 판정해야 한다
+    (test/qa 게이트와 동일하게 기본 False)."""
+
+    async def scenario():
+        sched = Scheduler(_cfg(tmp_path, sample_spec_path, max_attempts=2))
+        await sched.board.init("spec", {})
+        await sched.board.add_units([{"id": "U1", "title": "t", "roles": ["frontend-developer"]}])
+
+        async def fake(role, unit=None):
+            # _ok 키 자체가 없는 malformed outcome.
+            return {"status": "done", "artifacts": [], "blockers": ["malformed: no _ok key"]}
+
+        sched.runner.run_role = fake
+        ok = await sched._develop_unit(sched.board.units()[0], asyncio.Semaphore(1), 1)
+        return ok, sched.board.snapshot()
+
+    ok, snap = asyncio.run(scenario())
+    assert ok is False  # _ok 누락 → 실패
+    assert snap["units"][0]["status"] == BLOCKED
+    # 실패로 기록돼 dev 실패 시그니처가 남는다(누락 outcome 을 통과로 보지 않는다).
+    assert any("개발(dev) 실패" in (w or "") for w in snap.get("warnings", []))
+
+
+def test_remember_dev_failure_counts_missing_ok_outcome(tmp_path, sample_spec_path):
+    """#RA-devok: _remember_dev_failure 도 _ok 누락 outcome 을 실패로 집계해 반복 카운트에
+    반영한다(에스컬레이션 게이트가 정상 동작)."""
+    sched = Scheduler(_cfg(tmp_path, sample_spec_path, max_attempts=0))
+    for _ in range(2):
+        sched._remember_dev_failure(
+            "U1",
+            [{"status": "failed", "failure_kind": "dependency_env", "command": "npm run build"}],
+        )
+    assert sched._dev_failure_repeat_count("U1") == 2  # _ok 없어도 실패로 누적
+
+
+def test_escalation_header_preserved_in_long_repair_context(tmp_path, sample_spec_path):
+    """#RA4: 매우 긴 본문 + 에스컬레이션이면 예전엔 끝 자르기(body[-MAX:])로 앞에 붙인
+    에스컬레이션 헤더가 통째로 잘렸다. 이제 헤더는 보존되고 base 본문의 꼬리만 잘린다."""
+    sched = Scheduler(_cfg(tmp_path, sample_spec_path, max_attempts=0))
+    long_blocker = "X" * 8000  # _MAX_REPAIR_CONTEXT_CHARS(4000)를 훨씬 초과
+    escalation = sched._escalation_text(3, "dev")
+    assert escalation is not None
+    repaired = sched._with_repair_context(
+        {"id": "U1", "title": "t"},
+        {"_ok": False, "status": "failed", "blockers": [long_blocker]},
+        "dev",
+        escalation=escalation,
+    )
+    ctx = repaired["repair_context"]
+    assert "[수리 에스컬레이션]" in ctx  # 헤더가 살아있어야 함(예전엔 끝 자르기로 사라졌다)
+    assert ctx.startswith("[수리 에스컬레이션]")  # 헤더가 맨 앞에 보존
+    # 길이 예산은 여전히 지켜진다.
+    from orchestrator.scheduler import _MAX_REPAIR_CONTEXT_CHARS
+
+    assert len(ctx) <= _MAX_REPAIR_CONTEXT_CHARS
+
+
+def test_failure_signatures_cleared_on_terminal_states(tmp_path, sample_spec_path):
+    """#RA5: unit 이 terminal(DONE/FAILED/BLOCKED)에 도달하면 dev/verify 실패 시그니처가
+    정리돼 누수/오염되지 않는다."""
+
+    async def done_scenario():
+        # DONE 경로: _test_unit 에서 통과 시 verify 시그니처 정리.
+        sched = Scheduler(_cfg(tmp_path / "a", sample_spec_path, max_attempts=2))
+        await sched.board.init("spec", {})
+        await sched.board.add_units([{"id": "U1", "title": "t"}])
+        qa_calls = 0
+
+        async def fake(role, unit=None):
+            nonlocal qa_calls
+            if role == "qa":
+                qa_calls += 1
+                if qa_calls == 1:
+                    return {"_ok": False, "status": "failed", "blockers": ["x"], "artifacts": []}
+            return {"_ok": True, "status": "done", "artifacts": []}
+
+        sched.runner.run_role = fake
+        await sched._test_unit(sched.board.units()[0], asyncio.Semaphore(1), 1)
+        return sched
+
+    async def failed_scenario():
+        # FAILED 경로: dev 재작업이 attempts 소진으로 실패하면 dev 시그니처 정리.
+        sched = Scheduler(_cfg(tmp_path / "b", sample_spec_path, max_attempts=2))
+        await sched.board.init("spec", {})
+        await sched.board.add_units([{"id": "U1", "title": "t", "roles": ["frontend-developer"]}])
+
+        async def fake(role, unit=None):
+            return {"_ok": False, "status": "failed", "blockers": ["x"], "artifacts": []}
+
+        sched.runner.run_role = fake
+        unit = sched.board.units()[0]
+        assert await sched._develop_unit(unit, asyncio.Semaphore(1), 1) is False
+        await sched._repair_failed_dev(unit, asyncio.Semaphore(1), 1)
+        return sched
+
+    done_sched = asyncio.run(done_scenario())
+    assert done_sched.board.units()[0]["status"] == DONE
+    assert "U1" not in done_sched._verify_failure_signatures
+    assert "U1" not in done_sched._dev_failure_signatures
+    assert "U1" not in done_sched._last_dev_failure
+
+    failed_sched = asyncio.run(failed_scenario())
+    assert failed_sched.board.units()[0]["status"] == FAILED
+    assert "U1" not in failed_sched._dev_failure_signatures
+    assert "U1" not in failed_sched._last_dev_failure
+    assert "U1" not in failed_sched._verify_failure_signatures

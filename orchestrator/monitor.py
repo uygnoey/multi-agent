@@ -29,7 +29,7 @@ from pathlib import Path
 
 from . import procutil
 from .backends import backend_status
-from .board import TERMINAL_OK, _tail_lines
+from .board import TERMINAL_OK, _safe_unit_id, _tail_lines
 from .config import BACKEND_INFO, ROLES
 
 
@@ -43,7 +43,7 @@ def _read_pid(path: Path) -> int | None:
     """
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+    except Exception:  # #RA1: 비UTF8/손상 pidfile 의 UnicodeDecodeError(ValueError) 등도 흡수
         return None
     first = text.splitlines()[0].strip() if text.splitlines() else ""
     if not first:
@@ -489,7 +489,8 @@ def _read_board(orch_dir: Path) -> dict:
 
 def _read_agent_log(orch_dir: Path, role: str, n: int = 500) -> str:
     # #20: 전체 파일을 읽지 않고 끝 청크만 seek-read 해 마지막 n 줄만 반환(대용량 로그 방어).
-    p = orch_dir / "agents" / f"{role}.log"
+    # #RA2: board._log_path 는 _safe_unit_id 로 정규화해 쓰므로 읽기도 동일하게 정규화한다.
+    p = orch_dir / "agents" / f"{_safe_unit_id(role) or '_unknown'}.log"
     if not p.exists():
         return ""
     return "\n".join(_tail_lines(p, n))
@@ -506,7 +507,8 @@ _LOG_CACHE_LOCK = threading.Lock()
 
 def _read_agent_log_cached(orch_dir: Path, role: str, n: int = 500) -> str:
     """파일이 바뀌었을 때(mtime/size)만 다시 읽어 큰 로그에서 redraw 가 느려지지 않게 한다 (#36)."""
-    p = orch_dir / "agents" / f"{role}.log"
+    # #RA2: board._log_path(=쓰기) 와 동일하게 _safe_unit_id 로 정규화해 경로가 어긋나지 않게.
+    p = orch_dir / "agents" / f"{_safe_unit_id(role) or '_unknown'}.log"
     key = str(p)
     try:
         stat = p.stat()

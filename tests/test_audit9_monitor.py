@@ -28,7 +28,12 @@ from pathlib import Path
 import pytest
 
 from orchestrator import monitor as _monitor_mod
-from orchestrator.gitcheckpoints import GitCheckpointer, _parse_status_paths_z
+from orchestrator.gitcheckpoints import (
+    GitCheckpointer,
+    _parse_deleted_paths_z,
+    _parse_rename_pairs_z,
+    _parse_status_paths_z,
+)
 from orchestrator.monitor import (
     _clamp_interval,
     _is_zombie,
@@ -133,6 +138,39 @@ def test_stop_run_false_on_zero_pid(tmp_path: Path):
     orch = _orch(tmp_path)
     (orch / "run.pid").write_text("0", encoding="utf-8")
     assert _stop_run(orch) is False
+
+
+# ---------------------------------------------------------------------------
+# #RA1: 비UTF8/손상 pidfile 에서 _read_pid / _run_alive 가 예외 없이 None/False
+# ---------------------------------------------------------------------------
+def test_read_pid_none_on_non_utf8(tmp_path: Path):
+    # run.pid 가 비UTF8 바이트면 read_text 가 UnicodeDecodeError(ValueError) 를 던진다 —
+    # 매 TUI tick 마다 호출되는 경로이므로 예외 없이 None 이어야 한다.
+    pf = tmp_path / "run.pid"
+    pf.write_bytes(b"\xff\xfe123\n")
+    assert _read_pid(pf) is None
+
+
+def test_run_alive_false_on_non_utf8_pid(tmp_path: Path):
+    orch = _orch(tmp_path)
+    (orch / "run.pid").write_bytes(b"\xff\xfe123\n")
+    assert _run_alive(orch) is False  # 손상 pidfile 이 TUI/stop 경로를 크래시시키면 안 됨
+
+
+# ---------------------------------------------------------------------------
+# #RA2: 로그 읽기 경로가 board 쓰기 경로(_safe_unit_id) 와 일치
+# ---------------------------------------------------------------------------
+def test_read_agent_log_matches_board_write_path(tmp_path: Path):
+    from orchestrator.board import _safe_unit_id
+
+    role = "weird role/../x"  # 비표준 role → board 가 _safe_unit_id 로 정규화해 기록
+    safe = _safe_unit_id(role) or "_unknown"
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    (agents / f"{safe}.log").write_text("hello-line\n", encoding="utf-8")
+    # 읽기도 동일하게 정규화하므로 RAW role 로 호출해도 찾아진다.
+    assert "hello-line" in _monitor_mod._read_agent_log(tmp_path, role)
+    assert "hello-line" in _monitor_mod._read_agent_log_cached(tmp_path, role)
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +433,75 @@ def test_checkpoint_empty_message_uses_default(tmp_path: Path):
         text=True,
     )
     assert out.stdout.strip() == "orchestrator: checkpoint"  # _DEFAULT_COMMIT_MESSAGE
+
+
+# ---------------------------------------------------------------------------
+# #RA-git: rename 짝 / 삭제 경로 파서 + filesystem-rename / git mv 시 트리 일관성
+# ---------------------------------------------------------------------------
+def test_parse_rename_pairs_z():
+    text = "R  new name.py\0old name.py\0 M keep.py\0"
+    assert _parse_rename_pairs_z(text) == [("old name.py", "new name.py")]
+
+
+def test_parse_rename_pairs_z_none_for_plain():
+    assert _parse_rename_pairs_z("?? a.txt\0 M b.py\0") == []
+
+
+def test_parse_deleted_paths_z():
+    text = " D gone.py\0?? new.py\0 M keep.py\0"
+    assert _parse_deleted_paths_z(text) == {"gone.py"}
+
+
+def _init_repo(proj: Path):
+    proj.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "-C", str(proj), "init"], capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(proj), "config", "user.name", "t"], capture_output=True)
+    subprocess.run(["git", "-C", str(proj), "config", "user.email", "t@t"], capture_output=True)
+
+
+def _porcelain(proj: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(proj), "status", "--porcelain"], capture_output=True, text=True
+    ).stdout.strip()
+
+
+@pytest.mark.skipif(not _git_available(), reason="git 미설치")
+def test_checkpoint_filesystem_rename_stages_deletion(tmp_path: Path):
+    # filesystem rename(delete old + create new, git mv 아님): paths=[new] 만 줘도
+    # old 삭제가 함께 stage 되어 체크포인트 후 트리가 깨끗해야 한다 (#RA-git).
+    import asyncio
+
+    proj = tmp_path / "fs"
+    _init_repo(proj)
+    (proj / "a").mkdir()
+    (proj / "a" / "x.txt").write_text("hello", encoding="utf-8")
+    subprocess.run(["git", "-C", str(proj), "add", "-A"], capture_output=True)
+    subprocess.run(["git", "-C", str(proj), "commit", "-m", "init"], capture_output=True)
+
+    gc = GitCheckpointer(proj, enabled=True)  # baseline clean
+    (proj / "a" / "x.txt").unlink()
+    (proj / "a" / "y.txt").write_text("hello", encoding="utf-8")
+    committed, detail = asyncio.run(gc.checkpoint("rename", paths=["a/y.txt"]))
+    assert committed is True, detail
+    assert _porcelain(proj) == ""  # old 삭제까지 커밋되어 트리 clean
+
+
+@pytest.mark.skipif(not _git_available(), reason="git 미설치")
+def test_checkpoint_git_mv_pairs_origin_and_new(tmp_path: Path):
+    # staged rename(git mv): paths=[new] 만 줘도 origin·new 짝이 함께 잡혀 트리가 깨끗해야 한다.
+    import asyncio
+
+    proj = tmp_path / "mv"
+    _init_repo(proj)
+    (proj / "x.txt").write_text("hi" * 50, encoding="utf-8")
+    subprocess.run(["git", "-C", str(proj), "add", "-A"], capture_output=True)
+    subprocess.run(["git", "-C", str(proj), "commit", "-m", "init"], capture_output=True)
+
+    gc = GitCheckpointer(proj, enabled=True)
+    subprocess.run(["git", "-C", str(proj), "mv", "x.txt", "z.txt"], capture_output=True)
+    committed, detail = asyncio.run(gc.checkpoint("mv", paths=["z.txt"]))
+    assert committed is True, detail
+    assert _porcelain(proj) == ""
 
 
 # ---------------------------------------------------------------------------

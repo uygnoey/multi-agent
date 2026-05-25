@@ -121,10 +121,36 @@ class GitCheckpointer:
         status = self._run("status", "--porcelain", "-z", "--untracked-files=all")
         if status.returncode != 0:
             raise RuntimeError((status.stderr or status.stdout or "git status failed").strip())
-        changed = _parse_status_paths_z(status.stdout) - self._baseline_paths
+        all_changed = _parse_status_paths_z(status.stdout) - self._baseline_paths
+        # #RA-git: rename 짝(R/C) 과 tracked-삭제 경로를 미리 뽑아 둔다(필터링 시 짝을 함께 끌어옴).
+        rename_pairs = [
+            (o, n)
+            for (o, n) in _parse_rename_pairs_z(status.stdout)
+            if o not in self._baseline_paths or n not in self._baseline_paths
+        ]
+        deleted = _parse_deleted_paths_z(status.stdout) - self._baseline_paths
         selected = _normalize_paths(paths)
-        if selected is not None:
-            changed = {p for p in changed if any(p == s or p.startswith(s + "/") for s in selected)}
+        if selected is None:
+            return sorted(all_changed)
+
+        def _matches(p: str) -> bool:
+            return any(p == s or p.startswith(s + "/") for s in selected)
+
+        changed = {p for p in all_changed if _matches(p)}
+        # #RA-git (a): staged rename(R/C) 은 origin·new 가 한 변경이다. 한쪽만 필터에 잡혀도
+        # 양쪽을 함께 포함해야 체크포인트 커밋이 일관된다(old 가 tracked 인 채 남지 않게).
+        for orig, new in rename_pairs:
+            if _matches(orig) or _matches(new):
+                changed.update({orig, new})
+        # #RA-git (b): filesystem-rename(git mv 아닌 삭제+생성)은 ' D old'+'?? new' 로 따로 나온다.
+        # paths=[new] 만 선택되면 old 삭제가 staging 누락되어 커밋이 일관성을 잃는다. 선택된 경로와
+        # 같은 디렉터리에 있는 tracked-삭제 파일을 함께 포함해 삭제도 stage 되게 한다(한계: 디렉터리
+        # 단위 휴리스틱 — 다른 디렉터리로의 fs-rename 은 git mv 사용 시에만 R 짝으로 정확히 잡힌다).
+        sel_dirs = {s.rsplit("/", 1)[0] if "/" in s else "" for s in selected}
+        for d in deleted:
+            ddir = d.rsplit("/", 1)[0] if "/" in d else ""
+            if _matches(d) or ddir in sel_dirs:
+                changed.add(d)
         return sorted(changed)
 
     def _has_staged_changes(self) -> bool:
@@ -226,6 +252,49 @@ def _parse_status_paths_z(text: str) -> set[str]:
             if orig:
                 paths.add(orig)
     return paths
+
+
+def _iter_status_records_z(text: str):
+    """`git status --porcelain -z` 레코드를 (xy, path, orig) 로 순차 산출 (#RA-git).
+
+    _parse_status_paths_z 와 같은 토큰 소비 규칙을 쓰되, rename/copy(R/C) 의 origin 경로까지
+    함께 돌려준다(일반 레코드는 orig=None). 손상/짧은 레코드는 skip.
+    """
+    tokens = text.split("\0")
+    if tokens and tokens[-1] == "":
+        tokens.pop()
+    i = 0
+    n = len(tokens)
+    while i < n:
+        rec = tokens[i]
+        i += 1
+        if len(rec) < 4:
+            continue
+        xy = rec[:2]
+        path = rec[3:]
+        orig = None
+        if ("R" in xy or "C" in xy) and i < n:
+            orig = tokens[i]
+            i += 1
+        yield xy, path, orig
+
+
+def _parse_rename_pairs_z(text: str) -> list[tuple[str, str]]:
+    """rename/copy(R/C) 레코드의 (origin, new) 짝 목록 (#RA-git). 빈 경로는 제외."""
+    pairs: list[tuple[str, str]] = []
+    for _xy, path, orig in _iter_status_records_z(text):
+        if orig and path:
+            pairs.append((orig, path))
+    return pairs
+
+
+def _parse_deleted_paths_z(text: str) -> set[str]:
+    """삭제된 tracked 경로 집합 (#RA-git). XY 어느 한쪽이 'D'(' D'/'D '/'AD' 등)면 삭제로 본다."""
+    out: set[str] = set()
+    for xy, path, _orig in _iter_status_records_z(text):
+        if path and "D" in xy:
+            out.add(path)
+    return out
 
 
 def _normalize_paths(paths: list[str] | None) -> set[str] | None:

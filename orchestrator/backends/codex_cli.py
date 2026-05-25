@@ -22,6 +22,10 @@ except ModuleNotFoundError:  # 3.10 이하 → 정규식 기반 안전 fallback 
 
 from .base import Backend, RoleRequest, RoleResult, run_subprocess
 
+# #RA-e2big: 프롬프트 byte 길이가 이 임계치를 넘으면 argv(positional) 대신 stdin 으로 넘겨
+# OS ARG_MAX(E2BIG) 를 회피한다. 보수적 값(100KB) — 흔한 OS ARG_MAX(~256KB+)보다 충분히 작다.
+_PROMPT_STDIN_THRESHOLD = 100_000
+
 
 def _sanitize_key(key: str) -> str:
     """파일명 컴포넌트로 안전하게: 경로 구분자/.. 등을 제거하고 단어 문자만 남긴다.
@@ -281,10 +285,16 @@ class CodexCLIBackend(Backend):
             / f"{req.role}__{safe_key}__{uuid.uuid4().hex}.codex.txt"
         )
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        # #RA-e2big: 작은 프롬프트는 그대로 positional argv 로 넘기지만, 거대 프롬프트(system+
+        # context+task 합본)는 OS ARG_MAX(E2BIG) 에 걸려 create_subprocess_exec 자체가 실패할 수
+        # 있다. codex exec 는 "prompt 가 argv 로 없거나 '-' 이면 stdin 에서 읽는다"(--help 확인).
+        # 임계치(100KB)를 넘으면 positional 자리에 '-' 를 두고 프롬프트를 stdin 으로 흘린다.
+        prompt_bytes = prompt.encode("utf-8")
+        use_stdin = len(prompt_bytes) > _PROMPT_STDIN_THRESHOLD
         cmd = [
             "codex",
             "exec",
-            prompt,
+            "-" if use_stdin else prompt,
             "--cd",
             str(req.cwd),
             "--sandbox",
@@ -301,9 +311,20 @@ class CodexCLIBackend(Backend):
         # 누적 예산은 상위 runner 가 사전 체크로 처리하고, 긴 세션은 timeout 으로만 통제된다.
         try:
             try:
-                rc, out, err, timed_out = await run_subprocess(
-                    cmd, str(req.cwd), req.timeout, req.live_log_path
-                )
+                # #RA-e2big: stdin 경로일 때만 stdin_data 를 넘긴다(작은 프롬프트는 기존 4-인자
+                # 호출 그대로 — 기존 codex 테스트의 fake_run 시그니처와 호환 유지).
+                if use_stdin:
+                    rc, out, err, timed_out = await run_subprocess(
+                        cmd,
+                        str(req.cwd),
+                        req.timeout,
+                        req.live_log_path,
+                        stdin_data=prompt_bytes,
+                    )
+                else:
+                    rc, out, err, timed_out = await run_subprocess(
+                        cmd, str(req.cwd), req.timeout, req.live_log_path
+                    )
             except Exception as e:
                 return RoleResult(ok=False, error=str(e))
 
@@ -314,6 +335,9 @@ class CodexCLIBackend(Backend):
                 partial = _usage_from_jsonl(out)
                 model = req.model or _codex_default_model()
                 p_tokens = _visible_tokens(partial)
+                # #RA-0tok: usage dict 가 truthy 라도 토큰이 전부 0 이면 추정 비용은 0.0 으로
+                # 나온다. "$0.00 (estimated)" 라는 오해를 막기 위해 정확히 0.0 인 추정치는
+                # None 으로 접는다(보고 안 함). `or None` 이 0.0/None 둘 다 None 으로 만든다.
                 p_cost = (
                     codex_cost(
                         model,
@@ -321,6 +345,7 @@ class CodexCLIBackend(Backend):
                         partial.get("cached_input_tokens", 0),
                         partial.get("output_tokens", 0),
                     )
+                    or None
                     if partial
                     else None
                 )
@@ -349,7 +374,9 @@ class CodexCLIBackend(Backend):
             cached = usage.get("cached_input_tokens", 0)
             out_t = usage.get("output_tokens", 0)
             tokens = _visible_tokens(usage)
-            cost = codex_cost(model, inp, cached, out_t) if usage else None
+            # #RA-0tok: 토큰이 전부 0 이면 codex_cost 가 0.0 을 내는데, 이를 그대로 보고하면
+            # "$0.00 (estimated)" 라는 오해를 부른다. 정확히 0.0 인 추정치는 None 으로 접는다.
+            cost = (codex_cost(model, inp, cached, out_t) or None) if usage else None
             return RoleResult(
                 ok=True,
                 final_message=final or "codex exec ok",

@@ -39,13 +39,13 @@ class _BoundedBuffer:
 
     def append(self, line: bytes) -> None:
         if len(line) > self._max:
-            # Tail retention is right for ordinary logs, but stream-json records start with
-            # "{" and losing the head makes the whole event unparsable. Preserve the head for
-            # oversized JSON-looking records; keep tail semantics for everything else.
+            # #RA-buf: 단일 라인이 상한을 넘으면 그 라인'만' 절단한다. 예전엔 clear() 로 이전에
+            # 쌓인 라인(앞선 result/usage/init JSONL 이벤트)까지 통째로 버려, 거대한 라인 하나가
+            # 들어오면 정작 파싱에 필요한 직전 이벤트들이 사라졌다. 이제 오버사이즈 라인 자체만
+            # 절단(JSON 형태면 head, 아니면 tail)해 append 하고, 총 크기 상한은 아래 trim 루프에
+            # 맡긴다(가장 오래된 라인부터 drop). prior 누적 라인은 보존한다.
             line = line[: self._max] if line.lstrip().startswith(b"{") else line[-self._max :]
             self.dropped = True
-            self._lines.clear()
-            self._size = 0
         self._lines.append(line)
         self._size += len(line)
         while self._size > self._max and len(self._lines) > 1:
@@ -56,12 +56,15 @@ class _BoundedBuffer:
         return b"".join(self._lines)
 
 
-async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None):
+async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None, stdin_data=None):
     """서브프로세스를 타임아웃과 함께 실행. (returncode, stdout, stderr, timed_out) 반환.
 
     log_path 가 주어지면 stdout/stderr 를 라인 단위로 그 파일에 실시간 append(tee)한다 →
     긴 CLI 호출 중에도 로그가 실시간으로 쌓인다. line_render(line_bytes)->str|None 가 주어지면
     stdout 각 라인을 그 함수로 가독 변환해 기록(예: stream-json → 텍스트). 타임아웃 시 kill.
+
+    #RA-e2big: stdin_data(bytes)가 주어지면 그것을 자식의 stdin 으로 흘려준다 → 거대 프롬프트를
+    argv 가 아니라 stdin 으로 넘겨 OS ARG_MAX(E2BIG) 를 회피할 수 있다(기본 None=stdin 미사용).
 
     #34: 반환되는 stdout/stderr 는 스트림당 ~2MB tail 로 제한된다 (메모리 폭주 방지).
     전체 출력은 log_path tee 에 남고, 결과 이벤트는 스트림 끝부분에 있어 tail 로 충분하다.
@@ -69,6 +72,7 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None):
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
+        stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=2**20,  # 큰 JSON 라인 대응 (기본 64KB 초과 방지)
@@ -163,10 +167,27 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None):
             if tail:
                 _write_text(tail)
 
+    async def _feed_stdin():
+        # #RA-e2big: 거대 프롬프트를 stdin 으로 흘린다. stdout pump 와 동시에 돌려야(아래 gather)
+        # 자식이 출력하며 stdin 을 읽는 경우에도 파이프 버퍼가 막히지 않는다. 쓰고 나면 EOF 를
+        # 알리기 위해 stdin 을 닫는다(자식이 stdin 종료를 보고 프롬프트 수신을 끝낼 수 있도록).
+        if stdin_data is None or proc.stdin is None:
+            return
+        try:
+            proc.stdin.write(stdin_data)
+            await proc.stdin.drain()
+        except Exception:
+            pass
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+
     async def _drain_and_wait():
         # #21: stdout/stderr pump 와 proc.wait() 를 한 타임아웃 창 안에 함께 넣는다.
         # 그래야 stdout/stderr 를 닫고도 계속 실행되는 프로세스가 타임아웃을 우회하지 못한다.
         await asyncio.gather(
+            _feed_stdin(),
             _pump(proc.stdout, out_chunks, line_render),
             _pump(proc.stderr, err_chunks, None),
         )

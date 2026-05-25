@@ -31,7 +31,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from . import procutil
 from .backends import backend_status, resolve
-from .board import _tail_lines
+from .board import _safe_unit_id, _tail_lines
 from .config import BACKEND_INFO, FRAMEWORK_ROOT, ROLES, VALID_BACKENDS
 from .monitor import _read_agent_log, _read_board
 
@@ -72,7 +72,9 @@ def _read_agent_logs(orch_dir, roles, n: int = 120) -> dict:
     out = {}
     ad = orch_dir / "agents"
     for role in roles:
-        p = ad / f"{role}.log"
+        # #RA2: board._log_path 는 _safe_unit_id 로 정규화해 쓰므로(예: 공백/특수문자 →
+        #       '-', 빈 결과는 '_unknown') 읽기도 동일 규칙을 써야 파일이 어긋나지 않는다.
+        p = ad / f"{_safe_unit_id(role) or '_unknown'}.log"
         if not p.exists():
             continue
         # #20: 전체 파일을 읽지 않고 끝 청크만 seek-read 해 마지막 n 줄만 보낸다(대용량 방어).
@@ -407,10 +409,35 @@ def sanitize_run_opts(opts: dict) -> dict:
     # #M08: 저장된 rerun opts 의 숫자 범위를 클램프한다. 음수가 build_command 를 거쳐
     #       `--concurrency -5` 처럼 스폰 프로세스의 argparse 검증 에러로 재실행을 깨지 않게 한다
     #       (concurrency≥1, retries/max_attempts/max_units≥0; max_units 0 은 build_command 가 생략).
-    for fld, lo in (("concurrency", 1), ("max_units", 0), ("max_attempts", 0), ("retries", 0)):
+    # #RA-numclamp: 하한만이 아니라 상한도 클램프한다 — concurrency=10**9 같은 손상값이
+    #       스폰 프로세스에서 스레드 폭증/OOM 을 일으키지 않게 RunConfig 상한과 맞춘다
+    #       (concurrency≤64; max_attempts/retries/max_units 는 1000 으로 sane cap).
+    for fld, lo, hi in (
+        ("concurrency", 1, 64),
+        ("max_units", 0, 1000),
+        ("max_attempts", 0, 1000),
+        ("retries", 0, 1000),
+    ):
         if fld in out:
             iv = _coerce_int(out.get(fld), lo)
-            out[fld] = iv if iv >= lo else lo
+            out[fld] = min(hi, max(lo, iv))
+
+    # #RA-numclamp: poll_interval/timeout/budget 실수 옵션도 정리한다. /api/run 의 검증
+    #       (음수/비유한값 거부)을 거치지 않는 rerun 경로라, 손상된 _run_opts.json 이
+    #       `--budget -2`/`--timeout -1`/`--poll-interval inf` 처럼 스폰 프로세스의 검증
+    #       에러로 재실행을 깨뜨리지 않게 한다. poll_interval 은 0 으로 폴백(RunConfig 가
+    #       안전 하한 클램프), timeout/budget 은 키 자체를 제거(build_command 가 생략).
+    pi = out.get("poll_interval")
+    if pi not in (None, ""):
+        fv = _coerce_float(pi, None)
+        out["poll_interval"] = fv if (fv is not None and fv >= 0) else 0
+    for fld in ("timeout", "budget"):
+        if fld in out and out.get(fld) not in (None, ""):
+            fv = _coerce_float(out.get(fld), None)
+            if fv is None or fv < 0:
+                out.pop(fld, None)
+            else:
+                out[fld] = fv
     return out
 
 
@@ -916,6 +943,15 @@ def _make_handler(manager: RunManager, token: str | None = None):
             #      쿠키를 심어 이후 fetch 가 자동 인증되게 한다(브라우저 사용성).
             if u.path.startswith("/api/") and self._require_auth():
                 return
+            # #RA-origin: deferred — GET /api/* 에 _require_same_origin 을 그대로 재사용하면
+            #   기존 통과 테스트(test_audit5_webui.test_token_via_cookie)가 깨진다. 그 테스트는
+            #   토큰 서버에서 *쿠키-only 인증 + Origin 부재* 인 GET /api/runs 가 200 을 받기를
+            #   기대하는데, _origin_ok 는 바로 그 조합(auth_token and _is_cookie_only_auth and
+            #   Origin 부재)을 CSRF 표적으로 보고 차단(403)한다 — 이는 POST 도 거부하는 경로다.
+            #   즉 "POST 를 거부할 요청만 거부" 라는 제약을 지키면서 GET 에 적용하면, 합법적
+            #   쿠키-only 브라우저 GET 까지 막혀 하위호환이 깨진다. RA-origin 은 LOW~MEDIUM(현재
+            #   SameSite=Strict 쿠키가 cross-site 전송을 이미 차단)이므로, 기존 테스트를 깨지
+            #   않도록 GET 에는 적용하지 않고 보류한다(POST 의 same-origin 방어는 그대로 유지).
             if u.path == "/":
                 extra = None
                 if auth_token:

@@ -15,6 +15,7 @@ from orchestrator.board import (
     Board,
     _coerce_finite_float,
     _coerce_int,
+    _json_safe,
     _safe_artifact,
     _truncate_body,
 )
@@ -288,3 +289,98 @@ def test_write_report_ok_with_units(tmp_path: Path):
     b = _run(scenario())
     text = b.write_report().read_text(encoding="utf-8")
     assert "- result: **ok**" in text
+
+
+# ---- #RA-nan: NaN/Inf 가 board.json/snapshot 으로 새지 않음 ----
+def test_json_safe_helper_replaces_non_finite():
+    # 비-유한 float 만 0.0 으로 치환, 나머지 값/구조는 보존
+    out = _json_safe(
+        {
+            "a": float("nan"),
+            "b": float("inf"),
+            "c": float("-inf"),
+            "d": 1.5,
+            "e": [float("nan"), "keep", 2, {"f": float("inf")}],
+        }
+    )
+    assert out["a"] == 0.0 and out["b"] == 0.0 and out["c"] == 0.0
+    assert out["d"] == 1.5
+    assert out["e"] == [0.0, "keep", 2, {"f": 0.0}]
+
+
+def test_flush_sanitizes_non_finite_floats(tmp_path: Path):
+    async def scenario():
+        b = Board(tmp_path)
+        await b.init("spec", {})
+        await b.add_units([{"id": "U1", "title": "t"}])
+        # _data 에 임의 NaN/Inf 를 직접 주입(메타데이터 손상 시나리오 모사)
+        b._data["units"][0]["bad_metric"] = float("nan")
+        b._data["stack"] = {"weird": float("inf"), "neg": float("-inf")}
+        b._flush()
+        return b
+
+    b = _run(scenario())
+    raw = (tmp_path / ".orchestrator" / "board.json").read_text(encoding="utf-8")
+    # 표준-비준수 토큰이 파일에 없음 + 표준 파서로 로드 가능
+    assert "NaN" not in raw and "Infinity" not in raw
+    json.loads(raw)
+    # snapshot()/agents() 도 유한값(0.0)으로 살균되어 반환
+    snap = b.snapshot()
+    assert snap["units"][0]["bad_metric"] == 0.0
+    assert math.isfinite(snap["units"][0]["bad_metric"])
+    assert snap["stack"]["weird"] == 0.0 and snap["stack"]["neg"] == 0.0
+
+
+def test_snapshot_and_agents_finite_with_nan(tmp_path: Path):
+    async def scenario():
+        b = Board(tmp_path)
+        await b.init("spec", {})
+        await b.agent_update("backend-developer", status="running")
+        # per-agent 필드에 직접 NaN 주입 → agents() 가 NaN 토큰을 흘리면 안 됨
+        b._data["agents"]["backend-developer"]["bad"] = float("nan")
+        return b
+
+    b = _run(scenario())
+    # snapshot/agents 모두 표준 JSON round-trip 후 유한값
+    assert b.snapshot()["agents"]["backend-developer"]["bad"] == 0.0
+    assert b.agents()["backend-developer"]["bad"] == 0.0
+
+
+# ---- #RA-loglock: per-agent 로그 동시 추가쓰기가 인터리빙 없이 직렬화 ----
+def test_agent_log_appends_under_lock(tmp_path: Path):
+    import threading
+
+    async def scenario():
+        b = Board(tmp_path)
+        await b.init("spec", {})
+        return b
+
+    b = _run(scenario())
+    # 동기 락이 존재하고, 두 메서드가 그 락을 사용하는지 확인
+    assert isinstance(b._agent_log_lock, type(threading.Lock()))
+
+    # 여러 스레드가 동일 agent 로그에 동시에 블록을 써도 줄/블록이 깨지지 않음.
+    # 본문에 개행을 넣어, 락이 없으면 다른 스레드의 줄이 사이에 끼어드는지 검증한다
+    # (body-{i}|END 한 줄이 항상 붙어 있어야 함). prefix 중복을 피하려 |END 마커 사용.
+    n = 40
+    threads = [
+        threading.Thread(
+            target=b.write_agent_block,
+            args=("backend-developer", f"T{i}|END", f"body-{i}|END"),
+        )
+        for i in range(n)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    log = (tmp_path / ".orchestrator" / "agents" / "backend-developer.log").read_text(
+        encoding="utf-8"
+    )
+    # 모든 블록이 정확히 한 번씩 기록됨(인터리빙으로 누락/중복 없음)
+    for i in range(n):
+        assert log.count(f"body-{i}|END") == 1
+        assert log.count(f"T{i}|END") == 1
+    # 블록 구조가 깨지지 않음: 기록된 블록 수 == 스레드 수
+    assert log.count("|END\n") == n * 2  # title 줄 + body 줄 각각 n 개

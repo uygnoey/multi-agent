@@ -42,6 +42,14 @@ def test_format_pidfile_roundtrip(tmp_path):
         assert procutil.read_pid_token(pf) is None
 
 
+def test_read_pid_token_none_on_non_utf8(tmp_path):
+    # #RA1: 비UTF8/손상 pidfile 은 read_text 에서 UnicodeDecodeError(ValueError) 를 던진다 —
+    #       _run_alive 가 매 tick 마다 부르는 경로이므로 예외 없이 None 이어야 한다.
+    pf = tmp_path / "run.pid"
+    pf.write_bytes(b"\xff\xfe123\n")
+    assert procutil.read_pid_token(pf) is None
+
+
 def test_pid_is_ours_fallback_without_token():
     # 저장 토큰이 없으면(구형 pidfile) 항상 True 로 폴백한다(하위 호환).
     assert procutil.pid_is_ours(os.getpid(), None) is True

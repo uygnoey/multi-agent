@@ -32,9 +32,13 @@ _ANTHROPIC_FALLBACK_PRICING = {
 
 # #M05: base 키 뒤에 붙는 접미사를 base 단가로 매핑한다. 현행 모델 ID 는 패밀리와 날짜 사이에
 # 포인트 버전이 들어가므로(claude-opus-4-1-20250805, claude-sonnet-4-5) 포인트 버전 세그먼트
-# `(-\d+)*` 를 허용해야 한다. 예전 정규식 `^-(?:\d{6,8}|latest)$` 는 순수 날짜/latest 만 매칭해
-# 현행 모델이 단가표에 닿지 못하고 구독모드 비용 추정이 None 으로 떨어졌다.
-_ANTHROPIC_DATE_SUFFIX = re.compile(r"^(?:-\d+)*(?:-(?:\d{6,8}|latest))?$")
+# 를 허용해야 한다. 예전 정규식 `^-(?:\d{6,8}|latest)$` 는 순수 날짜/latest 만 매칭해 현행
+# 모델이 단가표에 닿지 못하고 구독모드 비용 추정이 None 으로 떨어졌다.
+# #RA-sdkre: 단, `(?:-\d+)*` 는 임의 개수의 `-digit` 세그먼트를 허용해, 미래의 가격이 다른
+# 변형(가령 단가가 다른 claude-opus-4-2 류)까지 base 단가로 조용히 매핑할 위험이 있다. 포인트
+# 버전 세그먼트를 최대 2개(`{0,2}`)로 제한해, 현행 ID(메이저·마이너 2단계)는 폴백하되 그 이상의
+# 미지 변형은 매칭에서 빠져 None(허위 비용 날조 금지)으로 떨어지게 한다.
+_ANTHROPIC_DATE_SUFFIX = re.compile(r"^(?:-\d+){0,2}(?:-(?:\d{6,8}|latest))?$")
 
 
 def _anthropic_pricing() -> dict:
@@ -77,13 +81,19 @@ def _anthropic_price_for(model: str | None):
 
 
 def _estimate_anthropic_cost(model: str | None, in_tokens: int, out_tokens: int):
-    """모델 단가 × 토큰으로 추정 비용(USD). 모델 미지정/단가표 미등록이면 None."""
+    """모델 단가 × 토큰으로 추정 비용(USD). 모델 미지정/단가표 미등록이면 None.
+
+    #RA-0tok: usage 가 있어도 토큰이 전부 0 이면(예: reasoning_tokens 만 잡힌 경우 등) 추정치가
+    0.0 으로 나온다. "$0.00 (estimated)" 라는 오해를 막기 위해 정확히 0.0 인 추정치는 None 으로
+    접는다(추정 비용 없음 → cost_estimated 도 False 로 표기되게).
+    """
     p = _anthropic_price_for(model)
     if not p:
         return None
     in_price, out_price = p
     cost = (in_tokens or 0) / 1e6 * in_price + (out_tokens or 0) / 1e6 * out_price
-    return round(cost, 6)
+    cost = round(cost, 6)
+    return cost or None
 
 
 def _make_options(cls, dropped: list | None = None, **kwargs):
@@ -269,6 +279,8 @@ class ClaudeSDKBackend(Backend):
             # codex/openai 백엔드와 일관. 모델/토큰을 알 수 없으면 None(허위 비용 날조 금지).
             if state["cost"] is not None:
                 return state["cost"], False
+            # #RA-0tok: _estimate_anthropic_cost 가 0.0(토큰 전부 0)을 None 으로 접으므로,
+            # 여기 est is not None 분기는 0.0 추정치를 보고하지 않는다(아래 None,True 로 떨어짐).
             est = _estimate_anthropic_cost(state["model"], state["in_tokens"], state["out_tokens"])
             if est is not None:
                 return est, True

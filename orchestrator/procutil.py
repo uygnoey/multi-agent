@@ -86,7 +86,7 @@ def read_pid_token(path: Path) -> str | None:
     """run.pid 둘째 줄의 시작시각 토큰. 없으면 None(하위 호환)."""
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    except Exception:  # #RA1: 비UTF8/손상 pidfile 의 UnicodeDecodeError(ValueError) 등도 흡수
         return None
     return lines[1].strip() if len(lines) > 1 and lines[1].strip() else None
 
