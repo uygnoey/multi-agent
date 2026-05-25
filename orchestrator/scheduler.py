@@ -554,22 +554,34 @@ class Scheduler:
         # (repair_instruction·notes·blockers)와 변동성 큰 stderr_tail(타임스탬프·줄번호·임시경로)을
         # 제외하고, 실제 장애를 식별하는 안정 필드(failure_kind·repair_owner·command)만 쓴다.
         # 그래야 반복 카운트가 헛리셋되지 않아 에스컬레이션이 정상 발화한다.
-        stable = {k: fields[k] for k in ("failure_kind", "repair_owner", "command") if k in fields}
+        # #audit14: 검증 단계(source: test-engineer vs qa)도 안정 필드로 포함한다. 서로 다른
+        # 검증 주체의 실패가 같은 failure_kind/command 를 우연히 공유해도 하나의 '반복 실패'로
+        # 과합산되지 않게 한다(Codex 교차검증). dev 경로는 fields 에 source 가 없어 영향 없음.
+        stable = {
+            k: fields[k]
+            for k in ("failure_kind", "repair_owner", "command", "source")
+            if k in fields
+        }
         return json.dumps(
             {"fields": stable, "statuses": [str(o.get("status", "")) for o in failed]},
             ensure_ascii=False,
             sort_keys=True,
         )
 
-    def _remember_verify_failure(self, uid: str, outcome: dict) -> int:
+    def _remember_verify_failure(self, uid: str, outcome: dict, source: str = "") -> int:
         """QA/test 검증 실패의 진행 시그니처를 기록하고 반복 횟수를 반환한다(#H04).
 
         dev 실패(_remember_dev_failure)와 대칭. dev 는 성공하나 QA 가 계속 실패하는 경우에도
         '진전 없음'을 추적해 에스컬레이션·외부장애 분류에 쓴다.
+
+        source(test-engineer/qa)를 시그니처에 포함해(#audit14) 서로 다른 검증 주체의 실패를
+        같은 반복으로 합치지 않는다(같은 source 가 같은 방식으로 반복될 때만 count 증가).
         """
         fields = {
             k: outcome[k] for k in ("failure_kind", "repair_owner", "command") if outcome.get(k)
         }
+        if source:
+            fields["source"] = source
         signature = self._failure_signature(fields, [outcome])
         prev_sig, prev_count = self._verify_failure_signatures.get(uid, ("", 0))
         count = prev_count + 1 if prev_sig == signature else 1
@@ -791,7 +803,7 @@ class Scheduler:
                 self._clear_failure_state(uid)  # #RA5: terminal(FAILED) → 시그니처 정리
                 await self.board.set_status(uid, FAILED, f"{source} failed after retries")
                 return
-            count = self._remember_verify_failure(uid, outcome)  # #H04 진행 추적
+            count = self._remember_verify_failure(uid, outcome, source)  # #H04 진행 추적
             # #H09: 고신뢰 외부/영구 장애가 반복되면 분류·중단.
             ext = self._external_blocker_reason([outcome])
             if ext and count >= 2:

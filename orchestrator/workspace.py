@@ -60,7 +60,14 @@ def _under_root(path: Path, root: Path) -> bool:
 
 
 def _guard_managed_path(project_dir: Path, path: Path, *, allow_unsafe: bool, label: str) -> None:
-    """Reject symlink escapes before writing orchestrator-managed project files."""
+    """Reject symlink escapes before writing orchestrator-managed project files.
+
+    위협 모델(#audit13): 이미 존재하는 symlink 컴포넌트로의 탈출은 거부한다. 다만 이 검사와
+    이어지는 mkdir/write 사이에 *로컬* 공격자가 컴포넌트를 symlink 로 바꿔치기하는 TOCTOU
+    레이스는 닫지 못한다. 본 도구는 단일 사용자 로컬 실행을 전제로 하므로(공격자가 이미 같은
+    사용자 권한으로 로컬에 있어야 성립) 이 잔존 레이스를 수용한다. CI/멀티테넌트/불신 spec 을
+    공유 환경에서 실행한다면 openat(O_NOFOLLOW) 기반 incremental mkdir 로 재작성해야 한다.
+    """
 
     if allow_unsafe:
         return

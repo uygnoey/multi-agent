@@ -1365,7 +1365,7 @@ INDEX_HTML = r"""<!doctype html>
   <section id="launch" class="card">
     <h3 style="margin-top:0">새 실행 — 기획서 업로드</h3>
     <div class="row">
-      <div><label>기획서 파일 (.md/.txt)</label><input type="file" id="specFile" accept=".md,.txt,.markdown"/></div>
+      <div><label>기획서 파일 (.md/.txt/.html)</label><input type="file" id="specFile" accept=".md,.txt,.markdown,.html,.htm"/></div>
       <div><label>실행 이름</label><input type="text" id="name" placeholder="my-app"/></div>
     </div>
     <div class="row">

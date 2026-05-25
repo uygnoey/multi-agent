@@ -99,7 +99,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         prog="orchestrator",
         description="멀티에이전트 · 멀티백엔드 소프트웨어 빌드 오케스트레이터 (웹·앱·서비스·CLI)",
     )
-    p.add_argument("--spec", type=Path, help="기획서 마크다운 경로")
+    p.add_argument("--spec", type=Path, help="기획서 파일 경로 (.md/.txt/.html 등 텍스트)")
     p.add_argument("--project-dir", type=Path, help="산출물을 생성할 타깃 디렉터리")
     p.add_argument(
         "--backend",

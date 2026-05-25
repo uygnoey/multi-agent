@@ -222,6 +222,11 @@ python -m orchestrator --web --port 8765 --base-dir ~/agent-runs
 - **Exception isolation**: one role's failure does not cancel other concurrent roles (run_role never propagates)
 - **Result integrity**: a leftover result file is not mistaken for success when the backend failed; the board is single-writer
 - **Web security**: path-traversal blocking (run id confined to base_dir · role validation), request body size cap
+- ⚠️ **Managed-file symlink guard assumes single-user local use (#audit13)**: managed write paths
+  (`.orchestrator`·`.claude`·`docs`·`CLAUDE.md`, etc.) reject *pre-existing* symlink escapes, but the
+  TOCTOU race between the check and creation (a local attacker swapping in a symlink in that window) is
+  not closed. This is accepted under a single-user local threat model; **for CI/multi-tenant/untrusted
+  input in shared environments**, use an `O_NOFOLLOW`-based rewrite or Docker/sandbox isolation
 - **Result contract**: non-supervisor roles treat a missing/broken result JSON as failure (avoids false success)
 - Per-session `max_turns`/budget, global concurrency semaphore, `--max-units`, path scoping (confined to target cwd)
 - `codex` defaults to `--sandbox workspace-write` and uses `danger-full-access` only when `--full-access` is set.
