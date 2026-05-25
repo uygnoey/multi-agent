@@ -461,7 +461,16 @@ def _coerce_board_schema(data: dict) -> dict:
             # #audit16: agents 의 *값*도 dict 여야 한다. 손상 board(예: {"agents":{"qa":"running"}})
             # 에서 소비자(webui /api/state·monitor render)가 a.get()/a["status"]= 로 접근하다
             # AttributeError/TypeError 로 크래시하던 것을 막는다(비-dict 값은 드롭).
-            data["agents"] = {k: v for k, v in raw_agents.items() if isinstance(v, dict)}
+            kept = {k: v for k, v in raw_agents.items() if isinstance(v, dict)}
+            # #audit17(R2): dict 값 안의 문자열성 스칼라 필드도 비-str 이면 str 로 강제한다.
+            # 소비자가 (a.get("model") or ...)[:18] 슬라이스나 f"{status:<9}" 포맷을 하므로,
+            # model=123/status={...} 같은 비-str 이 dict-값 필터를 통과한 뒤 render_snapshot/
+            # _draw_list 를 TypeError 로 크래시시키던 것을 막는다.
+            for v in kept.values():
+                for f in ("status", "model", "backend", "current_unit", "last_message"):
+                    if f in v and not isinstance(v[f], str):
+                        v[f] = str(v[f])
+            data["agents"] = kept
     raw_units = data.get("units")
     if raw_units is not None and not isinstance(raw_units, list):
         data["units"] = []

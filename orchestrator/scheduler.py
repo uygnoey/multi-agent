@@ -242,7 +242,7 @@ class Scheduler:
                     await self.board.set_status(uid, BLOCKED, "stop requested before unit started")
                     await self.board.add_warning(f"{uid}: stop 요청으로 unit 미처리 → blocked")
                     return
-                if not await self._wait_for_deps(unit):
+                if not await self._wait_for_deps(unit, skipped_unit_ids=skipped_unit_ids):
                     await self.board.set_status(uid, BLOCKED, "deps unmet or failed")
                     await self.board.add_warning(f"{uid}: 의존성 미충족/실패로 blocked")
                     return
@@ -794,6 +794,11 @@ class Scheduler:
         밖에서 수행해 두 세마포어를 중첩 점유하지 않는다.
         """
         uid = unit["id"]
+        # #audit17(R1): dev→test 경계에서 외부장애 debounce 카운터를 리셋한다. dev 수리 중 쌓인
+        # ext_repeat(예: 1)가 검증 단계로 새어 test 첫 외부장애 1회만으로 >=2 거짓 BLOCK 하던
+        # 회귀(audit16)를 막는다. 검증 루프 내부의 dev 재작업은 이 값을 건드리지 않으므로,
+        # te↔qa 교대 외부장애의 정상 누적·중단(audit15)은 그대로 유지된다.
+        self._external_repeat.pop(uid, None)
         target = unit  # 검증 대상 (실패 시 repair_context 가 붙은 unit 으로 갱신)
         skip_te_once = False  # test/config 재작업 직후엔 te 를 생략하고 바로 qa
         while True:
@@ -901,7 +906,9 @@ class Scheduler:
                 return  # terminal 상태 세팅됨
             target = developed  # 재검증 (continue)
 
-    async def _wait_for_deps(self, unit: dict, timeout: float | None = None) -> bool:
+    async def _wait_for_deps(
+        self, unit: dict, timeout: float | None = None, skipped_unit_ids: set[str] | None = None
+    ) -> bool:
         """deps 가 모두 완료되면 True. 실패/blocked dep 이 있으면 즉시 False(패스트페일).
 
         존재하지 않는 dep id 는 BLOCKED 로 처리한다(False). 타임아웃은 의존 unit 의
@@ -919,6 +926,16 @@ class Scheduler:
         if unknown:
             await self.board.add_warning(f"{uid}: 존재하지 않는 의존성 → blocked: {unknown}")
             await self.board.log_event(uid, f"unknown deps → blocked: {unknown}")
+            return False
+        # #audit17(N2): dep 가 --max-units 로 스킵되어 영구 DESIGNED 로 남는 경우, 완료(성공)도
+        # 실패(FAILED/BLOCKED)도 아니라 stall 윈도까지 헛대기하다 blocked 됐다. 스킵된 dep 는
+        # 만족될 수 없으므로 즉시 blocked 로 표면화한다(성공으로 치지 않음).
+        skipped_dep = [d for d in deps if skipped_unit_ids and d in skipped_unit_ids]
+        if skipped_dep:
+            await self.board.add_warning(
+                f"{uid}: 의존성이 --max-units 로 스킵됨 → blocked: {skipped_dep}"
+            )
+            await self.board.log_event(uid, f"deps skipped by --max-units → blocked: {skipped_dep}")
             return False
         # 단순 시간초과가 아니라 '진행이 멈췄을 때'만 포기한다(stall). dep 가 아직 작업 중이면
         # (상태가 바뀌거나 에이전트가 활동 중이면) 계속 기다린다 — 한 role 호출이 상태를 붙잡는

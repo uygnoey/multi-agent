@@ -63,6 +63,10 @@ def _cap_text(value, limit: int) -> str:
 
 def _coerce_finite_float(raw) -> float:
     """비-숫자/NaN/Inf 는 0.0 으로 변환 (잘못된 비용 메타데이터 방어)."""
+    # #audit17(N3): bool 은 int 의 서브클래스라 float(True)==1.0 이 된다. _safe_report_num 과
+    # 동일하게 명시적으로 거부 — cost_add=True 같은 오입력이 $1.00 을 누적하지 않게 한다.
+    if isinstance(raw, bool):
+        return 0.0
     try:
         val = float(raw)
     except (TypeError, ValueError):
@@ -71,11 +75,11 @@ def _coerce_finite_float(raw) -> float:
 
 
 def _json_key_safe(key):
-    if isinstance(key, float) and not math.isfinite(key):
-        return str(key)
-    if isinstance(key, (str, int, float, bool)) or key is None:
-        return key
-    return str(key)
+    # #audit17(N4): 비-str 키를 모두 str 로 정규화한다. 예전엔 int/bool/float 키를 그대로 두어,
+    # 1 과 "1" 같은 int-vs-str 충돌이 _json_safe 의 dict 컴프리헨션에서 별개 키로 남고 json.dumps
+    # 가 중복 키({"1":..,"1":..})를 뱉어 브라우저 JSON.parse 가 한 값을 조용히 잃었다. 모두
+    # str 로 만들면 컴프리헨션이 충돌을 last-wins 로 합쳐 항상 유일 키만 직렬화된다.
+    return key if isinstance(key, str) else str(key)
 
 
 def _json_safe(obj, _seen: set[int] | None = None):
@@ -89,30 +93,31 @@ def _json_safe(obj, _seen: set[int] | None = None):
     if isinstance(obj, (str, int, bool)) or obj is None:
         return obj
     oid = id(obj)
-    if isinstance(obj, (dict, list, tuple, set)):
+    # #audit17(N4): set 은 재귀 대상에서 제외해 leaf 로 둔다 → 호출부 default=str 가 "{...}"
+    # 문자열로 격하한다(set→str 의미 보존, 기존 동작/테스트와 일치). dict/list/tuple 만 재귀해
+    # 내부 NaN/순환/키를 살균한다(set 원소는 hashable 이라 set 자체를 품지 못해 순환 위험 없음).
+    if isinstance(obj, (dict, list, tuple)):
         if oid in _seen:
             return "<cycle>"
         _seen.add(oid)
         try:
             if isinstance(obj, dict):
                 return {_json_key_safe(k): _json_safe(v, _seen) for k, v in obj.items()}
-            if isinstance(obj, (list, tuple, set)):
-                return [_json_safe(v, _seen) for v in obj]
+            return [_json_safe(v, _seen) for v in obj]
         finally:
             _seen.discard(oid)
-    if isinstance(obj, dict):
-        return {str(k): _json_safe(v, _seen) for k, v in obj.items()}
     return obj
 
 
 def _dumps_safe(data, **kw) -> str:
-    # #RA-nan: allow_nan=False 로 우선 직렬화해 NaN/Inf 가 없으면 그대로 통과.
-    # NaN/Inf 가 섞여 있으면 json.dumps 가 ValueError 를 던지는데, 그 예외로 단일 writer 를
-    # 죽이지 않고 _json_safe 로 살균한 구조를 다시 allow_nan=False 로 직렬화한다.
-    try:
-        return json.dumps(data, ensure_ascii=False, allow_nan=False, **kw)
-    except (TypeError, ValueError, RecursionError):
-        return json.dumps(_json_safe(data), ensure_ascii=False, allow_nan=False, **kw)
+    # #audit17(N4): 항상 _json_safe 로 먼저 살균한 뒤 직렬화한다. 예전엔 json.dumps 를 직접
+    # 시도하고 예외 때만 폴백했는데, 비-str 키(예: int 1 과 str "1")는 json.dumps 가 예외 없이
+    # 둘 다 "1" 로 직렬화해 '중복 키'를 뱉었다(브라우저 JSON.parse 가 한 값을 조용히 유실).
+    # _json_safe 가 모든 키를 str 로 정규화하고 dict 컴프리헨션이 충돌을 last-wins 로 합쳐 항상
+    # 유일 키만 남긴다. NaN/Inf→0, 순환→마커도 함께 처리. set/bytes 등 비-직렬화 leaf 값은
+    # 그대로 두고 호출부의 default=str 가 격하한다(set→"{...}" 문자열 의미 보존). 비용은 작은
+    # board 재구성으로 _flush 의 fsync×2 에 비하면 무시할 수준.
+    return json.dumps(_json_safe(data), ensure_ascii=False, allow_nan=False, **kw)
 
 
 def _coerce_int(raw) -> int:
@@ -395,7 +400,9 @@ class Board:
                     pass
             self._data = {
                 "created_at": time.time(),
-                "spec_excerpt": spec_text[:2000],
+                # #audit17(N5): 비-str spec_text(int/dict 등)면 [:2000] 슬라이스가 TypeError 로
+                # init 을 반쪽 실패시켜 board.json 이 안 생겼다. str() 로 방어(입력 경로 일관).
+                "spec_excerpt": str(spec_text)[:2000],
                 "stack": stack,
                 "phase": "init",
                 "total_cost_usd": 0.0,

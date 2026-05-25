@@ -1630,7 +1630,7 @@ async function tick(){
         (a.tokens?num(a.tokens).toLocaleString()+" tok":null),"calls "+(a.calls||0),
         (a.current_unit&&a.current_unit!=="global")?("unit "+a.current_unit):null].filter(Boolean).join(" · ");
       return '<div class="agent-card'+(run?" run":"")+'"><h5>'+statusDot(a.status)+esc(r)+
-        '<span class="badge">'+(a.status||"idle")+'</span></h5><div class="meta">'+esc(meta)+
+        '<span class="badge">'+esc(a.status||"idle")+'</span></h5><div class="meta">'+esc(meta)+
         '</div><pre>'+esc(logs[r]||"(대기 중)")+'</pre></div>'}).join("");
     document.querySelectorAll("#agentCards pre").forEach(p=>{p.scrollTop=p.scrollHeight});
     // 통합 로그 — 자동 스크롤
