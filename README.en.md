@@ -161,7 +161,7 @@ python -m orchestrator --watch --project-dir /tmp/demo-web
 #  or (after install):  dev-crew-monitor --project-dir /tmp/demo-web
 ```
 
-- **List view**: status (● running / ○ idle), cumulative cost, call count, current unit for all 10 roles
+- **List view**: status (● running / ○ idle), cumulative cost, call count, current unit for all 11 roles
 - **↑/↓** (or j/k) to move, **Enter** to open an agent's detail
 - **Detail view**: what that agent is doing in real time (activity log) · cost · backend. The log
   **auto-follows the latest (tail)** and **soft-wraps** on narrow screens. **↑** pauses follow,

@@ -146,6 +146,38 @@ def _safe_unit_id(raw) -> str:
     return s
 
 
+def _path_under_root(path: Path, root: Path) -> bool:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    return resolved == root or root in resolved.parents
+
+
+def _guard_managed_project_path(project_dir: Path, path: Path, label: str) -> None:
+    """Reject symlink escapes before Board writes managed project artifacts."""
+
+    if os.environ.get("ORCH_ALLOW_UNSAFE_PROJECT_DIR") == "1":
+        return
+    root = project_dir.resolve()
+    try:
+        rel = path.relative_to(project_dir)
+    except ValueError as exc:
+        raise ValueError(f"{label} path escapes project dir: {path}") from exc
+
+    cur = project_dir
+    for part in rel.parts:
+        cur = cur / part
+        try:
+            is_link = cur.is_symlink()
+        except OSError as exc:
+            raise ValueError(f"cannot verify symlink status for {cur}") from exc
+        if is_link:
+            raise ValueError(f"{label} path is a symlink: {cur}")
+        if cur.exists() and not _path_under_root(cur, root):
+            raise ValueError(f"{label} path escapes project dir: {cur.resolve()}")
+
+
 # unit 상태 머신
 TODO = "todo"
 DESIGNING = "designing"
@@ -728,6 +760,7 @@ class Board:
         done = sum(1 for u in units if u.get("status") in TERMINAL_OK)
         artifacts = d.get("artifacts", [])
         docs_dir = self.project_dir / "docs"
+        _guard_managed_project_path(self.project_dir, docs_dir, "docs deliverables")
         docs_dir.mkdir(parents=True, exist_ok=True)
 
         def table(headers):
@@ -796,6 +829,8 @@ class Board:
         # 파일이 없을 때만 보드 요약을 써서 항상 fallback 이 존재하도록 보장한다.
         en_path = docs_dir / "DELIVERABLES.md"
         ko_path = docs_dir / "DELIVERABLES.ko.md"
+        _guard_managed_project_path(self.project_dir, en_path, "docs deliverables")
+        _guard_managed_project_path(self.project_dir, ko_path, "docs deliverables")
         # board.json 과 동일하게 원자적(temp→os.replace)으로 기록(부분 파일 방지)
         if not en_path.exists():
             self._atomic_write_text(en_path, "\n".join(en) + "\n")

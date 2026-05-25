@@ -47,6 +47,7 @@ def test_scaffold_rewrites_orchestrator_generated_claude_md(tmp_path: Path):
     refreshed = (target / "CLAUDE.md").read_text(encoding="utf-8")
     assert refreshed != stale  # stale content replaced
     assert "the current spec body" in refreshed  # current spec excerpt embedded
+    assert ".orchestrator/spec.md" in refreshed
     assert (target / "AGENTS.md").exists()
 
 
@@ -60,7 +61,7 @@ def test_scaffold_appends_to_existing_gitignore(tmp_path: Path):
     assert ".orchestrator/" in gi
 
 
-def test_expose_team_agents_copies_ten_files(tmp_path: Path):
+def test_expose_team_agents_copies_eleven_files(tmp_path: Path):
     target = tmp_path / "proj"
     target.mkdir()
     count = expose_team_agents(target)

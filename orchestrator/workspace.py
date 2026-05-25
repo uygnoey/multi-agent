@@ -51,6 +51,52 @@ _SYSTEM_DIR_NAMES = {
 }
 
 
+def _under_root(path: Path, root: Path) -> bool:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    return resolved == root or root in resolved.parents
+
+
+def _guard_managed_path(project_dir: Path, path: Path, *, allow_unsafe: bool, label: str) -> None:
+    """Reject symlink escapes before writing orchestrator-managed project files."""
+
+    if allow_unsafe:
+        return
+    root = project_dir.resolve()
+    try:
+        rel = path.relative_to(project_dir)
+    except ValueError as exc:
+        raise ValueError(
+            f"위험한 project_dir 거부: {label} 경로가 project_dir 밖입니다 ({path}). "
+            "정말 의도했다면 ORCH_ALLOW_UNSAFE_PROJECT_DIR=1 을 설정하세요."
+        ) from exc
+
+    cur = project_dir
+    for part in rel.parts:
+        cur = cur / part
+        try:
+            is_link = cur.is_symlink()
+        except OSError as exc:
+            raise ValueError(
+                f"위험한 project_dir 거부: {cur} 의 심링크 여부를 확인할 수 없습니다 "
+                f"({exc}). 안전을 확인할 수 없어 거부합니다. "
+                "정말 의도했다면 ORCH_ALLOW_UNSAFE_PROJECT_DIR=1 을 설정하세요."
+            ) from exc
+        if is_link:
+            raise ValueError(
+                f"위험한 project_dir 거부: {cur} 이(가) 심볼릭 링크입니다 "
+                f"({label} 외부 쓰기 방지). "
+                "정말 의도했다면 ORCH_ALLOW_UNSAFE_PROJECT_DIR=1 을 설정하세요."
+            )
+        if cur.exists() and not _under_root(cur, root):
+            raise ValueError(
+                f"위험한 project_dir 거부: {label} 실경로가 project_dir 밖을 가리킵니다 "
+                f"({cur.resolve()}). 정말 의도했다면 ORCH_ALLOW_UNSAFE_PROJECT_DIR=1 을 설정하세요."
+            )
+
+
 def _fmt_stack(stack: dict) -> str:
     # (#audit9-13) stack 이 None/비-dict 여도 죽지 않게 방어.
     if not isinstance(stack, dict):
@@ -85,7 +131,10 @@ def expose_team_agents(project_dir: Path) -> int:
     """
     if not AGENTS_DIR.exists():
         return 0
-    dest_dir = Path(project_dir) / ".claude" / "agents"
+    project_dir = Path(project_dir).expanduser().resolve()
+    allow_unsafe = os.environ.get("ORCH_ALLOW_UNSAFE_PROJECT_DIR") == "1"
+    dest_dir = project_dir / ".claude" / "agents"
+    _guard_managed_path(project_dir, dest_dir, allow_unsafe=allow_unsafe, label=".claude/agents")
     dest_dir.mkdir(parents=True, exist_ok=True)
     count = 0
     for md in sorted(AGENTS_DIR.glob("*.md")):
@@ -97,6 +146,7 @@ def expose_team_agents(project_dir: Path) -> int:
             print(f"[scaffold] 역할 정의 읽기 실패로 건너뜀: {md.name} ({exc})")
             continue
         dest = dest_dir / md.name
+        _guard_managed_path(project_dir, dest, allow_unsafe=allow_unsafe, label=".claude/agents")
         # 기존 파일은 건드리지 않음 (#12): 동일하면 재기록 불필요, 다르면 사용자 편집본 보존.
         # 없을 때만 새로 기록한다.
         # 의도된 동작(#20): 기존 .claude/agents/*.md 는 절대 덮어쓰지 않아 사용자 편집을 보존한다.
@@ -191,6 +241,13 @@ def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
                 )
 
     orch = project_dir / ".orchestrator"
+    _guard_managed_path(project_dir, orch, allow_unsafe=allow_unsafe, label=".orchestrator")
+    _guard_managed_path(
+        project_dir, orch / "results", allow_unsafe=allow_unsafe, label=".orchestrator/results"
+    )
+    _guard_managed_path(
+        project_dir, orch / "qa", allow_unsafe=allow_unsafe, label=".orchestrator/qa"
+    )
     (orch / "results").mkdir(parents=True, exist_ok=True)
     (orch / "qa").mkdir(parents=True, exist_ok=True)
     # .orchestrator/spec.md 는 사용자 파일이 아니라 오케스트레이터 내부 상태다. 재사용 디렉터리에
@@ -198,11 +255,15 @@ def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
     # 단, spec_text 가 비어있거나 공백뿐이면 기록을 건너뛴다: 빈 값으로 덮어쓰면 이전에 있던
     # 정상 spec 을 파괴하기 때문이다(재사용 디렉터리 보호). 기존 파일이 있으면 그대로 보존한다.
     if spec_text and spec_text.strip():
+        _guard_managed_path(
+            project_dir, orch / "spec.md", allow_unsafe=allow_unsafe, label=".orchestrator/spec.md"
+        )
         (orch / "spec.md").write_text(spec_text, encoding="utf-8")
 
     stack_str = _fmt_stack(stack)
     for fname in ("CLAUDE.md", "AGENTS.md"):
         target = project_dir / fname
+        _guard_managed_path(project_dir, target, allow_unsafe=allow_unsafe, label=fname)
         tpl = TEMPLATES_DIR / fname
         base = tpl.read_text(encoding="utf-8") if tpl.exists() else f"# {fname}\n"
         # 생성 마커를 본문 맨 앞에 박아 두어 우리 생성물임을 표시한다 (#40).
@@ -232,6 +293,7 @@ def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
     expose_team_agents(project_dir)
 
     gi = project_dir / ".gitignore"
+    _guard_managed_path(project_dir, gi, allow_unsafe=allow_unsafe, label=".gitignore")
     if gi.exists():
         cur = gi.read_text(encoding="utf-8")
         # 라인 단위로 실제 ignore 패턴을 확인 (주석/부분일치 오인 방지; #92)

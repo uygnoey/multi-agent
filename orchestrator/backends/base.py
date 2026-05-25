@@ -24,6 +24,22 @@ from typing import Any
 _MAX_STREAM_BYTES = 2 * 1024 * 1024  # 스트림당 메모리 보관 상한 (~2MB tail)
 
 
+def _open_live_log(log_path) -> Any:
+    f = open(log_path, "a", encoding="utf-8")  # noqa: SIM115 (closed by caller)
+    f.write(f"\n===== backend run @ {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+    f.flush()
+    return f
+
+
+def _write_live_log(f, text: str) -> None:
+    f.write(text)
+    f.flush()
+
+
+def _close_live_log(f) -> None:
+    f.close()
+
+
 class _BoundedBuffer:
     """라인 bytes 를 누적하되, 총 보관 크기를 상한으로 제한하는 tail 버퍼.
 
@@ -89,15 +105,14 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None, std
     out_chunks = _BoundedBuffer(_MAX_STREAM_BYTES)
     err_chunks = _BoundedBuffer(_MAX_STREAM_BYTES)
     f = None
+    log_lock = asyncio.Lock()
     if log_path is not None:
         try:
             # #H08: "w"(truncate)는 같은 파일(agents_dir/{role}.log)에 runner 가 백엔드 호출 직전
             # 기록한 PROMPT 블록과 직전 retry/failover 로그까지 지워 장애 분석성을 떨어뜨린다.
             # "a"(append)로 보존하되, 호출마다 구분자 헤더를 1줄 남겨 시도 경계를 표시한다.
             # (재사용 project-dir 의 과거 run 로그는 board.init 이 run 시작 시 1회 비운다.)
-            f = open(log_path, "a", encoding="utf-8")  # noqa: SIM115 (수동 close)
-            f.write(f"\n===== backend run @ {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
-            f.flush()
+            f = await asyncio.to_thread(_open_live_log, log_path)
         except Exception:
             f = None
 
@@ -106,26 +121,27 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None, std
 
         decoder = codecs.getincrementaldecoder("utf-8")("replace") if render is None else None
 
-        def _write_text(text: str) -> None:
+        async def _write_text(text: str) -> None:
             if f is None:
                 return
+            if not text:
+                return
             try:
-                f.write(text)
-                f.flush()
+                async with log_lock:
+                    await asyncio.to_thread(_write_live_log, f, text)
             except Exception:
                 pass
 
-        def _write_rendered(line: bytes) -> None:
+        async def _write_rendered(line: bytes) -> None:
             if f is None:
                 return
             try:
                 if render is not None:
                     rendered = render(line)
                     if rendered:
-                        f.write(rendered if rendered.endswith("\n") else rendered + "\n")
-                        f.flush()
+                        await _write_text(rendered if rendered.endswith("\n") else rendered + "\n")
                 else:
-                    _write_text(line.decode(errors="replace"))
+                    await _write_text(line.decode(errors="replace"))
             except Exception:
                 pass
 
@@ -138,7 +154,7 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None, std
                 break
             chunks.append(data)
             if render is None:
-                _write_text(decoder.decode(data, final=False) if decoder is not None else "")
+                await _write_text(decoder.decode(data, final=False) if decoder is not None else "")
                 continue
             pending += data
             while True:
@@ -147,25 +163,20 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None, std
                     break
                 line = pending[: pos + 1]
                 pending = pending[pos + 1 :]
-                _write_rendered(line)
+                await _write_rendered(line)
             if len(pending) > _MAX_STREAM_BYTES:
                 pending = (
                     pending[:_MAX_STREAM_BYTES]
                     if pending.lstrip().startswith(b"{")
                     else pending[-_MAX_STREAM_BYTES:]
                 )
-                if f is not None:
-                    try:
-                        f.write("[stream line truncated]\n")
-                        f.flush()
-                    except Exception:
-                        pass
+                await _write_text("[stream line truncated]\n")
         if render is not None and pending:
-            _write_rendered(pending)
+            await _write_rendered(pending)
         if render is None and decoder is not None:
             tail = decoder.decode(b"", final=True)
             if tail:
-                _write_text(tail)
+                await _write_text(tail)
 
     async def _feed_stdin():
         # #RA-e2big: 거대 프롬프트를 stdin 으로 흘린다. stdout pump 와 동시에 돌려야(아래 gather)
@@ -259,7 +270,7 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None, std
     finally:
         if f is not None:
             try:
-                f.close()
+                await asyncio.to_thread(_close_live_log, f)
             except Exception:
                 pass
         # #2: asyncio 서브프로세스 transport 를 루프가 살아있는 지금 명시적으로 닫는다.

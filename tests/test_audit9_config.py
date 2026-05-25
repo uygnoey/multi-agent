@@ -17,7 +17,7 @@ from orchestrator.config import (
     normalize_completion_level,
 )
 from orchestrator.prompts import compose_prompt
-from orchestrator.workspace import _fmt_stack, scaffold
+from orchestrator.workspace import _fmt_stack, expose_team_agents, scaffold
 
 
 def _cfg(**kw) -> RunConfig:
@@ -341,6 +341,30 @@ def test_scaffold_rejects_orchestrator_symlink_escape(tmp_path, monkeypatch):
         scaffold(project, "spec", {})
     # 방어가 동작했으니 outside 에 results/qa 가 생기지 않아야 한다.
     assert not (outside / "results").exists()
+
+
+def test_scaffold_rejects_claude_agents_symlink_escape(tmp_path, monkeypatch):
+    monkeypatch.delenv("ORCH_ALLOW_UNSAFE_PROJECT_DIR", raising=False)
+    project = tmp_path / "proj"
+    project.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (project / ".claude").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="심볼릭 링크|밖"):
+        scaffold(project, "spec", {})
+    assert not (outside / "agents").exists()
+
+
+def test_expose_team_agents_rejects_claude_symlink_escape(tmp_path, monkeypatch):
+    monkeypatch.delenv("ORCH_ALLOW_UNSAFE_PROJECT_DIR", raising=False)
+    project = tmp_path / "proj"
+    project.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (project / ".claude").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="심볼릭 링크|밖"):
+        expose_team_agents(project)
+    assert not (outside / "agents").exists()
 
 
 def test_scaffold_symlink_bypass_with_env(tmp_path, monkeypatch):

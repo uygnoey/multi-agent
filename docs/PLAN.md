@@ -8,7 +8,7 @@
 여기 들어있는 멀티에이전트 코드가 **별도의 새 프로젝트 디렉터리(타깃)** 에 소프트웨어(웹·앱·서비스·CLI 등)를 만들어낸다.
 즉 오케스트레이터는 재사용 가능한 도구이고, 실행할 때마다 `--project-dir <타깃>`을 받아 그 안에 산출물을 생성한다.
 
-가상 개발팀은 10개 역할 에이전트로 구성된다.
+가상 개발팀은 11개 역할 에이전트로 구성된다.
 - PM/PL(1·2)은 **상시 감독**, 아키텍트(3)가 설계하면 개발 3인(4·5·9)이 **동시에** 구현하고,
   개발 단위가 끝날 때마다 테스트 3인(6·7·8)이 테스트시트/테스트코드로 검증한다.
 - 핵심 요구: "상시 감독" + "각 에이전트 동시 실행" + "개발 단위별 완료 시 테스트 트리거".
@@ -97,7 +97,7 @@ flowchart TB
 
 ### 1) 역할 정의 — `.claude/agents/*.md` (하이브리드 축, 프롬프트 단일 출처)
 frontmatter(`name`,`description`,`tools`,`model`)+본문. 오케스트레이터가 본문을 읽어 모든 백엔드 역할 프롬프트로 주입(Claude SDK=`system_prompt`, Claude CLI=`--append-system-prompt`, OpenAI=`instructions`, Codex=prepend). 대화형 Claude Code에서도 재사용.
-10개: `project-manager`, `project-leader`, `architecture-engineer`, `frontend-developer`, `backend-developer`, `dba`, `testsheet-creator`, `test-engineer`, `qa`, `cicd`. 최소권한 `tools`, Agent 툴 미부여.
+11개: `project-manager`, `project-leader`, `architecture-engineer`, `frontend-developer`, `backend-developer`, `dba`, `testsheet-creator`, `test-engineer`, `qa`, `cicd`, `docs-writer`. 최소권한 `tools`, Agent 툴 미부여.
 
 ### 2) 공유 지침 템플릿 — `templates/CLAUDE.md`, `templates/AGENTS.md`
 오케스트레이터가 타깃 스캐폴딩 시 spec 컨텍스트와 함께 타깃 루트에 기록 → CLI 백엔드(claude/codex)가 cwd에서 자동 로드. 내용: 타깃 레이아웃, **결과파일 조정 프로토콜**, 코딩 컨벤션, 선택된 스택. 두 생태계 규약 동시 제공.

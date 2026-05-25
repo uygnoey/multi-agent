@@ -73,6 +73,11 @@ def compose_prompt(
         "Follow the shared protocol, coding conventions, and tech stack in this directory's "
         "CLAUDE.md / AGENTS.md."
     )
+    parts.append(
+        "The complete current product spec is stored at `.orchestrator/spec.md` in the project "
+        "root. Inline excerpts are only orientation aids; use the full file when planning from "
+        "the whole spec or when a work unit is ambiguous."
+    )
     # (#audit9-10) 완료 수준 정규화는 config.normalize_completion_level 단일 소스를 재사용한다.
     level = normalize_completion_level(completion_level)
     if level == "production":
@@ -110,6 +115,17 @@ def compose_prompt(
         )
     else:
         parts.append("## Scope\nThe entire spec.")
+        if role == "architecture-engineer":
+            parts.append(
+                "## Full spec required\n"
+                "Before decomposing work units, read `.orchestrator/spec.md` in full and base the "
+                "unit list on the complete spec, not only on the excerpt below."
+            )
+        else:
+            parts.append(
+                "## Full spec source\n"
+                "Read `.orchestrator/spec.md` when the excerpt below is incomplete for this task."
+            )
         if spec_excerpt:
             parts.append("## Spec excerpt\n" + spec_excerpt[:1500])
 

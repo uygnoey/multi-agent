@@ -1,7 +1,7 @@
 """실시간 에이전트 모니터 TUI (stdlib curses, 의존성 0).
 
 별도 프로세스로 실행해 `<project-dir>/.orchestrator/` 의 런 상태를 폴링한다.
-  - 리스트 뷰: 10개 역할의 상태(●running/○idle)·누적 비용·호출수·현재 unit
+  - 리스트 뷰: 11개 역할의 상태(●running/○idle)·누적 비용·호출수·현재 unit
   - ↑/↓(또는 j/k) 이동, Enter 로 상세 진입
   - 상세 뷰: 그 에이전트가 실시간으로 무엇을 하는지(활동 로그) + 비용, b/Esc 로 뒤로
   - q 종료

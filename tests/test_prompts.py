@@ -92,6 +92,8 @@ def test_spec_excerpt_and_scope_when_unit_none():
     )
     assert "## Scope" in out
     assert "The entire spec." in out
+    assert "## Full spec required" in out
+    assert "read `.orchestrator/spec.md` in full" in out
     assert "## Spec excerpt" in out
     assert "This is the project spec body." in out
 

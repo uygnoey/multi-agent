@@ -30,4 +30,8 @@ This file is auto-loaded by agents that read `AGENTS.md` (e.g. OpenAI Codex).
   start servers — CI handles install/build, and only QA runs tests. Write/edit source; stay focused.
 
 ## Spec excerpt
+The complete current spec is stored at `.orchestrator/spec.md`. Treat this excerpt as a
+navigation aid only; read the full file before planning or implementing requirements that may
+extend beyond the excerpt.
+
 {{SPEC_EXCERPT}}

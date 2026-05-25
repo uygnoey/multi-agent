@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from orchestrator.board import Board
 
 
@@ -77,3 +79,20 @@ def test_write_deliverables_fills_only_missing_side(tmp_path: Path):
     # KO 는 보드 요약으로 생성됨
     ko = (docs_dir / "DELIVERABLES.ko.md").read_text(encoding="utf-8")
     assert "# 개발 산출물" in ko
+
+
+def test_write_deliverables_rejects_docs_symlink_escape(tmp_path: Path):
+    async def scenario():
+        b = Board(tmp_path)
+        await b.init("spec", {})
+        await b.add_units([{"id": "U1", "title": "t"}])
+        return b
+
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (tmp_path / "docs").symlink_to(outside, target_is_directory=True)
+    b = _run(scenario())
+
+    with pytest.raises(ValueError, match="symlink|escapes|심볼릭"):
+        b.write_deliverables()
+    assert not (outside / "DELIVERABLES.md").exists()
