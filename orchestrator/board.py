@@ -27,6 +27,13 @@ _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 # 로그/디렉티브 본문 최대 길이: LLM 폭주 출력이 파일을 무한히 키우는 것을 방지.
 _MAX_BODY_CHARS = 20000
 
+# unit 텍스트/경로 필드 길이 상한 (#audit13): 런어웨이 입력(수만~수십만 자 title/description/
+# artifact)이 board.json·report.md·API payload 를 부풀리지 않게 캡. 정상 콘텐츠는 보존하되
+# 명백한 폭주만 잘라 '…(truncated)' 마커를 남긴다.
+_MAX_TITLE_CHARS = 1000
+_MAX_DESCRIPTION_CHARS = 8000
+_MAX_ARTIFACT_CHARS = 1024
+
 
 def _ts() -> str:
     """이벤트/디렉티브/에이전트 블록용 타임스탬프.
@@ -44,6 +51,14 @@ def _truncate_body(text: str) -> str:
     if len(s) <= _MAX_BODY_CHARS:
         return s
     return s[:_MAX_BODY_CHARS] + "\n…(truncated)"
+
+
+def _cap_text(value, limit: int) -> str:
+    """unit title/description 텍스트 필드를 limit 자로 캡 (#audit13). 비-str 은 str() 방어."""
+    s = str(value)
+    if len(s) <= limit:
+        return s
+    return s[:limit] + "…(truncated)"
 
 
 def _coerce_finite_float(raw) -> float:
@@ -131,6 +146,9 @@ def _safe_artifact(raw) -> str | None:
     parts = re.split(r"[\\/]+", s)
     if ".." in parts:
         return None
+    # #audit13: 런어웨이 길이의 '경로'가 board.json/report 를 부풀리지 않게 캡.
+    if len(s) > _MAX_ARTIFACT_CHARS:
+        s = s[:_MAX_ARTIFACT_CHARS]
     return s
 
 
@@ -191,6 +209,12 @@ BLOCKED = "blocked"
 FAILED = "failed"
 
 TERMINAL_OK = (DONE, TESTED)
+
+# #audit13: set_status 는 상태 머신에 정의된 값만 허용한다. 오타("doen")나 손상된 호출이
+# 임의 문자열을 board/report/UI 로 전파해 TERMINAL_OK 판정을 영구 오분류하는 것을 막는다.
+_VALID_STATUSES = frozenset(
+    {TODO, DESIGNING, DESIGNED, IN_PROGRESS, DEV_DONE, TESTING, TESTED, DONE, BLOCKED, FAILED}
+)
 
 
 def _md_cell(v) -> str:
@@ -462,8 +486,9 @@ class Board:
                 self._data["units"].append(
                     {
                         "id": uid,
-                        "title": u.get("title", uid),
-                        "description": u.get("description", ""),
+                        # #audit13: 런어웨이 길이 title/description 캡 (board.json 부풀림 방지)
+                        "title": _cap_text(u.get("title", uid), _MAX_TITLE_CHARS),
+                        "description": _cap_text(u.get("description", ""), _MAX_DESCRIPTION_CHARS),
                         "status": DESIGNED,
                         "deps": deps,
                         "roles": [normalize_role(r) for r in roles_raw]
@@ -489,6 +514,12 @@ class Board:
         await self.log_event("scheduler", f"WARNING: {msg}")
 
     async def set_status(self, unit_id: str, status: str, note: str | None = None) -> None:
+        # #audit13: 상태 머신에 없는 값은 적용하지 않고 경고만 남긴다(거짓 전이/오분류 방지).
+        if status not in _VALID_STATUSES:
+            await self.log_event(
+                unit_id, f"WARNING: invalid status {status!r} rejected (not applied)"
+            )
+            return
         matched = False
         async with self._lock:
             for u in self._data["units"]:

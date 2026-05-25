@@ -402,6 +402,19 @@ class Runner:
         # 부분/이전 결과파일을 성공으로 오탐하지 않도록 합성 실패 결과를 쓴다.
         # phase/role 을 _coerce_result 로 전달해 페이즈별 계약(아키텍트=units 필수 등)을 반영 (#97).
         if res.ok and result_path.exists():
+            # #audit13: 결과 파일이 symlink 면 신뢰하지 않는다. sandbox 백엔드가 결과 경로를
+            #           외부(예: /etc/passwd)를 가리키는 symlink 로 바꿔치기해 임의 파일을
+            #           '결과 JSON'으로 읽히는 것을 차단(결과 무결성). 명시적 검사 + 아래
+            #           os.open 의 O_NOFOLLOW 로 TOCTOU 레이스까지 원자적으로 막는다.
+            if result_path.is_symlink():
+                return {
+                    "status": "failed",
+                    "artifacts": [],
+                    "notes": [],
+                    "blockers": ["result file is a symlink (rejected; contract violation)"],
+                    "units": [],
+                    "_ok": False,
+                }
             # #22: read_text() 로 통째 올리기 전에 크기를 검사 — 거대 결과 파일은 메모리를
             #      폭주시키므로 읽지 않고 계약 위반(실패)으로 처리한다.
             try:
@@ -421,7 +434,11 @@ class Runner:
                     "_ok": False,
                 }
             try:
-                with result_path.open("rb") as fh:
+                # O_NOFOLLOW: 최종 컴포넌트가 symlink 면 open 이 ELOOP 로 실패 → 아래 except 가
+                # 계약 위반으로 처리(검사~open 사이 symlink 바꿔치기 레이스까지 원자적 차단).
+                # Windows 에는 O_NOFOLLOW 가 없으므로 getattr 폴백(상단 is_symlink 검사로 보완).
+                fd = os.open(result_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                with os.fdopen(fd, "rb") as fh:
                     raw = fh.read(_MAX_RESULT_BYTES + 1)
                 if len(raw) > _MAX_RESULT_BYTES:
                     return {

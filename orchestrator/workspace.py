@@ -259,6 +259,16 @@ def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
             project_dir, orch / "spec.md", allow_unsafe=allow_unsafe, label=".orchestrator/spec.md"
         )
         (orch / "spec.md").write_text(spec_text, encoding="utf-8")
+    elif not (orch / "spec.md").exists():
+        # #audit13: 빈/공백 spec 이고 기존 spec.md 도 없으면, 프롬프트가 지시하는
+        # "전체 spec 은 .orchestrator/spec.md 에 있다" 포인터가 dangling 되지 않게
+        # 플레이스홀더를 기록한다. 기존 spec.md 가 있으면 보존(재사용 디렉터리 보호, #140).
+        _guard_managed_path(
+            project_dir, orch / "spec.md", allow_unsafe=allow_unsafe, label=".orchestrator/spec.md"
+        )
+        (orch / "spec.md").write_text(
+            "(이 run 에는 spec 본문이 제공되지 않았습니다.)\n", encoding="utf-8"
+        )
 
     stack_str = _fmt_stack(stack)
     for fname in ("CLAUDE.md", "AGENTS.md"):

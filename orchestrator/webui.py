@@ -806,8 +806,11 @@ def _make_handler(manager: RunManager, token: str | None = None):
             #     raise 하면, 응답을 못 보내고 핸들러가 죽어 클라이언트는 빈 연결을 받는다.
             #     직렬화/인코딩을 try/except 로 감싸 실패 시 제네릭 500 JSON 으로 응답한다.
             # #9: 바디가 UTF-8(ensure_ascii=False)이므로 Content-Type 에 charset=utf-8 명시.
+            # #audit13: allow_nan=False — 손상 board 의 NaN/Infinity 가 비표준 JSON(`NaN`)으로
+            #           나가 브라우저 JSON.parse 를 깨뜨리는 것을 막는다. 위반 시 ValueError →
+            #           아래 except 가 잡아 제네릭 500 JSON 으로 응답한다.
             try:
-                body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                body = json.dumps(obj, ensure_ascii=False, allow_nan=False).encode("utf-8")
             except (TypeError, ValueError, UnicodeEncodeError):
                 code = 500
                 body = b'{"error": "internal serialization error"}'
