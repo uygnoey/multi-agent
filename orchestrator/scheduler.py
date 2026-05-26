@@ -125,7 +125,18 @@ class Scheduler:
         extra = ""
         try:
             sp = self.cfg.spec_path
-            if sp and sp.is_file() and sp.stat().st_size <= MAX_SPEC_BYTES:
+            # #audit19(F1): do NOT ingest our own composed spec. Without --spec, spec_path
+            # defaults to project_dir/.orchestrator/spec.md — the very file run()/scaffold writes
+            # the composed feature spec into. Reading it back as "extra" made each re-run absorb
+            # composed spec (unbounded growth + duplicated/stale instructions). Only read an
+            # explicitly-provided, DISTINCT --spec file.
+            placeholder = (self.cfg.project_dir / ".orchestrator" / "spec.md").resolve()
+            if (
+                sp
+                and sp.is_file()
+                and sp.resolve() != placeholder
+                and sp.stat().st_size <= MAX_SPEC_BYTES
+            ):
                 extra = sp.read_text(encoding="utf-8", errors="replace")
         except OSError:
             extra = ""
@@ -952,7 +963,11 @@ class Scheduler:
                 await self.board.set_status(
                     uid, TESTING, f"test/config repair attempt {self._attempt_label(attempt)}"
                 )
-                te = await self.runner.run_role("test-engineer", target)
+                # #audit19(P1): test/config 재작업의 test-engineer 호출도 _test_sem 으로 캡한다.
+                # 예전엔 sem 밖이라 검증 반복(production max_attempts=0) 중 동시 te 세션이 cap 을
+                # 우회해 폭증할 수 있었다. (dev 재작업은 아래에서 sem 밖 — 두 세마포어 중첩 금지.)
+                async with self._test_sem:
+                    te = await self.runner.run_role("test-engineer", target)
                 await self.board.add_artifacts(uid, list(te.get("artifacts", [])))
                 if te.get("_ok", False) and te.get("status") != "failed":
                     skip_te_once = True  # 다음 루프: te 생략하고 바로 qa

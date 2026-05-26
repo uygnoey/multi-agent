@@ -69,6 +69,10 @@ class GitCheckpointer:
         for _var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY"):
             env.pop(_var, None)
         env.setdefault("GIT_CONFIG_NOSYSTEM", "1")
+        # #audit19(F4): 사용자 전역 ~/.gitconfig 의 commit.gpgsign=true(키 없음)/core.hooksPath/
+        # include 등이 체크포인트 커밋을 깨거나 변형하지 않도록 전역 config 도 차단한다. 신원은
+        # _ensure_identity 가 env(GIT_AUTHOR_*)나 --local 로 명시 주입하므로 영향 없음.
+        env["GIT_CONFIG_GLOBAL"] = os.devnull
         cmd = ["git", "-C", str(self.project_dir), *args]
         try:
             return subprocess.run(

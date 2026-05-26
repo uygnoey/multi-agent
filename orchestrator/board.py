@@ -434,6 +434,10 @@ class Board:
             # (충돌-rename 으로 둘째 unit 이 U-1-2 가 돼도, 그 unit 을 가리키는 dep 가 첫 unit
             #  (U-1)에 잘못 묶이지 않도록 raw id 까지 최종 id 로 정확히 remap.)
             id_map: dict[str, str] = {e: e for e in existing}
+            # #audit19(P4): 각 최종 uid 를 *만든 raw_key* 를 기록한다. "이미 존재하는 uid" 가
+            # 같은 raw 의 멱등 재투입인지(skip) vs 다른 raw 가 sanitize 되며 충돌한 것인지(rename)
+            # 를 구분하기 위함. 기존 unit 은 canonical(자기 자신)이 origin 이라고 seed.
+            uid_origin: dict[str, str] = {e: e for e in existing}
             accepted: list[tuple[str, dict]] = []  # 1차에서 확정된 (최종 id, 원본 unit)
             for u in units:
                 if not isinstance(u, dict):
@@ -452,9 +456,11 @@ class Board:
                     skipped_warnings.append(f"unit skipped: invalid id {raw_id!r}")
                     continue
                 if uid in existing:
-                    if raw_key == uid:
-                        # 이미 정규형(canonical) id 로 존재 → 동일 unit 의 멱등 재투입이므로
-                        # 중복 생성 없이 skip 하되, 원인은 보드 경고로 가시화한다.
+                    if uid_origin.get(uid) == raw_key:
+                        # 같은 raw id 가 만든 동일 unit 의 멱등 재투입 → 중복 생성 없이 skip
+                        # (원인은 보드 경고로 가시화). #audit19(P4): 예전엔 raw_key==uid 만 봐서
+                        # 'a/b'→'a-b' 가 먼저 들어오면 뒤따르는 raw 'a-b'(다른 unit)를 잘못
+                        # 멱등으로 보고 유실했다. 이제 origin(만든 raw)이 같을 때만 멱등 처리.
                         skipped_warnings.append(f"unit skipped: duplicate id {raw_id!r}")
                         continue
                     # 서로 다른 raw 입력이 같은 sanitized id 로 충돌하면 조용히 버리지 않고
@@ -471,6 +477,7 @@ class Board:
                     )
                     uid = new_uid
                 existing.add(uid)
+                uid_origin[uid] = raw_key  # #audit19(P4): 이 최종 uid 를 만든 raw 기록
                 added += 1
                 # raw id·최종 id 둘 다로 이 unit 을 찾게 한다(canonical 키는 첫 소유자 우선).
                 id_map.setdefault(raw_key, uid)

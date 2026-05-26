@@ -135,9 +135,14 @@ class MockBackend(Backend):
                 "    steps:\n      - run: echo mock-ci\n",
             )
         elif role == "docs-writer":
+            # #audit19(C3): mock 도 사람 문서를 4개 언어(EN/KO/JA/ES)로 낸다 — 새 4언어 정책을
+            # mock/CI 가 검증할 수 있게. mock 은 무비용 샘플이므로 ja/es 는 영어 본문에 언어
+            # 표기를 덧붙인 placeholder 로 둔다(실 백엔드는 docs-writer.md 지시대로 실제 번역).
             for name, (en, ko) in _mock_doc_set().items():
                 write(f"docs/{name}.md", en)
                 write(f"docs/{name}.ko.md", ko)
+                write(f"docs/{name}.ja.md", f"<!-- 日本語 (mock placeholder) -->\n{en}")
+                write(f"docs/{name}.es.md", f"<!-- Español (mock placeholder) -->\n{en}")
 
         result = {
             "status": status,

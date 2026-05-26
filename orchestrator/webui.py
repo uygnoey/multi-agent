@@ -288,6 +288,13 @@ def build_command(py: str, spec_path: Path, project_dir: Path, opts: dict) -> li
         "--poll-interval",
         _fmt_num(poll),
     ]
+    # #audit19(C5): 증분(기능 추가) 모드를 웹/API 에서도 트리거할 수 있게 --feature 를 전달한다.
+    # 예전엔 build_command 가 항상 greenfield(--spec) 명령만 만들어 웹으로는 feature 모드 불가였다.
+    # '=' 형식으로 넘겨 값이 '-' 로 시작하거나 개행을 포함해도 child argparse 가 플래그로 오인하지
+    # 않게 한다(--spec 은 그대로 추가 컨텍스트로 함께 전달).
+    feature = opts.get("feature")
+    if isinstance(feature, str) and feature.strip():
+        cmd.append(f"--feature={feature}")
     backends = opts.get("backends")
     if backends:
         cmd += ["--backends", ",".join(backends) if isinstance(backends, list) else str(backends)]
@@ -356,21 +363,33 @@ def sanitize_run_opts(opts: dict) -> dict:
         return {"mock": True}
     out = dict(opts)
 
-    # backend: str 만 허용 (resolve()/ALIASES.get 가 unhashable 로 죽지 않게). 그 외 → "mock".
-    backend = out.get("backend", "mock")
-    out["backend"] = backend if isinstance(backend, str) else "mock"
+    # #audit19(P3): 백엔드 값을 타입뿐 아니라 *유효성*까지 검증·정규화한다. /api/run 은
+    # resolve()∈VALID_BACKENDS 로 검증하지만 rerun(이 경로)은 안 했다. 손상/수기편집된
+    # _run_opts.json 의 backend="--mock" 같은 값이 그대로 build_command 로 흘러 child argparse 를
+    # 깨뜨릴 수 있었다. resolve 해서 valid 면 canonical 이름으로 정규화, 아니면 드롭.
+    def _valid_backend(b):
+        if not isinstance(b, str) or not b:
+            return None
+        try:
+            r = resolve(b)
+        except Exception:
+            return None
+        return r if r in VALID_BACKENDS else None
 
-    # backends: list[str] 만 허용. 문자열이면 콤마 분해, dict/숫자 등은 제거.
+    # backend: 유효 백엔드만, canonical 이름으로. 그 외 → "mock".
+    out["backend"] = _valid_backend(out.get("backend", "mock")) or "mock"
+
+    # backends: list[유효 canonical] 만. 문자열이면 콤마 분해, 무효/비문자열은 제거.
     backends = out.get("backends")
     if isinstance(backends, str):
         backends = [b.strip() for b in backends.split(",") if b.strip()]
     if isinstance(backends, list):
-        backends = [b for b in backends if isinstance(b, str) and b]
+        backends = [r for b in backends if (r := _valid_backend(b))]
         out["backends"] = backends or None
     elif backends is not None:
         out["backends"] = None
 
-    # role_backends: dict 만 허용. 값은 str 또는 list[str] 로 정리, 알 수 없는 역할은 버린다.
+    # role_backends: dict 만 허용. 값은 유효 canonical str 또는 list[str], 알 수 없는 역할은 버린다.
     rb = out.get("role_backends")
     if isinstance(rb, dict):
         clean_rb = {}
@@ -378,10 +397,10 @@ def sanitize_run_opts(opts: dict) -> dict:
             if role not in ROLES:
                 continue
             if isinstance(prov, str):
-                if prov:
-                    clean_rb[role] = prov
+                if r := _valid_backend(prov):
+                    clean_rb[role] = r
             elif isinstance(prov, list):
-                provs = [p for p in prov if isinstance(p, str) and p]
+                provs = [r for p in prov if (r := _valid_backend(p))]
                 if provs:
                     clean_rb[role] = provs
             # 그 외(dict/숫자/None)는 버린다.
@@ -534,13 +553,21 @@ class RunManager:
             # 디스크를 고갈시킬 수 있다(cap 의 목적 무력화). _procs 에 없는 live run 만 합산한다.
             tracked = set(self._procs)
             try:
-                base = self.base_dir
+                base = self.base_dir.resolve()
                 entries = list(base.iterdir()) if base.exists() else []
             except OSError:
+                base = self.base_dir
                 entries = []
             for d in entries:
                 try:
-                    if d.name in tracked or not d.is_dir():
+                    # #audit19(F2): list_runs 와 동일하게 symlink/containment 를 막는다. 예전엔
+                    # d.is_dir() 가 symlink 를 따라가 base_dir 밖(또는 순환)을 가리키는 심볼릭
+                    # 디렉터리도 live run 으로 세어 임의 run.pid 를 읽고 os.kill(pid,0) 프로브 +
+                    # cap 오집계가 가능했다. symlink 는 건너뛰고, resolve 후 base 하위만 인정한다.
+                    if d.name in tracked or d.is_symlink():
+                        continue
+                    rp = d.resolve()
+                    if rp.parent != base or not d.is_dir():
                         continue
                     if self._run_alive_cached(d / ".orchestrator"):
                         running += 1

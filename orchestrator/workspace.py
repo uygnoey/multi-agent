@@ -23,6 +23,10 @@ _GITIGNORE_SEED = ".orchestrator/\n__pycache__/\nnode_modules/\n.venv/\n*.db\n"
 # 덮어쓰지 않는다. HTML 주석이라 Markdown 렌더링에 보이지 않는다.
 _GEN_MARKER = "<!-- orchestrator-generated -->"
 
+# #audit19(C2): 타깃 .claude/agents/*.md 복사본에 붙이는 생성 마커. 이 마커가 있는 파일만
+# 이후 스캐폴딩에서 최신 프레임워크 역할정의로 갱신한다(없으면 사용자 작성본으로 보고 보존).
+_AGENT_GEN_MARKER = "<!-- orchestrator-generated role definition; regenerated on scaffold -->"
+
 
 # (#audit9-11) 루트 바로 아래의 시스템 디렉터리 블랙리스트(이름 단위). 절대경로가 정확히
 # <anchor>/<name> 형태(루트 한 단계 아래)일 때만 거부한다 → /etc/myproj 같은 하위는 정상 허용.
@@ -154,15 +158,24 @@ def expose_team_agents(project_dir: Path) -> int:
             continue
         dest = dest_dir / md.name
         _guard_managed_path(project_dir, dest, allow_unsafe=allow_unsafe, label=".claude/agents")
-        # 기존 파일은 건드리지 않음 (#12): 동일하면 재기록 불필요, 다르면 사용자 편집본 보존.
-        # 없을 때만 새로 기록한다.
-        # 의도된 동작(#20): 기존 .claude/agents/*.md 는 절대 덮어쓰지 않아 사용자 편집을 보존한다.
-        # 부작용으로 프레임워크의 역할정의(role-definition) 변경은 *이미 존재하는* 타깃에
-        # 자동 전파되지 않는다. 최신 역할정의로 강제 갱신하려면 해당 파일(또는
-        # .claude/agents/ 디렉터리)을 지운 뒤 다시 스캐폴딩하면 된다.
+        # #audit19(C2): 생성 마커 기반 갱신. 복사 시 본문 끝에 마커를 붙여 둔다. 이후 스캐폴딩에서
+        #   - 없으면 새로 기록,
+        #   - 마커가 있으면(=우리가 만든 복사본) 최신 프레임워크 정의로 *덮어써 갱신*
+        #     (예: docs-writer 4언어 변경이 기존 프로젝트에도 전파),
+        #   - 마커가 없으면(사용자 작성/편집본) 보존.
+        # (마커는 본문 끝 HTML 주석이라 frontmatter/subagent 동작에 영향 없음. 프레임워크 원본
+        #  AGENTS_DIR 파일에는 마커를 넣지 않으므로 load_agent 등 내부 사용엔 영향 없음.)
+        content = bundled.rstrip("\n") + "\n\n" + _AGENT_GEN_MARKER + "\n"
         if dest.exists():
-            continue
-        dest.write_text(bundled, encoding="utf-8")
+            try:
+                cur = dest.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if _AGENT_GEN_MARKER not in cur:
+                continue  # 사용자 작성/편집본 → 보존
+            if cur == content:
+                continue  # 이미 최신 → 재기록 불필요
+        dest.write_text(content, encoding="utf-8")
         count += 1
     return count
 
@@ -235,9 +248,13 @@ def gather_repo_context(project_dir: Path, max_files: int = _REPO_MAX_FILES) -> 
     for kf in _REPO_KEY_FILES:
         p = root / kf
         try:
-            if p.is_file() and not p.is_symlink():
-                txt = p.read_text(encoding="utf-8", errors="replace")[:_REPO_MAX_KEY_BYTES]
-                excerpts.append(f"--- {kf} ---\n{txt}")
+            if not (p.is_file() and not p.is_symlink()):
+                continue
+            # #audit19(F3): 거대 key 파일(비정상 package.json/lockfile)을 read_text() 로 통째로
+            # 올린 뒤 자르면 OOM 위험. 필요한 만큼만 읽는다.
+            with p.open("r", encoding="utf-8", errors="replace") as fh:
+                txt = fh.read(_REPO_MAX_KEY_BYTES)
+            excerpts.append(f"--- {kf} ---\n{txt}")
         except OSError:
             continue
     out = [f"## Existing project files ({len(paths)}{'+' if truncated else ''} paths)", tree]

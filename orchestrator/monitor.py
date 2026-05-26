@@ -45,14 +45,20 @@ def _read_pid(path: Path) -> int | None:
         text = path.read_text(encoding="utf-8")
     except Exception:  # #RA1: 비UTF8/손상 pidfile 의 UnicodeDecodeError(ValueError) 등도 흡수
         return None
-    first = text.splitlines()[0].strip() if text.splitlines() else ""
+    lines = text.splitlines()
+    first = lines[0].strip() if lines else ""
     if not first:
         return None
     try:
         pid = int(first)
     except ValueError:
         return None
-    return pid if pid > 0 else None  # (#6) pid<=0 거부
+    # (#6) pid<=0 거부 + #audit19(P2): C long(pid_t) 범위 초과 거부. macOS 의 pid_t 는 32-bit 라
+    # os.kill(2**31, 0) 이 OSError 가 아닌 OverflowError 로 터져 _run_alive/TUI 를 크래시시켰다
+    # (webui._read_pid 는 이미 방어). 실제 PID 는 이 상한보다 훨씬 작다.
+    if pid <= 0 or pid > 2_147_483_647:
+        return None
+    return pid
 
 
 # alive/zombie 판별 캐시(#7): 비-Linux 는 `_is_zombie` 가 매 refresh(~1s)마다 `ps` 를
