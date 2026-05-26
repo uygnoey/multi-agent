@@ -167,6 +167,85 @@ def expose_team_agents(project_dir: Path) -> int:
     return count
 
 
+# #feature: 증분 모드에서 기존 프로젝트 컨텍스트를 모을 때 건너뛸 디렉터리/핵심 파일.
+_REPO_SKIP_DIRS = {
+    ".git",
+    ".orchestrator",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "dist",
+    "build",
+    ".next",
+    ".pytest_cache",
+    ".ruff_cache",
+    "target",
+    ".turbo",
+    ".mypy_cache",
+}
+_REPO_KEY_FILES = (
+    "README.md",
+    "package.json",
+    "pyproject.toml",
+    "requirements.txt",
+    "docker-compose.yml",
+    "tsconfig.json",
+    "go.mod",
+    "Cargo.toml",
+)
+_REPO_MAX_FILES = 600
+_REPO_MAX_KEY_BYTES = 4000
+
+
+def gather_repo_context(project_dir: Path, max_files: int = _REPO_MAX_FILES) -> str:
+    """기존 프로젝트의 파일 트리 + 핵심 파일 발췌를 bounded 문자열로 모은다 (#feature 증분 모드).
+
+    아키텍트/개발자가 '무엇이 이미 있는지' 이해해 기존 코드를 재사용·편집하도록 프롬프트(스펙)에
+    주입한다. .git/.orchestrator/node_modules 등 노이즈 디렉터리는 제외하고, 파일 수 상한으로
+    캡한다(거대 트리 방어).
+    """
+    root = Path(project_dir)
+    if not root.is_dir():
+        return "(no existing project files)"
+    paths: list[str] = []
+    truncated = False
+    try:
+        walker = os.walk(root)
+        for dirpath, dirs, files in walker:
+            dirs[:] = sorted(d for d in dirs if d not in _REPO_SKIP_DIRS)
+            for fn in sorted(files):
+                if fn == ".DS_Store" or fn.endswith((".pyc", ".pyo")):
+                    continue
+                full = Path(dirpath) / fn
+                try:
+                    rel = full.relative_to(root).as_posix()
+                except ValueError:
+                    continue
+                paths.append(rel)
+                if len(paths) >= max_files:
+                    truncated = True
+                    break
+            if truncated:
+                break
+    except OSError:
+        pass
+    tree = "\n".join(paths) if paths else "(empty project)"
+    excerpts: list[str] = []
+    for kf in _REPO_KEY_FILES:
+        p = root / kf
+        try:
+            if p.is_file() and not p.is_symlink():
+                txt = p.read_text(encoding="utf-8", errors="replace")[:_REPO_MAX_KEY_BYTES]
+                excerpts.append(f"--- {kf} ---\n{txt}")
+        except OSError:
+            continue
+    out = [f"## Existing project files ({len(paths)}{'+' if truncated else ''} paths)", tree]
+    if excerpts:
+        out += ["", "## Key file excerpts", *excerpts]
+    return "\n".join(out)
+
+
 def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
     # 위험한 타깃 가드: scaffold 는 project_dir 에 mkdir(parents=True) 한 뒤 .orchestrator/,
     # .gitignore, CLAUDE.md, AGENTS.md, spec.md 를 기록한다. 사용자가 실수로 파일시스템

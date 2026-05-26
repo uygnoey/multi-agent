@@ -291,6 +291,10 @@ class RunConfig:
     full_access: bool = False  # machine-wide backend access; default is project workspace access
     auto_commit: bool = True  # create checkpoint commits inside the generated project
     completion_level: str = "mvp"  # mvp or production: how complete the generated app must be
+    # #feature: 증분(기능 추가) 모드. 설정되면 기존 project_dir 위에 이 기능을 *추가*한다
+    # (그린필드 재빌드가 아님). 아키텍트는 기존 코드 구조를 컨텍스트로 받아 델타 unit 만 계획하고,
+    # 개발자는 기존 파일을 편집하며, 기존 테스트가 계속 통과하도록(회귀 게이트) 유지한다.
+    feature: str | None = None
     max_attempts: int = 0  # dev→test→qa repair attempts per unit; 0 = until fixed/external stop
     retries: int = 1  # transient backend-failure retries per role call
     retry_backoff: float = 2.0  # seconds, exponential

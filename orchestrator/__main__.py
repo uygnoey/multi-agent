@@ -102,6 +102,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--spec", type=Path, help="기획서 파일 경로 (.md/.txt/.html 등 텍스트)")
     p.add_argument("--project-dir", type=Path, help="산출물을 생성할 타깃 디렉터리")
     p.add_argument(
+        "--feature",
+        help="증분(기능 추가) 모드: 기존 --project-dir 프로젝트에 이 기능을 *추가*한다 "
+        "(그린필드 재빌드 아님; 기존 코드 재사용·편집). --spec 는 선택(추가 컨텍스트).",
+    )
+    p.add_argument(
         "--backend",
         default=DEFAULT_BACKEND,
         choices=(*VALID_BACKENDS, *ALIASES),
@@ -237,8 +242,13 @@ def build_config(a: argparse.Namespace) -> RunConfig:
             raise SystemExit(f"알 수 없는 역할: {role} (가능: {', '.join(ROLES)})")
         role_priority[role] = _parse_backend_list(backends)
     cfg = RunConfig(
-        spec_path=a.spec.resolve(),
+        # #feature: 증분 모드는 --spec 없이도 가능. 없으면 project_dir 의 .orchestrator/spec.md
+        # 경로를 placeholder 로 둔다(증분 모드의 run() 은 이 파일을 읽지 않고 spec 을 합성한다).
+        spec_path=(
+            a.spec.resolve() if a.spec else (a.project_dir.resolve() / ".orchestrator" / "spec.md")
+        ),
         project_dir=a.project_dir.resolve(),
+        feature=a.feature,
         default_backend=resolve(a.backend),
         backend_priority=backend_priority,
         role_priority=role_priority,
@@ -340,10 +350,19 @@ def main(argv=None) -> int:
 
         run_tui(a.project_dir.resolve(), a.interval)  # #16: --interval 을 TUI 갱신 주기로 전달
         return 0
-    if not a.spec or not a.project_dir:
-        raise SystemExit("--spec 와 --project-dir 는 필수입니다 (또는 --check 만 사용).")
-    if not a.spec.is_file():
-        raise SystemExit(f"spec 파일을 찾을 수 없음: {a.spec}")
+    if a.feature:
+        # #feature: 증분(기능 추가) 모드 — 기존 프로젝트 --project-dir 가 필요하고 --spec 은 선택.
+        if not a.project_dir:
+            raise SystemExit("--feature(증분 모드)에는 기존 프로젝트 --project-dir 가 필요합니다.")
+        if not a.project_dir.is_dir():
+            raise SystemExit(f"--feature: 기존 프로젝트 디렉터리를 찾을 수 없음: {a.project_dir}")
+        if a.spec and not a.spec.is_file():
+            raise SystemExit(f"spec 파일을 찾을 수 없음: {a.spec}")
+    else:
+        if not a.spec or not a.project_dir:
+            raise SystemExit("--spec 와 --project-dir 는 필수입니다 (또는 --check/--feature 사용).")
+        if not a.spec.is_file():
+            raise SystemExit(f"spec 파일을 찾을 수 없음: {a.spec}")
 
     cfg = build_config(a)
     # (#audit9-20) 최상위 실행을 감싸 KeyboardInterrupt(사용자 중단)는 친절히 130 으로,
