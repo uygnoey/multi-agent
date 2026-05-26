@@ -26,10 +26,13 @@ _ROLE_INSTRUCTION = {
     "qa": "Run this unit's tests and verify results. Report pass/fail with evidence.",
     "cicd": "Set up the build/test/deploy pipeline (.github/workflows/).",
     "docs-writer": (
-        "From the ACTUAL code/design, write the full human-readable deliverable set in EN and KO "
-        "(docs/<NAME>.md + <NAME>.ko.md): index, ERD (mermaid erDiagram), "
+        "From the ACTUAL code/design, write the full human-readable deliverable set in FOUR "
+        "languages — Korean, English, Japanese, Spanish. For each doc <NAME>, write "
+        "docs/<NAME>.md (English), docs/<NAME>.ko.md (Korean), docs/<NAME>.ja.md (Japanese), "
+        "docs/<NAME>.es.md (Spanish). Docs: index, ERD (mermaid erDiagram), "
         "SEQUENCE (mermaid sequenceDiagram), DB_TABLES, API, USER_MANUAL, DEPLOY, RUN_GUIDE, "
-        "ARCHITECTURE. Use mermaid diagrams and tables; match real tables/endpoints/commands."
+        "ARCHITECTURE. Use mermaid diagrams and tables; match real tables/endpoints/commands. "
+        "(Only these human-facing docs are translated; code/comments/identifiers stay as-is.)"
     ),
     "project-manager": (
         "Review the current board and recent events, then write a short, actionable directive "

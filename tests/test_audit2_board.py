@@ -27,12 +27,21 @@ def test_write_deliverables_creates_fallback_when_absent(tmp_path: Path):
 
     b = _run(scenario())
     written = b.write_deliverables()
-    # 에이전트가 쓰지 않았으면 보드 요약을 fallback 으로 생성
-    assert written == ["docs/DELIVERABLES.md", "docs/DELIVERABLES.ko.md"]
+    # 에이전트가 쓰지 않았으면 보드 요약을 fallback 으로 4개 언어 생성
+    assert written == [
+        "docs/DELIVERABLES.md",
+        "docs/DELIVERABLES.ko.md",
+        "docs/DELIVERABLES.ja.md",
+        "docs/DELIVERABLES.es.md",
+    ]
     en = (tmp_path / "docs" / "DELIVERABLES.md").read_text(encoding="utf-8")
     ko = (tmp_path / "docs" / "DELIVERABLES.ko.md").read_text(encoding="utf-8")
+    ja = (tmp_path / "docs" / "DELIVERABLES.ja.md").read_text(encoding="utf-8")
+    es = (tmp_path / "docs" / "DELIVERABLES.es.md").read_text(encoding="utf-8")
     assert "# Development Deliverables" in en
     assert "# 개발 산출물" in ko
+    assert "# 開発成果物" in ja
+    assert "# Entregables de desarrollo" in es
 
 
 def test_write_deliverables_does_not_clobber_agent_authored(tmp_path: Path):
@@ -52,8 +61,13 @@ def test_write_deliverables_does_not_clobber_agent_authored(tmp_path: Path):
     (docs_dir / "DELIVERABLES.ko.md").write_text(rich_ko, encoding="utf-8")
 
     written = b.write_deliverables()
-    # 두 경로 모두 반환되어 전역 아티팩트로 추가 가능
-    assert written == ["docs/DELIVERABLES.md", "docs/DELIVERABLES.ko.md"]
+    # 4개 언어 경로 모두 반환. 에이전트가 쓴 EN/KO 는 보존, 없던 JA/ES 만 fallback 으로 생성.
+    assert written == [
+        "docs/DELIVERABLES.md",
+        "docs/DELIVERABLES.ko.md",
+        "docs/DELIVERABLES.ja.md",
+        "docs/DELIVERABLES.es.md",
+    ]
     # 에이전트가 쓴 원본 내용이 그대로 보존됨 (보드 요약이 덮어쓰지 않음)
     assert (docs_dir / "DELIVERABLES.md").read_text(encoding="utf-8") == rich_en
     assert (docs_dir / "DELIVERABLES.ko.md").read_text(encoding="utf-8") == rich_ko
@@ -74,11 +88,18 @@ def test_write_deliverables_fills_only_missing_side(tmp_path: Path):
     (docs_dir / "DELIVERABLES.md").write_text(rich_en, encoding="utf-8")
 
     written = b.write_deliverables()
-    assert written == ["docs/DELIVERABLES.md", "docs/DELIVERABLES.ko.md"]
+    assert written == [
+        "docs/DELIVERABLES.md",
+        "docs/DELIVERABLES.ko.md",
+        "docs/DELIVERABLES.ja.md",
+        "docs/DELIVERABLES.es.md",
+    ]
     assert (docs_dir / "DELIVERABLES.md").read_text(encoding="utf-8") == rich_en
-    # KO 는 보드 요약으로 생성됨
+    # 없던 KO/JA/ES 는 보드 요약으로 생성됨
     ko = (docs_dir / "DELIVERABLES.ko.md").read_text(encoding="utf-8")
     assert "# 개발 산출물" in ko
+    assert "# 開発成果物" in (docs_dir / "DELIVERABLES.ja.md").read_text(encoding="utf-8")
+    assert "# Entregables" in (docs_dir / "DELIVERABLES.es.md").read_text(encoding="utf-8")
 
 
 def test_write_deliverables_rejects_docs_symlink_escape(tmp_path: Path):

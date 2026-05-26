@@ -783,11 +783,12 @@ class Board:
         return report
 
     def write_deliverables(self) -> list[str]:
-        """보드 상태로 개발 산출물 문서를 EN/KO 양쪽으로 생성 (보드 요약은 fallback).
+        """보드 상태로 개발 산출물 문서를 사람이 읽는 4개 언어(EN/KO/JA/ES)로 생성 (fallback).
 
-        docs-writer 백엔드가 이미 docs/DELIVERABLES.md/.ko.md 를 작성한 경우 그 풍부한
-        산출물을 덮어쓰지 않는다. 파일이 없을 때만 보드 요약을 써서 fallback 을 보장하고,
-        실제로 디스크에 존재하는 경로만 반환한다(스케줄러가 전역 아티팩트로 추가).
+        사람이 보는 문서/가이드만 다국어로 만든다(#lang). docs-writer 백엔드가 이미
+        docs/DELIVERABLES.md / .ko.md / .ja.md / .es.md 를 작성했으면 덮어쓰지 않고, 없는 언어만
+        보드 요약으로 채워 fallback 을 보장한다. 실제로 존재하는 경로만 반환(스케줄러가 전역
+        아티팩트로 추가).
         """
         d = self._data
         units = d.get("units", [])
@@ -820,63 +821,107 @@ class Board:
                     out.append("")
             return out
 
-        en = (
-            [
-                "# Development Deliverables",
+        cost_str = f"${_safe_report_num(d.get('total_cost_usd', 0.0)):.4f}"
+
+        def build(labels: dict) -> list[str]:
+            return (
+                [
+                    labels["title"],
+                    "",
+                    f"- {labels['phase']}: **{d.get('phase')}**",
+                    f"- {labels['done']}: **{done}/{len(units)}**",
+                    f"- {labels['cost']}: **{cost_str}**",
+                    f"- {labels['stack']}: {d.get('stack')}",
+                    "",
+                    f"## {labels['workunits']}",
+                    "",
+                ]
+                + table(labels["headers"])
+                + ["", f"## {labels['shared']}", ""]
+                # 전역 산출물도 per-unit 과 동일하게 _md_cell 로 이스케이프(개행/파이프 주입 방지)
+                + ([f"- {_md_cell(a)}" for a in artifacts] or [labels["none"]])
+                + ["", f"## {labels['perunit']}", ""]
+                + unit_files()
+                + [labels["runguide"]]
+            )
+
+        # #lang: 사람이 읽는 문서만 4개 언어(EN/KO/JA/ES)로. AI-facing 텍스트는 영어 그대로.
+        langs = [
+            (
                 "",
-                f"- phase: **{d.get('phase')}**",
-                f"- units done: **{done}/{len(units)}**",
-                f"- total cost: **${_safe_report_num(d.get('total_cost_usd', 0.0)):.4f}**",
-                f"- stack: {d.get('stack')}",
-                "",
-                "## Work units",
-                "",
-            ]
-            + table(["id", "status", "test", "files", "title"])
-            + ["", "## Design & shared artifacts", ""]
-            # 전역 산출물도 per-unit 과 동일하게 _md_cell 로 이스케이프(개행/파이프 주입 방지)
-            + ([f"- {_md_cell(a)}" for a in artifacts] or ["- (none)"])
-            + ["", "## Per-unit files", ""]
-            + unit_files()
-            + ["See `docs/RUN_GUIDE.md` for how to run."]
-        )
-        ko = (
-            [
-                "# 개발 산출물",
-                "",
-                f"- 단계: **{d.get('phase')}**",
-                f"- 완료 unit: **{done}/{len(units)}**",
-                f"- 총비용: **${_safe_report_num(d.get('total_cost_usd', 0.0)):.4f}**",
-                f"- 스택: {d.get('stack')}",
-                "",
-                "## 작업 단위",
-                "",
-            ]
-            + table(["id", "상태", "테스트", "파일수", "제목"])
-            + ["", "## 설계·공통 산출물", ""]
-            # 전역 산출물도 per-unit 과 동일하게 _md_cell 로 이스케이프(개행/파이프 주입 방지)
-            + ([f"- {_md_cell(a)}" for a in artifacts] or ["- (없음)"])
-            + ["", "## 단위별 파일", ""]
-            + unit_files()
-            + ["실행 방법은 `docs/RUN_GUIDE.ko.md` 참고."]
-        )
-        # 에이전트가 작성한 산출물을 보드 요약으로 덮어쓰지 않는다.
-        # 파일이 없을 때만 보드 요약을 써서 항상 fallback 이 존재하도록 보장한다.
-        en_path = docs_dir / "DELIVERABLES.md"
-        ko_path = docs_dir / "DELIVERABLES.ko.md"
-        _guard_managed_project_path(self.project_dir, en_path, "docs deliverables")
-        _guard_managed_project_path(self.project_dir, ko_path, "docs deliverables")
-        # board.json 과 동일하게 원자적(temp→os.replace)으로 기록(부분 파일 방지)
-        if not en_path.exists():
-            self._atomic_write_text(en_path, "\n".join(en) + "\n")
-        if not ko_path.exists():
-            self._atomic_write_text(ko_path, "\n".join(ko) + "\n")
-        # 실제로 존재하는 경로만 반환(에이전트가 쓴 것이든 보드가 쓴 것이든 모두 포함).
+                {
+                    "title": "# Development Deliverables",
+                    "phase": "phase",
+                    "done": "units done",
+                    "cost": "total cost",
+                    "stack": "stack",
+                    "workunits": "Work units",
+                    "headers": ["id", "status", "test", "files", "title"],
+                    "shared": "Design & shared artifacts",
+                    "none": "- (none)",
+                    "perunit": "Per-unit files",
+                    "runguide": "See `docs/RUN_GUIDE.md` for how to run.",
+                },
+            ),
+            (
+                ".ko",
+                {
+                    "title": "# 개발 산출물",
+                    "phase": "단계",
+                    "done": "완료 unit",
+                    "cost": "총비용",
+                    "stack": "스택",
+                    "workunits": "작업 단위",
+                    "headers": ["id", "상태", "테스트", "파일수", "제목"],
+                    "shared": "설계·공통 산출물",
+                    "none": "- (없음)",
+                    "perunit": "단위별 파일",
+                    "runguide": "실행 방법은 `docs/RUN_GUIDE.ko.md` 참고.",
+                },
+            ),
+            (
+                ".ja",
+                {
+                    "title": "# 開発成果物",
+                    "phase": "フェーズ",
+                    "done": "完了ユニット",
+                    "cost": "総コスト",
+                    "stack": "スタック",
+                    "workunits": "作業ユニット",
+                    "headers": ["id", "状態", "テスト", "ファイル数", "タイトル"],
+                    "shared": "設計・共有成果物",
+                    "none": "- (なし)",
+                    "perunit": "ユニット別ファイル",
+                    "runguide": "実行方法は `docs/RUN_GUIDE.ja.md` を参照。",
+                },
+            ),
+            (
+                ".es",
+                {
+                    "title": "# Entregables de desarrollo",
+                    "phase": "fase",
+                    "done": "unidades completadas",
+                    "cost": "costo total",
+                    "stack": "stack",
+                    "workunits": "Unidades de trabajo",
+                    "headers": ["id", "estado", "prueba", "archivos", "título"],
+                    "shared": "Diseño y artefactos compartidos",
+                    "none": "- (ninguno)",
+                    "perunit": "Archivos por unidad",
+                    "runguide": "Consulte `docs/RUN_GUIDE.es.md` para ejecutar.",
+                },
+            ),
+        ]
+        # 에이전트가 작성한 산출물은 덮어쓰지 않고, 없는 언어만 보드 요약으로 채운다.
         written: list[str] = []
-        if en_path.exists():
-            written.append("docs/DELIVERABLES.md")
-        if ko_path.exists():
-            written.append("docs/DELIVERABLES.ko.md")
+        for suffix, labels in langs:
+            path = docs_dir / f"DELIVERABLES{suffix}.md"
+            _guard_managed_project_path(self.project_dir, path, "docs deliverables")
+            if not path.exists():
+                # board.json 과 동일하게 원자적(temp→os.replace)으로 기록(부분 파일 방지)
+                self._atomic_write_text(path, "\n".join(build(labels)) + "\n")
+            if path.exists():
+                written.append(f"docs/DELIVERABLES{suffix}.md")
         return written
 
     # ---- reads (best-effort snapshots) ----

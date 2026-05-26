@@ -114,11 +114,12 @@ class Scheduler:
         self._test_sem = asyncio.Semaphore(max(1, self.cfg.concurrency))
 
     def _compose_feature_spec(self) -> str:
-        """#feature 증분 모드: 기능 요청 + 기존 프로젝트 컨텍스트 + 증분 지시를 한 스펙으로 합성.
+        """#feature incremental mode: compose one spec = feature request + existing-project context.
 
-        증분 지시와 기능 요청을 *맨 앞*에 둬 prompts 의 spec_excerpt(앞부분) 가 핵심을 담게 하고,
-        기존 파일 트리/발췌는 뒤에 붙인다(전체는 .orchestrator/spec.md 로 에이전트가 Read 가능).
-        --spec 가 함께 주어지면 추가 사양으로 포함한다.
+        The spec is AGENT-FACING, so it is written in English (AI-friendly). The incremental
+        instruction + feature request go FIRST so prompts' spec_excerpt (the head) captures the
+        essentials; the existing file tree/excerpts follow (full spec is readable by agents at
+        .orchestrator/spec.md). If --spec is also given, include it as extra context.
         """
         feat = str(self.cfg.feature or "").strip()
         extra = ""
@@ -130,30 +131,31 @@ class Scheduler:
             extra = ""
         repo = workspace.gather_repo_context(self.cfg.project_dir)
         parts = [
-            "# INCREMENTAL FEATURE REQUEST (개발 지속성 / feature-addition 모드)",
+            "# INCREMENTAL FEATURE REQUEST (development-continuity / feature-addition mode)",
             "",
-            "아래 *기존 프로젝트*에 새 기능을 **추가**하는 작업입니다. 처음부터 다시 만들지",
-            "마세요. 기존 코드·구조·스택·의존성을 그대로 재사용하고, 필요한 파일만 편집(Edit)",
-            "하거나 새로 추가하세요.",
+            "This task ADDS a new feature to the *existing project* below. Do NOT rebuild from",
+            "scratch. Reuse the existing code, structure, stack, and dependencies; only edit",
+            "(Edit) the files you must, or add new ones.",
             "",
-            "## 작업 순서 (필수 — 반드시 이 순서를 따르세요)",
-            "1) **백지 감사·코드 분석 먼저**: 이전 가정/문서에 의존하지 말고, 아래 기존",
-            "   프로젝트 코드를 처음부터 다시 읽어 버그·오류·결함을 *모든 심각도*로 찾으세요.",
-            "2) **발견 이슈 먼저 수정**: 감사에서 나온 이슈를 work unit 으로 만들어 기능",
-            "   추가 *전에* 수정하세요. (발견 이슈가 없으면 그 사실을 명시.)",
-            "3) **그 다음 기능 추가**: '추가할 기능'을 기존 코드를 재사용·편집해 더하세요.",
-            "4) **회귀 금지**: 기존 테스트 + 새 테스트가 모두 통과해야 합니다. 개발자는",
-            "   실제로 실행해 확인하세요.",
+            "## Required order of work (follow this order)",
+            "1) **Blank-slate audit & code analysis FIRST**: do not rely on prior assumptions or",
+            "   docs; re-read the existing project code from scratch and find bugs/defects of ALL",
+            "   severities (critical to minor).",
+            "2) **Fix found issues FIRST**: turn audit findings into work units and fix them",
+            "   BEFORE adding the feature. (If no issues are found, state that explicitly.)",
+            "3) **THEN add the feature**: implement the requested feature by reusing/editing code.",
+            "4) **No regressions**: existing tests + new tests must all pass. Developers must",
+            "   actually run them to confirm.",
             "",
-            "아키텍트는 (a) 감사 발견 이슈 수정 unit + (b) 기능 추가 unit 을 함께 계획하고,",
-            "각 unit 의 deps/artifacts 를 기존 파일 기준으로 지정하세요.",
+            "The architect must plan BOTH (a) issue-fix units from the audit AND (b) feature",
+            "units, specifying each unit's deps/artifacts against the existing files.",
             "",
-            "## 추가할 기능",
+            "## Feature to add",
             feat or "(no feature text provided)",
             "",
         ]
         if extra.strip():
-            parts += ["## 추가 사양·컨텍스트 (--spec)", extra, ""]
+            parts += ["## Additional spec / context (--spec)", extra, ""]
         parts.append(repo)
         return "\n".join(parts)
 

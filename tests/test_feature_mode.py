@@ -84,11 +84,11 @@ def test_compose_feature_spec_includes_instruction_and_context(tmp_path):
     assert "tiny calculator" in spec  # README 발췌
     # 증분 핵심 지시가 앞부분(spec_excerpt 가 잡는 영역)에 있어야 한다
     assert "INCREMENTAL FEATURE REQUEST" in spec[:1500]
-    # 핵심: 추가 개발 전에 '백지 감사 → 이슈 수정 → 기능 추가' 순서를 강제해야 한다
-    assert "백지 감사" in spec
-    assert "작업 순서" in spec
-    audit_pos = spec.find("백지 감사")
-    feat_pos = spec.find("## 추가할 기능")
+    # 핵심: 추가 개발 전에 'audit → fix → add feature' 순서를 강제(스펙은 AI-facing 영어).
+    assert "Blank-slate audit" in spec
+    assert "Required order of work" in spec
+    audit_pos = spec.find("Blank-slate audit")
+    feat_pos = spec.find("## Feature to add")
     assert 0 <= audit_pos < feat_pos  # 감사 지시가 기능 요청보다 앞에 온다
 
 

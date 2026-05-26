@@ -71,9 +71,14 @@ def test_write_report_survives_non_numeric_cost(tmp_path: Path, bad):
 def test_write_deliverables_survives_non_numeric_cost(tmp_path: Path, bad):
     b = _board_with_unit(tmp_path)
     b._data["total_cost_usd"] = bad
-    # EN/KO 산출물이 예외 없이 기록되어야 함 (복구성)
+    # 4개 언어(EN/KO/JA/ES) 산출물이 예외 없이 기록되어야 함 (복구성)
     written = b.write_deliverables()
-    assert written == ["docs/DELIVERABLES.md", "docs/DELIVERABLES.ko.md"]
+    assert written == [
+        "docs/DELIVERABLES.md",
+        "docs/DELIVERABLES.ko.md",
+        "docs/DELIVERABLES.ja.md",
+        "docs/DELIVERABLES.es.md",
+    ]
     en = (tmp_path / "docs" / "DELIVERABLES.md").read_text(encoding="utf-8")
     ko = (tmp_path / "docs" / "DELIVERABLES.ko.md").read_text(encoding="utf-8")
     assert "- total cost: **$0.0000**" in en
