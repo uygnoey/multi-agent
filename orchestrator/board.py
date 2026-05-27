@@ -339,11 +339,18 @@ class Board:
         # #RA-nan: allow_nan=False + NaN/Inf 폴백 살균을 거쳐 board.json 에 표준-비준수
         # NaN/Infinity 토큰이 새지 않게 한다(webui 의 JSON.parse 보호).
         payload = _dumps_safe(self._data, indent=2, default=str)
-        with tmp.open("w", encoding="utf-8") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())  # tmp 본문을 디스크에 강제 반영 (rename 전 내구성 확보)
-        tmp.replace(self.path)  # 원자적 교체 유지
+        # #audit20: write/fsync 도중 예외(ENOSPC/EIO 등)가 나면 stale board.json.tmp 가 남는다.
+        # _atomic_write_text 와 동일하게 어떤 예외든 tmp 를 정리한 뒤 재던진다(replace 는 write 가
+        # 끝난 뒤에만 실행되므로 board.json 본체는 손상되지 않지만, tmp 잔존은 정리한다).
+        try:
+            with tmp.open("w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())  # tmp 본문을 디스크에 강제 반영 (rename 전 내구성 확보)
+            tmp.replace(self.path)  # 원자적 교체 유지
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
         # rename(디렉터리 엔트리 변경)을 영속화하려면 상위 디렉터리도 fsync 해야 한다. 단,
         # 일부 플랫폼/파일시스템(예: Windows)은 디렉터리 fd-fsync 를 지원하지 않으므로 best-effort.
         try:

@@ -193,7 +193,19 @@ def _usage_from_jsonl(out: bytes) -> dict[str, int]:
             continue
         if o.get("type") != "turn.completed" or not isinstance(o.get("usage"), dict):
             continue
-        for k, v in o["usage"].items():
+        u = o["usage"]
+        for k, v in u.items():
+            # #audit20(#5): 일부 Codex/OpenAI usage shape 는 캐시 토큰을 평면 cached_input_tokens
+            #   가 아니라 input_tokens_details.cached_tokens 로 중첩 보고한다. 중첩 dict 는
+            #   _coerce_usage_value 를 통과 못해 누락되고, codex_cost 는 평면 키만 보므로 캐시
+            #   할인이 빠져 비용을 과대추정한다. 같은 usage 에 평면 키가 없을 때만 중첩값을 평면
+            #   키로 끌어올려(단일 객체 내 중복합산 방지) 두 shape 모두에서 캐시 토큰을 집계한다.
+            if k == "input_tokens_details" and isinstance(v, dict):
+                if "cached_input_tokens" not in u:
+                    cached = _coerce_usage_value(v.get("cached_tokens"))
+                    if cached is not None:
+                        usage["cached_input_tokens"] = usage.get("cached_input_tokens", 0) + cached
+                continue
             iv = _coerce_usage_value(v)
             if iv is None:
                 continue

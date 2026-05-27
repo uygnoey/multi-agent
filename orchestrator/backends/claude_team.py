@@ -11,6 +11,7 @@ import shutil
 
 from .base import Backend, RoleRequest, RoleResult, run_subprocess
 from .claude_cli import (
+    _PROMPT_STDIN_THRESHOLD,
     _is_unknown_budget_flag_error,
     budget_arg,
     claude_stream_line,
@@ -35,10 +36,14 @@ class ClaudeTeamBackend(Backend):
             f"Do not do the work yourself — the `{req.role}` subagent must do it.\n\n"
             f"{req.prompt}"
         )
-        base_cmd = [
-            "claude",
-            "-p",
-            lead_prompt,
+        # #audit20(#2): claude_cli 와 동일하게 거대 lead_prompt 는 positional 자리에서 빼고 stdin
+        #   으로 흘려 E2BIG 를 피한다(claude -p 는 positional 이 없으면 stdin 에서 읽음).
+        prompt_bytes = lead_prompt.encode("utf-8")
+        use_stdin = len(prompt_bytes) > _PROMPT_STDIN_THRESHOLD
+        base_cmd = ["claude", "-p"]
+        if not use_stdin:
+            base_cmd.append(lead_prompt)
+        base_cmd += [
             "--output-format",
             "stream-json",
             "--verbose",
@@ -59,13 +64,27 @@ class ClaudeTeamBackend(Backend):
         # (-p/--print 전용). req.budget 이 명시되면 per-call 예산 캡을 실제로 전달해 강제한다.
         budget_flag = ["--max-budget-usd", budget_arg(req.budget)] if req.budget is not None else []
         cmd = base_cmd + budget_flag
+
+        # #audit20(#2): stdin 경로일 때만 stdin_data 를 넘긴다(작은 프롬프트는 기존 시그니처 유지).
+        async def _run(c):
+            if use_stdin:
+                return await run_subprocess(
+                    c,
+                    str(req.cwd),
+                    req.timeout,
+                    req.live_log_path,
+                    line_render=claude_stream_line,
+                    stdin_data=prompt_bytes,
+                )
+            return await run_subprocess(
+                c, str(req.cwd), req.timeout, req.live_log_path, line_render=claude_stream_line
+            )
+
         # #26(#118): 그러나 turn-limit 플래그(--max-turns 등)는 동일 CLI 에 존재하지 않는다
         # (claude --help 로 검증: 0건). 없는 플래그를 넘기면 매 호출이 깨지므로 추가하지 않는다
         # — req.max_turns 강제는 이 백엔드에서 불가(KEEP-DOCUMENTED). 긴 세션은 timeout 으로 통제.
         try:
-            rc, out, err, timed_out = await run_subprocess(
-                cmd, str(req.cwd), req.timeout, req.live_log_path, line_render=claude_stream_line
-            )
+            rc, out, err, timed_out = await _run(cmd)
         except Exception as e:
             return RoleResult(ok=False, error=str(e))
 
@@ -79,13 +98,7 @@ class ClaudeTeamBackend(Backend):
             and _is_unknown_budget_flag_error(err.decode(errors="replace"))
         ):
             try:
-                rc, out, err, timed_out = await run_subprocess(
-                    base_cmd,
-                    str(req.cwd),
-                    req.timeout,
-                    req.live_log_path,
-                    line_render=claude_stream_line,
-                )
+                rc, out, err, timed_out = await _run(base_cmd)
             except Exception as e:
                 return RoleResult(ok=False, error=str(e))
 

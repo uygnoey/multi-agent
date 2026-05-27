@@ -371,9 +371,9 @@ class Scheduler:
                 await self.board.add_warning("cicd failed (배포 파이프라인 산출물 미완)")
             await self._checkpoint("orchestrator: cicd artifacts", cicd_out.get("artifacts", []))
 
-            # Phase E — 문서화: 실행 가이드(EN/KO) + 개발 산출물(EN/KO)
+            # Phase E — 문서화: 실행 가이드 + 개발 산출물 (4개 언어 EN/KO/JA/ES; #lang 정책)
             await self.board.set_phase("docs")
-            await self.board.log_event("scheduler", "Phase E: docs (EN/KO)")
+            await self.board.log_event("scheduler", "Phase E: docs (EN/KO/JA/ES)")
             docs_out = await self.runner.run_role("docs-writer")
             await self.board.add_global_artifacts(docs_out.get("artifacts", []))
             if not docs_out.get("_ok", True):

@@ -37,6 +37,9 @@ from .monitor import _read_agent_log, _read_board
 
 MAX_BODY_BYTES = 4 * 1024 * 1024  # 요청 바디 상한 (메모리 고갈 방지)
 MAX_SPEC_BYTES = 1024 * 1024  # 기획서 텍스트 상한
+# #audit20(#3): feature 는 --feature=<값> argv 로 전달되므로 E2BIG 방지를 위해 상한을 둔다.
+#   증분 지시문은 짧은 게 정상이라 8KB 면 충분하고, OS ARG_MAX/MAX_ARG_STRLEN 보다 훨씬 작다.
+MAX_FEATURE_CHARS = 8192
 
 
 def _token_equal(provided: str, expected: str) -> bool:
@@ -612,9 +615,13 @@ class RunManager:
 
         audit7(PID/PGID 재사용 방어): pgid 를 시작 시 한 번 캡처해 수 초간 os.killpg 를 반복하면,
         그 사이 그룹 리더가 죽고 커널이 같은 PGID 를 무관한 새 프로세스 그룹에 재할당할 때
-        엉뚱한 그룹을 죽일 수 있다. 그래서 매 그룹 시그널 직전에 리더가 아직 그 그룹을 이끄는지
-        재검증(_leader_leads_group)하고, 리더가 사라진 순간 그룹 시그널을 완전히 중단한다 —
-        마지막 blanket 그룹 SIGKILL 도 보내지 않는다.
+        엉뚱한 그룹을 죽일 수 있다. 그래서 *반복 시그널 구간* 의 매 그룹 시그널 직전에 리더가
+        아직 그 그룹을 이끄는지 재검증(_leader_leads_group)하고, 리더가 사라진 순간 그 반복 그룹
+        시그널을 중단한다.
+
+        #audit20 정정: _sweep_stragglers() 의 최종 1회 그룹 SIGKILL 은 이 가드를 거치지 않고 리더
+        사후에도 발사된다 — "그룹이 비어있지 않은 한 pgid 는 재사용되지 않는다"는 POSIX 불변식에
+        기댄 별도 안전논리이며, 잔존 TOCTOU(완전 방어는 start-time 토큰 검증 필요)는 후속 과제다.
         """
         pid = None
         orch = self.project_dir(run_id) / ".orchestrator"
@@ -1317,6 +1324,23 @@ def _make_handler(manager: RunManager, token: str | None = None):
             ):
                 self._json({"error": "invalid model"}, 400)
                 return
+            # #audit20(#3): feature(증분 모드 지시문)는 검증 없이 build_command 의 --feature=<값>
+            #   argv 로 흘러갔다. 비문자열 거부, NUL(argv 에 못 들어감) 거부, 길이 상한으로
+            #   2MB 같은 값이 OSError: Argument list too long(E2BIG)을 내는 것을 막는다.
+            #   (값은 '=' 형식으로 전달되므로 '-' 로 시작해도 플래그로 오인되지 않아 허용.)
+            feature = data.get("feature")
+            if feature is not None:
+                if not isinstance(feature, str):
+                    self._json({"error": "feature must be a string"}, 400)
+                    return
+                if "\x00" in feature:
+                    self._json({"error": "feature must not contain NUL"}, 400)
+                    return
+                if len(feature) > MAX_FEATURE_CHARS:
+                    self._json(
+                        {"error": f"feature too long (> {MAX_FEATURE_CHARS} chars)"}, 400
+                    )
+                    return
             # #audit16: manager.start() 예외(동시 run 한도 초과·mkdir/write 실패 등)를 핸들러
             # traceback/연결종료로 흘리지 않고 JSON 에러로 매핑한다.
             try:
@@ -1367,9 +1391,24 @@ def serve(port: int = 8765, base_dir: Path | None = None, host: str = "127.0.0.1
         httpd.server_close()
 
 
+def _port_arg(raw: str) -> int:
+    """--port 검증: 1..65535 범위 정수만 허용 (#audit20 #7).
+
+    예전엔 type=int 만 써서 `--port 70000` 이 argparse 를 통과한 뒤 serve()→bind() 에서
+    OverflowError(원시 traceback)로 터졌다. __main__._port 와 동일하게 친절한 에러로 막는다.
+    """
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"포트는 정수여야 합니다: {raw!r}") from None
+    if not (1 <= v <= 65535):
+        raise argparse.ArgumentTypeError(f"포트는 1..65535 범위여야 합니다: {v}")
+    return v
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="orchestrator.webui", description="멀티에이전트 웹 UI")
-    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--port", type=_port_arg, default=8765)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--base-dir", type=Path, help="실행 결과 디렉터리 (기본 ~/agent-runs)")
     a = p.parse_args(argv)
@@ -1443,6 +1482,7 @@ INDEX_HTML = r"""<!doctype html>
     <div class="row">
       <div><label>기획서 파일 (.md/.txt/.html)</label><input type="file" id="specFile" accept=".md,.txt,.markdown,.html,.htm"/></div>
       <div><label>실행 이름</label><input type="text" id="name" placeholder="my-app"/></div>
+      <div style="flex:1 1 100%"><label title="비우면 기존 그린필드(전체 빌드). 입력하면 --project-dir 의 기존 프로젝트에 그 기능만 증분 추가하는 feature 모드로 실행된다.">feature (선택 · 증분 기능 추가 모드)</label><input type="text" id="feature" placeholder="비우면 전체 빌드 · 예: add OAuth login"/></div>
     </div>
     <div class="row">
       <div style="flex:2"><label>백엔드 (우선순위 순, 콤마 · 1개=단일 / 여러 개=폴오버·분산·교차)</label>
@@ -1558,7 +1598,7 @@ async function startRun(){
       max_attempts:raw("maxAttempts"),
       poll_interval:raw("pollInterval"),timeout:raw("timeout"),
       retries:raw("retries"),completion_level:$("completionLevel").value,
-      budget:raw("budget"),model:raw("model"),
+      budget:raw("budget"),model:raw("model"),feature:raw("feature"),
       mock:$("mock").checked,delegate:$("delegate").checked,full_access:$("fullAccess").checked,
       auto_commit:$("autoCommit").checked};
     const r=await fetchWithTimeout("/api/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)},30000);

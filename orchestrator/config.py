@@ -428,10 +428,17 @@ class RunConfig:
 
         self.default_backend = norm(self.default_backend)
         self.backend_priority = [norm(n) for n in (self.backend_priority or [])]
+        # #audit20(#6): 값(백엔드)뿐 아니라 키(역할)도 정규화한다. 예전엔 키를 그대로 둬서
+        # 프로그래매틱 호출 RunConfig(role_priority={"backend": [...]}) 의 alias 키가
+        # backends_for("backend-developer") 에서 매칭되지 않아 핀이 조용히 무시됐다(CLI 는
+        # __main__ 이 키를 미리 정규화해 무사했음 — 두 진입점 동작을 일치시킨다).
         self.role_priority = {
-            role: [norm(n) for n in names] for role, names in (self.role_priority or {}).items()
+            normalize_role(role): [norm(n) for n in names]
+            for role, names in (self.role_priority or {}).items()
         }
-        self.role_backend = {role: norm(n) for role, n in (self.role_backend or {}).items()}
+        self.role_backend = {
+            normalize_role(role): norm(n) for role, n in (self.role_backend or {}).items()
+        }
         # 정규화 과정에서 발생한 경고를 보존(웹/CLI 에서 노출 가능). raise 하지 않는다.
         self.backend_warnings = warnings
 

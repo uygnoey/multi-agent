@@ -181,10 +181,15 @@ def _stop_run(orch_dir: Path) -> bool:
 
     audit7(PID/PGID 재사용 방어): pgid 를 시작 시 한 번 캡처해 수 초간 os.killpg 를 반복하면,
     그 사이 리더가 죽고 커널이 같은 PGID 를 재사용할 때 무관한 새 프로세스 그룹을 죽일 수
-    있다. 그래서 매 그룹 시그널 직전에 _leader_leads_group() 으로 "원래 리더가 아직 그 그룹을
-    이끄는지" 재검증하고, 리더가 사라진 순간(ProcessLookupError) 그룹 시그널을 *완전히 중단*
-    한다 — 재사용됐을 수 있는 pgid 에 마지막 blanket SIGKILL 을 보내지 않는다. 리더가 살아
-    있는 동안만 per-process 폴백(os.kill(pid,...))을 유지한다.
+    있다. 그래서 *반복 시그널 구간(wait-phase)* 의 매 그룹 시그널 직전에 _leader_leads_group()
+    으로 "원래 리더가 아직 그 그룹을 이끄는지" 재검증하고, 리더가 사라진 순간(ProcessLookupError)
+    그 반복 그룹 시그널을 중단한다. 리더가 살아 있는 동안만 per-process 폴백(os.kill(pid,...))을
+    유지한다.
+
+    #audit20 정정: 단, _sweep_stragglers() 의 *최종 1회* 그룹 SIGKILL 은 이 가드를 거치지 않고
+    리더 사후에도 발사된다 — "그룹이 비어있지 않은 한 커널은 그 pgid 를 재사용하지 않는다"는
+    POSIX 불변식(잔존 자식 = 곧 우리 그룹)에 기댄 별도 안전논리다. 다만 비었음을 확인↔killpg
+    사이의 잔존 TOCTOU(완전 방어는 start-time 토큰 검증 필요)는 문서화된 후속 과제로 남는다.
 
     TUI 루프를 막지 않도록 동기 작업은 SIGTERM 전송 1회뿐이고, 종료 확인·SIGKILL 에스컬레
     이션·pidfile 제거는 데몬 스레드에서 처리한다. stop 이 시작되면 True 를 반환한다.
@@ -326,6 +331,10 @@ _VALUE_RERUN_FLAGS = frozenset(
         # #H01: 완료 레벨은 production 빌드 rerun argv 에 항상 들어가므로 화이트리스트에 포함해야
         #       TUI 재실행이 "허용되지 않은 플래그"로 깨지지 않는다.
         "--completion-level",
+        # #audit20(#1): 증분(기능 추가) 모드로 시작한 run 의 argv 에는 --feature 가 들어간다
+        #       (scheduler._rerun_argv 가 sys.argv 를 그대로 보존). 화이트리스트에 없으면 feature
+        #       모드 run 은 TUI 재실행('r')이 "허용되지 않은 플래그"로 전부 거부됐다. 값을 받는다.
+        "--feature",
     }
 )
 _NONNEG_FLOAT_RERUN_FLAGS = frozenset({"--budget", "--poll-interval", "--timeout"})

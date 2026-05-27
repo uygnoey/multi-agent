@@ -12,6 +12,11 @@ import shutil
 from .base import Backend, RoleRequest, RoleResult, run_subprocess
 
 _MAX_LOG_FIELD_CHARS = 4000
+# #audit20(#2): 거대 프롬프트(system+context+task 합본; spec 은 최대 4MB)를 positional argv 로
+#   넘기면 OS ARG_MAX/MAX_ARG_STRLEN(리눅스 단일인자 128KB) 에 걸려 create_subprocess_exec 자체가
+#   E2BIG 로 실패한다. codex 백엔드와 동일하게 임계치 초과 시 프롬프트를 stdin 으로 흘린다
+#   (claude -p 는 positional 프롬프트가 없으면 stdin 에서 읽는다). 작은 프롬프트는 기존 경로 유지.
+_PROMPT_STDIN_THRESHOLD = 100_000
 
 
 def _clip_log_field(value: str) -> str:
@@ -137,10 +142,13 @@ class ClaudeCLIBackend(Backend):
         return True, "binary present (auth NOT verified: 로그인 구독 또는 ANTHROPIC_API_KEY 필요)"
 
     async def run_role(self, req: RoleRequest) -> RoleResult:
-        base_cmd = [
-            "claude",
-            "-p",
-            req.prompt,
+        # #audit20(#2): 임계치 초과 프롬프트는 positional 자리에서 빼고 stdin 으로 흘린다.
+        prompt_bytes = req.prompt.encode("utf-8")
+        use_stdin = len(prompt_bytes) > _PROMPT_STDIN_THRESHOLD
+        base_cmd = ["claude", "-p"]
+        if not use_stdin:
+            base_cmd.append(req.prompt)
+        base_cmd += [
             "--output-format",
             "stream-json",
             "--verbose",
@@ -158,14 +166,29 @@ class ClaudeCLIBackend(Backend):
         # 전달해 강제한다. budget 미지정이면 추가하지 않는다(기존 동작 유지).
         budget_flag = ["--max-budget-usd", budget_arg(req.budget)] if req.budget is not None else []
         cmd = base_cmd + budget_flag
+
+        # #audit20(#2): stdin 경로일 때만 stdin_data 를 넘긴다(작은 프롬프트는 기존 호출 시그니처
+        #   그대로 — 기존 claude 테스트의 fake_run(...,line_render) 시그니처와 호환 유지).
+        async def _run(c):
+            if use_stdin:
+                return await run_subprocess(
+                    c,
+                    str(req.cwd),
+                    req.timeout,
+                    req.live_log_path,
+                    line_render=claude_stream_line,
+                    stdin_data=prompt_bytes,
+                )
+            return await run_subprocess(
+                c, str(req.cwd), req.timeout, req.live_log_path, line_render=claude_stream_line
+            )
+
         # #25(#117): 그러나 동일 CLI 에 turn-limit 플래그(--max-turns 등)는 존재하지 않는다
         # (claude --help 로 검증: 0건). 없는 플래그를 넘기면 매 호출이 'unknown option'으로
         # 깨지므로 추가하지 않는다 — req.max_turns 강제는 이 백엔드에서 불가(KEEP-DOCUMENTED).
         # 긴/루핑 세션은 timeout 으로만 통제된다.
         try:
-            rc, out, err, timed_out = await run_subprocess(
-                cmd, str(req.cwd), req.timeout, req.live_log_path, line_render=claude_stream_line
-            )
+            rc, out, err, timed_out = await _run(cmd)
         except Exception as e:
             return RoleResult(ok=False, error=str(e))
 
@@ -179,13 +202,7 @@ class ClaudeCLIBackend(Backend):
             and _is_unknown_budget_flag_error(err.decode(errors="replace"))
         ):
             try:
-                rc, out, err, timed_out = await run_subprocess(
-                    base_cmd,
-                    str(req.cwd),
-                    req.timeout,
-                    req.live_log_path,
-                    line_render=claude_stream_line,
-                )
+                rc, out, err, timed_out = await _run(base_cmd)
             except Exception as e:
                 return RoleResult(ok=False, error=str(e))
 
