@@ -152,8 +152,8 @@ def test_openai_run_bash_normal_exit_preserves_full_output() -> None:
     import threading as th
 
     from orchestrator.backends.openai_agents import (
-        _BashCapture,
         _bash_command_spec,
+        _BashCapture,
         _scrubbed_bash_env,
     )
 
@@ -195,7 +195,7 @@ def test_openai_run_bash_normal_exit_preserves_full_output() -> None:
             pass
         drainer.join(timeout=1.0)
     full = cap.text()
-    captured = sum(1 for l in full.splitlines() if l.startswith("LINE"))
+    captured = sum(1 for line in full.splitlines() if line.startswith("LINE"))
     assert rc == 0
     assert captured == n, (
         f"정상 종료 시 데이터 손실 ({captured}/{n}). 1차 보정의 무조건 fd close "
