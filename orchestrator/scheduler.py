@@ -760,11 +760,10 @@ class Scheduler:
     def _budget_exhausted(self) -> bool:
         if self.cfg.budget is None:
             return False
-        try:
-            spent = float(self.board.snapshot().get("total_cost_usd", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            spent = 0.0
-        return spent >= self.cfg.budget
+        # #audit22: total_cost() 경량 getter — 이전엔 snapshot() 으로 전체 board JSON 직렬화 후
+        # 한 필드만 뽑아 repair 루프(dev/verify)에서 반복 호출 시 누적 비효율이 컸다.
+        # total_cost() 내부에서 _coerce_finite_float 가 NaN/Inf/비숫자 폴백을 처리한다.
+        return self.board.total_cost() >= self.cfg.budget
 
     async def _repair_failed_dev(self, unit: dict, sem: asyncio.Semaphore, attempt: int) -> None:
         """초기 dev 실패(pipeline 진입) 후 dev 재작업 루프 → 성공 시 검증(_test_unit).

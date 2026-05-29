@@ -30,7 +30,35 @@ from .prompts import compose_prompt
 # #39: 동시 호출이 시작 시점에 모두 "예산 충분" 으로 보고 N-way 로 초과하는 것을 막기 위한
 # in-flight 예약 추정치(USD). 실제 비용은 호출 후에야 알 수 있으므로 보수적인 한 호출 추정으로
 # 자리를 미리 점유한다. 정확한 값이 아니어도 시작 시점 동시 통과를 막는 것이 목적이다.
-_INFLIGHT_RESERVE_USD = 0.50
+# #audit22: 이전엔 모든 백엔드/모델에 고정 $0.50 을 썼는데, 고비용 모델(opus 등)에선 동시 N 개
+# 호출이 모두 예산 통과 후 합산이 예산을 크게 초과할 수 있었다. 백엔드/모델 휴리스틱으로
+# 보수적 상한 추정치를 사용 — 정확한 비용은 add_cost 후 finally 에서 _inflight_reserved 가
+# 정정된다. mock 은 0(과대예약 회피), opus 는 가장 비싸므로 가장 큰 추정.
+_INFLIGHT_RESERVE_DEFAULT_USD = 0.50  # 미지 백엔드 폴백 (기존 동작 유지)
+
+
+def _estimate_inflight_reserve(backend_name: str, model: str | None) -> float:
+    """백엔드/모델별 in-flight 예약 추정(USD). 보수적 상한 — 실제값은 호출 후 정정.
+
+    의도: budget hard-cap 이 아니라 '동시 시작' N-way 초과만 막는 게 목적이므로 정확도
+    보다는 모델 가격대에 비례한 상대 비율이 더 중요하다. 한 turn 의 출력 + 입력 비용을
+    매우 보수적으로 잡되 mock 은 0 으로 — mock 호출이 예산 회계를 어지럽히지 않게.
+    """
+    if not backend_name or backend_name == "mock":
+        return 0.0
+    m = (model or "").lower()
+    # 모델 가격 계열. 우선순위: 저가 키워드(haiku/mini/nano) 를 먼저 체크해 'gpt-4o-mini'
+    # 같이 'gpt-4o' 와도 매칭되는 모델이 sonnet 등급(0.30)으로 잘못 분류되지 않게 한다.
+    if "haiku" in m or "mini" in m or "nano" in m:
+        return 0.05
+    if "opus" in m:
+        return 1.50  # 가장 비싼 모델 — 한 turn 도 큰 비용 가능
+    if "sonnet" in m or "gpt-5" in m or "gpt-4o" in m:
+        return 0.30
+    # 모델 알 수 없으면 백엔드 기본값
+    if backend_name == "codex-cli":
+        return 0.10  # codex 기본은 gpt-5-codex medium turn 정도
+    return _INFLIGHT_RESERVE_DEFAULT_USD
 
 # #22: 역할 세션이 쓰는 결과 JSON 의 최대 크기. 폭주/악성 에이전트가 거대한 결과 파일을 쓰면
 # orchestrator 가 read_text() 로 통째 메모리에 올리다 죽을 수 있다. 5MB 초과는 읽지 않고 계약
@@ -168,7 +196,9 @@ class Runner:
             # 해제한다.
             if self.cfg.budget is not None:
                 async with self._budget_lock:
-                    committed = self.board.snapshot().get("total_cost_usd", 0.0) or 0.0
+                    # #audit22: total_cost() 경량 getter — 이전엔 snapshot() 으로 전체 board 를
+                    # 직렬화해 한 숫자만 뽑아 _budget_lock 보유 시간이 board 크기에 비례했다.
+                    committed = self.board.total_cost()
                     projected = committed + self._inflight_reserved
                     if projected >= self.cfg.budget:
                         blocker = (
@@ -184,7 +214,19 @@ class Runner:
                         )
                         return _failure_outcome("blocked", blocker)
                     # 통과 → 한 호출분 추정치를 예약(동시 시작자가 같은 잔액을 중복 사용 못 하게).
-                    reserved = _INFLIGHT_RESERVE_USD
+                    # #audit22: 고정 $0.50 대신 후보 백엔드/모델 중 worst-case 추정치 사용.
+                    # 어느 candidate 가 실제 선택될지 이 시점엔 모르므로 가장 비싼 추정으로 보수적
+                    # 예약 (의도는 동시 시작 N-way 초과 차단이므로 underestimate 보다 overestimate
+                    # 가 안전 — 약간의 false-block 은 받아들이고 진짜 초과는 막는 쪽).
+                    cands, _skipped = self._candidates(role)
+
+                    def _model_for(b: str) -> str | None:
+                        return self.cfg.model_for(b) or (agent.model if agent else None)
+
+                    reserved = max(
+                        (_estimate_inflight_reserve(b, _model_for(b)) for b in cands),
+                        default=_INFLIGHT_RESERVE_DEFAULT_USD,
+                    )
                     self._inflight_reserved += reserved
 
             return await self._run_role_inner(role, spec, agent, unit, key, result_path, result_rel)

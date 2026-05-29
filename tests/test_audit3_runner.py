@@ -37,12 +37,23 @@ class _FakeBackend:
         return RoleResult(ok=True, final_message=f"[{req.role}] fake done", cost_usd=self.cost)
 
 
-def _make_runner(tmp_path, *, budget=None, backend) -> tuple[runner_mod.Runner, Board]:
+def _make_runner(
+    tmp_path,
+    *,
+    budget=None,
+    backend,
+    default_backend_name: str = "mock",
+    model: str | None = None,
+) -> tuple[runner_mod.Runner, Board]:
     cfg = RunConfig(
         spec_path=tmp_path / "spec.md",
         project_dir=tmp_path / "proj",
         budget=budget,
-        default_backend="mock",  # _candidates 가 호출하지만 get_backend 를 패치하므로 무관.
+        # #audit22: in-flight 예약이 백엔드/모델별로 추정됨. mock 은 의도적으로 0 예약
+        # (예산 회계 비오염). N-way 예약 차단 검증 테스트는 default_backend_name + model
+        # 인자로 비-mock 백엔드를 명시해 양수 추정을 받게 한다.
+        default_backend=default_backend_name,
+        model=model,
     )
     board = Board(cfg.project_dir)
     asyncio.run(board.init("spec body", {}))
@@ -58,9 +69,16 @@ def test_concurrent_calls_do_not_all_pass_budget_check(tmp_path, monkeypatch):
     gate = asyncio.Event()
     backend = _FakeBackend(cost=0.0, gate=gate)
     monkeypatch.setattr(runner_mod, "get_backend", lambda name: backend)
-    # 예산 0.5 = 예약 추정 1회분 → 첫 호출만 예약 통과, 이후엔 projected>=budget 으로 막힘.
+    # #audit22: 백엔드/모델별 동적 추정으로 변경. mock 은 0 예약(비오염)이므로 비-mock +
+    # 명시 모델로 예약치를 받는다. budget = 예약치 1회분 → 첫 호출만 통과, 이후 projected
+    # >= budget 으로 막힘. 의도(N-way 동시 시작 차단)는 그대로.
+    reserve = runner_mod._estimate_inflight_reserve("claude-cli", "claude-sonnet-4-6")
     runner, _board = _make_runner(
-        tmp_path, budget=runner_mod._INFLIGHT_RESERVE_USD, backend=backend
+        tmp_path,
+        budget=reserve,
+        backend=backend,
+        default_backend_name="claude-cli",
+        model="claude-sonnet-4-6",
     )
 
     async def drive():

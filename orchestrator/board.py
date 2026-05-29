@@ -435,6 +435,11 @@ class Board:
         # 모아 두었다가 락 해제 후 기록한다.
         collision_warnings: list[str] = []
         skipped_warnings: list[str] = []
+        # #audit22: deps DAG 사이클 감지용 — 락 안에서 unit 들이 모두 확정된 뒤 검사하고,
+        # 사이클에 포함된 unit 들은 즉시 FAILED 마킹해 scheduler 의 stall timeout(1800~3600s)
+        # 까지 기다리지 않게 한다. 경고도 모아 락 해제 후 기록.
+        cycle_warnings: list[str] = []
+        cycle_uids: set[str] = set()
         async with self._lock:
             # 외부에서 board.json 이 손상돼 id 가 없는 unit 이 끼어 있어도 KeyError 로
             # 단일 writer 가 죽지 않게 .get() 으로 안전하게 수집(손상 엔트리는 건너뜀).
@@ -524,13 +529,76 @@ class Board:
                         "notes": [],
                     }
                 )
+            # #audit22: deps DAG 사이클 검출 — scheduler 의 _wait_for_deps 가 사이클을 만나면
+            # stall timeout(기본 1800~3600s)까지 기다리다 실패하는데, board 단에서 즉시 잡아
+            # cycle 에 포함된 unit 을 FAILED 마킹하면 그 시간 낭비를 차단할 수 있다.
+            # DFS 3색 알고리즘 — WHITE(미방문) / GRAY(현재 스택) / BLACK(완료). GRAY 만나면 cycle.
+            all_units = self._data["units"]
+            by_id: dict[str, dict] = {u["id"]: u for u in all_units if u.get("id")}
+            adj: dict[str, list[str]] = {
+                uid: [d for d in u.get("deps", []) if d in by_id]
+                for uid, u in by_id.items()
+            }
+            WHITE, GRAY, BLACK = 0, 1, 2
+            color = {uid: WHITE for uid in adj}
+            stack: list[str] = []
+            detected: list[list[str]] = []
+
+            def _dfs(node: str) -> None:
+                color[node] = GRAY
+                stack.append(node)
+                for nb in adj.get(node, []):
+                    if color.get(nb) == WHITE:
+                        _dfs(nb)
+                    elif color.get(nb) == GRAY:
+                        # 사이클: stack 에서 nb 까지의 구간이 cycle
+                        try:
+                            idx = stack.index(nb)
+                            detected.append(stack[idx:])
+                        except ValueError:
+                            pass
+                color[node] = BLACK
+                stack.pop()
+
+            try:
+                # 재귀 깊이 한계: unit 수가 수천 단위로 가는 일은 거의 없으나 안전 마진.
+                import sys as _sys
+
+                _old_limit = _sys.getrecursionlimit()
+                _sys.setrecursionlimit(max(_old_limit, len(adj) + 100))
+                try:
+                    for uid in list(adj):
+                        if color.get(uid) == WHITE:
+                            _dfs(uid)
+                finally:
+                    _sys.setrecursionlimit(_old_limit)
+            except RecursionError:
+                # 극단적으로 깊은 그래프면 부분 결과만 사용 (best-effort)
+                pass
+
+            # 사이클에 포함된 unit 모두 모아 FAILED 마킹 + 노트
+            for cyc in detected:
+                cycle_uids.update(cyc)
+                cycle_warnings.append(
+                    f"deps cycle detected: {' -> '.join(cyc)} -> {cyc[0]}"
+                )
+            for uid in cycle_uids:
+                u = by_id.get(uid)
+                if u is None:
+                    continue
+                u["status"] = FAILED
+                u.setdefault("notes", []).append(
+                    "[audit22] dependency cycle — auto-FAILED to avoid scheduler stall"
+                )
+
             self._flush()
-        # 충돌/skip 은 락 밖에서 보드 경고로 기록(가시성 확보).
-        for msg in [*collision_warnings, *skipped_warnings]:
+        # 충돌/skip/사이클은 락 밖에서 보드 경고로 기록(가시성 확보).
+        for msg in [*collision_warnings, *skipped_warnings, *cycle_warnings]:
             await self.add_warning(msg)
         skipped = len(units) - added
         extra = f" ({skipped} skipped: dup/invalid id)" if skipped else ""
-        await self.log_event("board", f"added {added} unit(s){extra}")
+        cyc_extra = f" [{len(cycle_uids)} auto-FAILED: deps cycle]" if cycle_uids else ""
+        await self.log_event("board", f"added {added} unit(s){extra}{cyc_extra}")
 
     async def add_warning(self, msg: str) -> None:
         """치명적이지 않지만 최종 성공으로 오해되면 안 되는 실패(설계/CI/문서 등)를 기록."""
@@ -956,6 +1024,17 @@ class Board:
     def snapshot(self) -> dict:
         # #RA-nan: allow_nan=False + NaN/Inf 살균을 거쳐 webui 가 NaN 토큰을 받지 않게 한다.
         return json.loads(_dumps_safe(self._data, default=str))
+
+    def total_cost(self) -> float:
+        """누적 비용(USD) 만 가볍게 반환 — snapshot() 의 전체 JSON roundtrip 회피.
+
+        #audit22: 예산 사전점검(runner._budget_lock 안)이나 budget exhausted 폴링이 매 호출
+        snapshot() 으로 전체 board 를 _dumps_safe + json.loads 직렬화해 한 숫자만 뽑는 것은
+        과한 비용 — board 가 커질수록 락 보유시간이 늘어 _budget_lock 경합/이벤트 루프 블로킹
+        이 심해진다. 이 getter 는 _data 의 단일 필드만 접근하므로 O(1).
+        손상/비유한값(NaN/Inf, 비숫자)은 0.0 으로 폴백해 호출부 산술이 깨지지 않게 한다.
+        """
+        return _coerce_finite_float(self._data.get("total_cost_usd", 0.0))
 
     # ---- logs / directives ----
     async def log_event(self, who: str, msg: str) -> None:

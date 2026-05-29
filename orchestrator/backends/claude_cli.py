@@ -120,6 +120,9 @@ def budget_arg(value) -> str:
 # #1(audit9): 설치된 claude CLI 가 '--max-budget-usd' 플래그를 모르면 rc!=0 으로 깨진다
 # (구버전/배포판 차이). stderr 에서 '알 수 없는 옵션' 신호를 감지해, 그 플래그만 빼고 한 번
 # 재시도할 수 있게 한다. SDK 백엔드의 'dropped flag' graceful 메커니즘과 같은 취지.
+# #audit22: 'did you mean' 은 너무 광범위 — CLI 가 값 유효성 오류("invalid value, did you mean
+# a smaller number?")에도 같은 문구를 쓰면 잘못 매칭돼 예산 플래그를 빼고 재실행 → silent
+# budget cap 우회. 명확히 '미지 옵션'을 가리키는 힌트만 유지(보수적 매칭).
 _UNKNOWN_OPTION_HINTS = (
     "unknown option",
     "unrecognized option",
@@ -127,7 +130,6 @@ _UNKNOWN_OPTION_HINTS = (
     "no such option",
     "unexpected option",
     "unknown argument",
-    "did you mean",
 )
 
 
@@ -135,7 +137,8 @@ def _is_unknown_budget_flag_error(stderr: str) -> bool:
     """stderr 가 '--max-budget-usd' 를 모르는 CLI 의 에러 신호를 담고 있으면 True.
 
     플래그 이름과 'unknown/unrecognized/no such option' 류 힌트가 함께 보일 때만 True 로 판정해,
-    예산 초과 등 무관한 에러를 오인하지 않는다(보수적 매칭).
+    예산 초과 등 무관한 에러를 오인하지 않는다(보수적 매칭). #audit22 에서 'did you mean'
+    힌트는 값 유효성 오류와도 매칭돼 silent budget cap 우회 위험이 있어 제거.
     """
     low = (stderr or "").lower()
     if "--max-budget-usd" not in low and "max-budget-usd" not in low:
