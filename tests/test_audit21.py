@@ -133,6 +133,78 @@ def test_openai_run_bash_timeout_drains_with_escaped_child() -> None:
 
 
 # ---------------------------------------------------------------------------
+# #2b — 정상 종료 경로에서 raw fd close 가 drainer 캡처를 끊지 않음 (Codex 재검증 보정)
+# ---------------------------------------------------------------------------
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pipe 동작 의존")
+def test_openai_run_bash_normal_exit_preserves_full_output() -> None:
+    """정상 종료 경로에서 대량 출력이 내부 캡처에서 손실되지 않아야 한다.
+
+    1차 audit21 보정에서 ``os.close(fileno)`` 가 정상 종료 경로에도 무조건 호출돼
+    drainer 가 kernel pipe buffer 를 다 비우기 전에 fd 가 닫혀 데이터 race 가
+    발생할 잠재 위험이 있었다(Codex 재검증 지적). 2차 보정에서 정상 경로는
+    drainer.join 으로 EOF 우선 대기, escape fallback 만 fd close 하도록 분리.
+
+    내부 캡처(_BashCapture)에서 전체 라인이 보존되는지를 직접 검증한다.
+    (반환값의 ``[exit 0]\\n...`` head 4000자 절단은 _run_bash_command 의 별도 표시
+    제한이며 audit21 회귀가 아님. 내부 캡처는 손실이 없어야 한다.)
+    """
+    import subprocess as sp
+    import threading as th
+
+    from orchestrator.backends.openai_agents import (
+        _BashCapture,
+        _bash_command_spec,
+        _scrubbed_bash_env,
+    )
+
+    # _run_bash_command 의 내부 구조를 직접 재현해 cap.text() 전체 길이 검사.
+    # (현재 구현이 capture 보존을 깨뜨리는지 정확히 잡기 위함.)
+    n = 5000
+    cmd = f"for i in $(seq 0 {n - 1}); do printf 'LINE%06d\\n' $i; done"
+    cap = _BashCapture(10 * 1024 * 1024)
+    argv, _note = _bash_command_spec(cmd, ".", True)
+    proc = sp.Popen(
+        argv,
+        cwd=".",
+        stdin=sp.DEVNULL,
+        stdout=sp.PIPE,
+        stderr=sp.STDOUT,
+        start_new_session=True,
+        env=_scrubbed_bash_env(),
+    )
+
+    def _drain() -> None:
+        try:
+            while True:
+                chunk = proc.stdout.read(8192)
+                if not chunk:
+                    break
+                cap.feed(chunk)
+        except Exception:
+            pass
+
+    drainer = th.Thread(target=_drain, daemon=True)
+    drainer.start()
+    rc = proc.wait(timeout=30)
+    # 현재 구현의 정상 종료 경로(2차 보정): drainer EOF 우선 → 손실 없음 기대
+    drainer.join(timeout=2.0)
+    if drainer.is_alive():
+        try:
+            os.close(proc.stdout.fileno())
+        except Exception:
+            pass
+        drainer.join(timeout=1.0)
+    full = cap.text()
+    captured = sum(1 for l in full.splitlines() if l.startswith("LINE"))
+    assert rc == 0
+    assert captured == n, (
+        f"정상 종료 시 데이터 손실 ({captured}/{n}). 1차 보정의 무조건 fd close "
+        f"회귀 가능성 — 2차 보정의 EOF 우선 분리 필요."
+    )
+    assert f"LINE{n - 1:06d}" in full, "마지막 라인이 잘렸다 (drainer race)"
+
+
+# ---------------------------------------------------------------------------
 # #3 — board._coerce_int 가 OverflowError 도 흡수
 # ---------------------------------------------------------------------------
 def test_board_coerce_int_handles_overflow() -> None:

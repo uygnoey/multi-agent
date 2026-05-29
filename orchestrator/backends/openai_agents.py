@@ -448,22 +448,30 @@ def _run_bash_command(
             timed_out = True
             rc = None
             _kill_process_group(proc)  # #3: 그룹째 종료
-        # #audit21: 그룹 종료 후 stdout 의 raw fd 를 강제 close 해 drainer.read() 를 풀어준다.
-        # escaped child(setsid 등으로 그룹을 빠져나간 손자)가 stdout fd 를 상속해 유지하면
-        # EOF 가 안 와 drainer 스레드가 영구 hang 됐다.
-        # 1차 수정에서 ``proc.stdout.close()`` 만 호출했으나, BufferedReader 가 내부 lock 을
-        # 쓰기 때문에 drainer 의 read() 와 충돌해 close 자체가 block 되는 사례가 재현됐다
-        # (python3 preexec_fn=os.setsid 자식). os.close(fileno) 는 lock 을 우회해 즉시 EBADF
-        # 를 read 측에 전파하므로 drainer 가 결정적으로 풀린다. 이후 GC 시 BufferedReader.close
-        # 가 OSError 를 안전하게 흡수한다.
-        try:
-            if proc.stdout is not None:
-                fd = proc.stdout.fileno()
-                os.close(fd)
-        except Exception:
-            pass
-        # drainer 가 daemon 이므로 짧은 join 으로 충분 — 실패해도 메인 종료 시 자동 정리.
-        drainer.join(timeout=1.0)
+        # #audit21: 정상/비정상 경로를 분리해 drainer 정리. (Codex 재검증 보정)
+        # - 정상 종료: 자식이 stdout 을 close 했으므로 drainer 가 EOF 로 자연 종료한다.
+        #   먼저 drainer.join 으로 데이터 캡처 손실 없이 마무리하고, 혹시(escaped child 가
+        #   PIPE write-end 를 들고 있는 드문 케이스) hang 되면 그 때만 raw fd close 로 풀어준다.
+        # - timeout: 부모는 죽었으나 escaped child(setsid 등)가 stdout fd 를 상속해 유지하면
+        #   EOF 가 안 와 drainer 가 hang. 즉시 os.close(fileno) 로 강제 EBADF.
+        #   BufferedReader.close() 는 lock 충돌로 자체가 block 될 수 있어 raw fd close 가
+        #   결정적이다(python3 preexec_fn=os.setsid 재현: 1차 수정 25.79s → 보정 후 2.01s).
+        if timed_out:
+            try:
+                if proc.stdout is not None:
+                    os.close(proc.stdout.fileno())
+            except Exception:
+                pass
+            drainer.join(timeout=1.0)
+        else:
+            drainer.join(timeout=2.0)
+            if drainer.is_alive():  # escaped child PIPE 보유 — fallback
+                try:
+                    if proc.stdout is not None:
+                        os.close(proc.stdout.fileno())
+                except Exception:
+                    pass
+                drainer.join(timeout=1.0)
 
         captured = cap.text()
         out = captured[:4000]
