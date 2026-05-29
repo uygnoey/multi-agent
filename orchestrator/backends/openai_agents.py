@@ -607,10 +607,55 @@ def _read_file_bytes_under_root(path: Path, root: Path, max_bytes: int) -> bytes
 
 
 def _write_file_bytes_under_root(path: Path, root: Path, data: bytes) -> None:
+    # #audit23: 원자 쓰기 — O_TRUNC 후 직접 write 는 크래시/ENOSPC 시 부분 파일이 남는다.
+    # 같은 디렉터리에 .tmp 로 쓰고 flush+fsync 후 os.replace 로 교체 (board._flush 와 동일 정책).
+    #
+    # 보안 동작 보존: path 가 root 안 symlink 면 _open_inside 의 ELOOP fallback 과 동일하게
+    # _symlink_target_under_root 로 root 안 target 을 얻어 거기에 atomic 쓰기 한다(기존 동작).
+    # root 밖 target 은 거부(ELOOP 재던짐). 1차 시도(atomic 만 적용)에서 tmp 경로가 symlink 가
+    # 아니라 link 자체를 일반 파일로 교체하던 회귀가 있었음 — 이 redirect 로 보존.
+    import errno as _errno
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    actual = path
+    try:
+        probe_fd = os.open(str(path), os.O_RDONLY | nofollow)
+        os.close(probe_fd)
+    except OSError as e:
+        if e.errno == _errno.ENOENT:
+            pass  # 새 파일 — actual=path 유지
+        elif _is_eloop(e):
+            target = _symlink_target_under_root(path, root)
+            if target is None:
+                raise  # root 밖 symlink — 거부
+            actual = target
+        else:
+            raise
+
+    tmp = actual.with_name(actual.name + ".tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    fd = _open_inside(path, root, flags, 0o644)
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(data)
+    fd = _open_inside(tmp, root, flags, 0o644)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, actual)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+    # 디렉터리 fsync (rename 메타데이터 영속화, best-effort)
+    try:
+        dir_fd = os.open(str(actual.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
 def _resolve_tools(requested, tool_map: dict, read_list_fallback: list) -> list:

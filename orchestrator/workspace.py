@@ -15,6 +15,7 @@ import re
 from pathlib import Path
 
 from .config import AGENTS_DIR, FRAMEWORK_ROOT, TEMPLATES_DIR
+from .fsutil import atomic_write_bytes, atomic_write_text
 
 _GITIGNORE_SEED = ".orchestrator/\n__pycache__/\nnode_modules/\n.venv/\n*.db\n"
 
@@ -175,7 +176,9 @@ def expose_team_agents(project_dir: Path) -> int:
                 continue  # 사용자 작성/편집본 → 보존
             if cur == content:
                 continue  # 이미 최신 → 재기록 불필요
-        dest.write_text(content, encoding="utf-8")
+        # #audit23: 비원자 write_text 는 크래시/ENOSPC 시 agent prompt 가 부분 파일로 남아
+        # 다음 run 의 백엔드 호출 시 깨진 시스템 프롬프트로 실패할 수 있다. fsutil 원자 쓰기로 통일.
+        atomic_write_text(dest, content)
         count += 1
     return count
 
@@ -357,11 +360,13 @@ def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
     # 새 spec 을 돌리면 이전 값이 stale 해지므로 현재 내용으로 (재)기록한다 (#140).
     # 단, spec_text 가 비어있거나 공백뿐이면 기록을 건너뛴다: 빈 값으로 덮어쓰면 이전에 있던
     # 정상 spec 을 파괴하기 때문이다(재사용 디렉터리 보호). 기존 파일이 있으면 그대로 보존한다.
+    # #audit23: spec.md 의 비원자 write_text 는 크래시/ENOSPC 시 부분 spec 이 남아
+    # 다음 run/리포트가 절단된 spec 을 신뢰하게 된다. fsutil 원자 쓰기로 통일.
     if spec_text and spec_text.strip():
         _guard_managed_path(
             project_dir, orch / "spec.md", allow_unsafe=allow_unsafe, label=".orchestrator/spec.md"
         )
-        (orch / "spec.md").write_text(spec_text, encoding="utf-8")
+        atomic_write_text(orch / "spec.md", spec_text)
     elif not (orch / "spec.md").exists():
         # #audit13: 빈/공백 spec 이고 기존 spec.md 도 없으면, 프롬프트가 지시하는
         # "전체 spec 은 .orchestrator/spec.md 에 있다" 포인터가 dangling 되지 않게
@@ -369,8 +374,9 @@ def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
         _guard_managed_path(
             project_dir, orch / "spec.md", allow_unsafe=allow_unsafe, label=".orchestrator/spec.md"
         )
-        (orch / "spec.md").write_text(
-            "(이 run 에는 spec 본문이 제공되지 않았습니다.)\n", encoding="utf-8"
+        atomic_write_text(
+            orch / "spec.md",
+            "(이 run 에는 spec 본문이 제공되지 않았습니다.)\n",
         )
 
     stack_str = _fmt_stack(stack)
@@ -401,7 +407,9 @@ def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
             if not existing.lstrip().startswith(_GEN_MARKER):
                 print(f"[scaffold] {fname} 은 사용자 작성으로 판단되어 보존합니다 (덮어쓰지 않음)")
                 continue
-        target.write_text(content, encoding="utf-8")
+        # #audit23: CLAUDE.md/AGENTS.md 도 원자 쓰기 — 크래시 시 사용자 작성으로 오인될
+        # 수 있는 부분 파일이 남지 않게 한다.
+        atomic_write_text(target, content)
 
     expose_team_agents(project_dir)
 
@@ -424,10 +432,10 @@ def scaffold(project_dir: Path, spec_text: str, stack: dict) -> None:
             if pat.strip() and pat.strip() not in existing
         ]
         if missing:
-            # 원본 바이트는 보존하고 누락 시드만 바이너리로 append (디코드 재기록 금지).
+            # #audit23: 원본 바이트 보존 + 누락 시드만 추가. 비원자 'ab' append 는 크래시 시
+            # 부분 라인이 남을 수 있어 atomic_write_bytes 로 read-modify-write 원자 교체.
             prefix = b"" if (not raw or raw.endswith(b"\n")) else b"\n"
             addition = prefix + ("\n".join(missing) + "\n").encode("utf-8")
-            with gi.open("ab") as f:
-                f.write(addition)
+            atomic_write_bytes(gi, raw + addition)
     else:
-        gi.write_text(_GITIGNORE_SEED, encoding="utf-8")
+        atomic_write_text(gi, _GITIGNORE_SEED)
