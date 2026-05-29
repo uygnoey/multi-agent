@@ -410,12 +410,16 @@ def _run_bash_command(
     - 반환: 정상 종료면 ``[exit <code>]\\n<본문>``, 타임아웃이면 ``[timeout]\\n<본문>``.
     """
     proc = None
+    drainer = None
     cap = _BashCapture(max_capture)
     argv, sandbox_note = _bash_command_spec(command, cwd, full_access)
     try:
         proc = subprocess.Popen(
             argv,
             cwd=cwd,
+            # #audit21: stdin 을 DEVNULL 로 명시. 미지정 시 자식이 부모 stdin 을 상속해
+            # read 호출 시 부모 tty/오케스트레이터 stdin 에서 입력을 기다리며 hang 한다.
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,  # stdout+stderr 를 한 스트림으로 합쳐 순서 보존
             start_new_session=True,  # #3: 새 프로세스 그룹 → 자식까지 그룹째 종료 가능
@@ -444,8 +448,22 @@ def _run_bash_command(
             timed_out = True
             rc = None
             _kill_process_group(proc)  # #3: 그룹째 종료
-        # 드레인 스레드가 EOF 까지 마무리하도록 잠깐 join (kill 후엔 곧 끝난다).
-        drainer.join(timeout=2.0)
+        # #audit21: 그룹 종료 후 stdout 의 raw fd 를 강제 close 해 drainer.read() 를 풀어준다.
+        # escaped child(setsid 등으로 그룹을 빠져나간 손자)가 stdout fd 를 상속해 유지하면
+        # EOF 가 안 와 drainer 스레드가 영구 hang 됐다.
+        # 1차 수정에서 ``proc.stdout.close()`` 만 호출했으나, BufferedReader 가 내부 lock 을
+        # 쓰기 때문에 drainer 의 read() 와 충돌해 close 자체가 block 되는 사례가 재현됐다
+        # (python3 preexec_fn=os.setsid 자식). os.close(fileno) 는 lock 을 우회해 즉시 EBADF
+        # 를 read 측에 전파하므로 drainer 가 결정적으로 풀린다. 이후 GC 시 BufferedReader.close
+        # 가 OSError 를 안전하게 흡수한다.
+        try:
+            if proc.stdout is not None:
+                fd = proc.stdout.fileno()
+                os.close(fd)
+        except Exception:
+            pass
+        # drainer 가 daemon 이므로 짧은 join 으로 충분 — 실패해도 메인 종료 시 자동 정리.
+        drainer.join(timeout=1.0)
 
         captured = cap.text()
         out = captured[:4000]
@@ -456,6 +474,14 @@ def _run_bash_command(
         return f"[exit {rc}]\n{body}"
     except Exception as e:
         _kill_process_group(proc)
+        # #audit21: 예외 경로도 동일하게 raw fd close 로 drainer 를 풀어준다(위와 동일 사유).
+        try:
+            if proc is not None and proc.stdout is not None:
+                os.close(proc.stdout.fileno())
+        except Exception:
+            pass
+        if drainer is not None:
+            drainer.join(timeout=1.0)
         return f"<bash error: {e}>"
 
 

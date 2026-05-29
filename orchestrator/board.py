@@ -121,12 +121,17 @@ def _dumps_safe(data, **kw) -> str:
 
 
 def _coerce_int(raw) -> int:
-    """비-정수 입력은 0 으로 변환 (잘못된 토큰 메타데이터 방어)."""
+    """비-정수 입력은 0 으로 변환 (잘못된 토큰 메타데이터 방어).
+
+    #audit21: ``int(float('inf'))`` 같은 비유한 float 은 OverflowError 를 던지므로
+    이전엔 누적 갱신을 깨뜨릴 수 있었다. 백엔드가 비정상 usage 를 보고해도(JSON
+    ``1e309`` 도 ``json.loads`` 가 ``inf`` 로 파싱) board 가 죽지 않도록 흡수한다.
+    """
     if isinstance(raw, bool):
         return 0
     try:
         return int(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 
@@ -703,7 +708,11 @@ class Board:
             if message is not None:
                 a["last_message"] = str(message)[:500]
             if call:
-                a["calls"] += 1
+                # #audit21: setdefault 가 calls=0 으로 초기화하므로 정상 경로엔 영향 없음.
+                # 외부에서 board.json 이 손상돼 calls 가 비-정수로 들어와도 단일 writer 가
+                # TypeError 로 죽지 않도록, 다른 누적값(tokens/cost)과 동일하게 _coerce_int
+                # 로 방어한다(패턴 통일 — LOW hardening).
+                a["calls"] = _coerce_int(a.get("calls", 0)) + 1
             a["updated_at"] = time.time()
             self._flush()
         if activity:

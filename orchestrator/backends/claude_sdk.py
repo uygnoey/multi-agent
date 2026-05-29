@@ -264,10 +264,22 @@ class ClaudeSDKBackend(Backend):
                 # usage 를 실어도 중복 합산(double-count) 안 되고, (b) 뒤에 usage 없는/부분 메시지가
                 # 와도 이전 값을 0/축소로 덮지 않는다. (이전엔 주석은 '누적'인데 코드는 단순 = 할당
                 # 이라, 멀티-usage 메시지에서 마지막 값만 남아 과소계상 위험이 있었다.)
-                it_i, ot_i = int(it or 0), int(ot or 0)
+                # #audit21: malformed usage(문자열/inf/None 등)에서 int() 가 던지는
+                # TypeError/ValueError/OverflowError 를 흡수한다. 이전엔 성공 stream 도
+                # 비정상 usage 한 번에 _consume 전체가 실패로 바뀔 수 있었다.
+                def _to_nonneg_int(v) -> int:
+                    if v is None:
+                        return 0
+                    try:
+                        iv = int(v)
+                    except (TypeError, ValueError, OverflowError):
+                        return 0
+                    return iv if iv > 0 else 0
+
+                it_i, ot_i = _to_nonneg_int(it), _to_nonneg_int(ot)
                 state["in_tokens"] = max(state["in_tokens"], it_i)
                 state["out_tokens"] = max(state["out_tokens"], ot_i)
-                total = int(tt) if tt else it_i + ot_i
+                total = _to_nonneg_int(tt) if tt else it_i + ot_i
                 if total:
                     state["tokens"] = max(state["tokens"] or 0, total)
 

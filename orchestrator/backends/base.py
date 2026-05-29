@@ -218,56 +218,64 @@ async def run_subprocess(cmd, cwd, timeout, log_path=None, line_render=None, std
         )
         await proc.wait()
 
+    # #audit21: 정상 종료 외 모든 경로(TimeoutError/CancelledError/예외)에서 동일한 그룹
+    # 정리를 받도록 cleanup 을 finally 로 통합한다. 이전엔 TimeoutError 만 SIGTERM→SIGKILL
+    # 그룹 종료를 수행했고 외부 task.cancel() 로 인한 CancelledError 경로는 transport close
+    # 만 해서 provider CLI 가 spawn 한 자식(node/codex 등)이 살아남았다
+    # (재현 검증: alive_after_cancel={'shell': False, 'child': True}).
+    exited_normally = False
     try:
         await asyncio.wait_for(_drain_and_wait(), timeout=timeout)
+        exited_normally = True
         return proc.returncode, out_chunks.getvalue(), err_chunks.getvalue(), False
     except asyncio.TimeoutError:
-        # #17: 즉시 SIGKILL 대신 SIGTERM 으로 정리(락/임시파일 등) 유예를 준 뒤 SIGKILL.
-        # 프로세스 그룹째 종료한다 (CLI 가 spawn 한 자식 — node/codex 등 — 이 살아남지 않도록).
-        # pgid 는 spawn 직후 캡처한 값을 재사용한다(여기서 다시 조회하면 부모가 이미 죽어 실패).
-        # 1) SIGTERM (graceful) — 그룹 우선, 실패 시 단일 프로세스
-        try:
-            if pgid is not None:
-                os.killpg(pgid, signal.SIGTERM)
-            else:
-                proc.terminate()
-        except Exception:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-        # 2) 최대 ~3초까지 자발적 종료 대기
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=3.0)
-        except asyncio.TimeoutError:
-            # 3) 아직 살아있으면 SIGKILL 로 강제 종료
+        return None, out_chunks.getvalue(), err_chunks.getvalue(), True
+    finally:
+        # 1~3) 정상 종료가 아니고 부모가 아직 살아있으면 SIGTERM 유예 후 SIGKILL (#17 정책).
+        #      pgid 는 spawn 직후 캡처한 값을 재사용(여기서 다시 조회하면 부모가 이미 죽어 실패).
+        if not exited_normally and proc.returncode is None:
+            # 1) SIGTERM (graceful) — 그룹 우선, 실패 시 단일 프로세스
             try:
                 if pgid is not None:
-                    os.killpg(pgid, signal.SIGKILL)
+                    os.killpg(pgid, signal.SIGTERM)
                 else:
-                    proc.kill()
+                    proc.terminate()
             except Exception:
                 try:
-                    proc.kill()
+                    proc.terminate()
                 except Exception:
                     pass
+            # 2) 최대 ~3초까지 자발적 종료 대기. cancel 재전달로 cleanup 이 끊기지 않게
+            #    예외를 모두 흡수하고 다음 단계로 진행한다.
             try:
-                await proc.wait()
-            except Exception:
+                await asyncio.wait_for(proc.wait(), timeout=3.0)
+            except BaseException:
                 pass
-        except Exception:
-            pass
+            # 3) 아직 살아있으면 SIGKILL 로 강제 종료
+            if proc.returncode is None:
+                try:
+                    if pgid is not None:
+                        os.killpg(pgid, signal.SIGKILL)
+                    else:
+                        proc.kill()
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                try:
+                    await proc.wait()
+                except BaseException:
+                    pass
         # 4) 부모가 유예 안에 죽었더라도(grace-success), SIGTERM 을 무시한 채 살아남은
         #    그룹 내 자식(부모 셸은 종료) 을 마지막으로 한 번 더 SIGKILL 로 일소한다.
-        #    두 경로(부모 graceful 종료 / 부모 무응답) 모두 그룹 SIGKILL 으로 끝나야
-        #    호출이 끝난 뒤 살아남는 자식이 없다. 그룹이 이미 비었으면 무해(try/except).
+        #    정상 종료 경로에서도 그룹 내 자식이 남았을 수 있으므로 동일하게 수행.
+        #    그룹이 이미 비었으면 무해(try/except).
         if pgid is not None:
             try:
                 os.killpg(pgid, signal.SIGKILL)
             except Exception:
                 pass
-        return None, out_chunks.getvalue(), err_chunks.getvalue(), True
-    finally:
         if f is not None:
             try:
                 await asyncio.to_thread(_close_live_log, f)

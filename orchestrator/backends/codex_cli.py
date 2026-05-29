@@ -170,9 +170,11 @@ def codex_cost(model: str, input_tokens: int, cached_input_tokens: int, output_t
 
 
 def _coerce_usage_value(value) -> int | None:
+    # #audit21: ``1e309`` 같은 비유한 JSON 숫자가 ``float('inf')`` 로 들어오면
+    # ``int(inf)`` 가 OverflowError 를 던진다. 비정상 usage 가 파서를 죽이지 않도록 흡수.
     try:
         iv = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return max(0, iv)
 

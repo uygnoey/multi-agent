@@ -76,11 +76,23 @@ def parse_stream_result(out_bytes: bytes):
             cost = o.get("total_cost_usd", cost)
             u = o.get("usage") or {}
             if u:
+                # #audit21: usage 필드가 비정상(str/inf/None)이어도 정상 stream 파싱이
+                # 깨지지 않도록 각 항목을 안전하게 int 로 강제한다. 이전엔 ``"123"`` 같은
+                # 문자열 usage 가 들어오면 ``or 0`` 가 truthy 로 평가돼 ``str + int`` 가 TypeError.
+                def _u(v) -> int:
+                    if v is None:
+                        return 0
+                    try:
+                        iv = int(v)
+                    except (TypeError, ValueError, OverflowError):
+                        return 0
+                    return iv if iv > 0 else 0
+
                 tokens = (
-                    (u.get("input_tokens") or 0)
-                    + (u.get("cache_creation_input_tokens") or 0)
-                    + (u.get("cache_read_input_tokens") or 0)
-                    + (u.get("output_tokens") or 0)
+                    _u(u.get("input_tokens"))
+                    + _u(u.get("cache_creation_input_tokens"))
+                    + _u(u.get("cache_read_input_tokens"))
+                    + _u(u.get("output_tokens"))
                 )
     return final, cost, model, tokens
 
