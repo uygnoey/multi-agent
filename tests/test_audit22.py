@@ -200,11 +200,12 @@ def test_claude_cli_did_you_mean_no_longer_matches_value_error() -> None:
     """CLI 가 값 유효성 오류에 'did you mean' 을 쓰면 silent 예산 우회가 생겼었다.
 
     audit22 에서 'did you mean' 힌트를 _UNKNOWN_OPTION_HINTS 에서 제거. 진짜 미지 옵션
-    힌트만 유지(unknown/unrecognized/no such option/unexpected option/unknown argument).
+    힌트만 유지(unknown/unrecognized/no such option/unexpected option/unknown argument/
+    not found/not recognized).
     """
     from orchestrator.backends.claude_cli import _is_unknown_budget_flag_error
 
-    # 진짜 unknown 옵션 — True
+    # 진짜 unknown 옵션 — True (확정 표현)
     assert _is_unknown_budget_flag_error(
         "error: unknown option '--max-budget-usd'"
     )
@@ -225,6 +226,35 @@ def test_claude_cli_did_you_mean_no_longer_matches_value_error() -> None:
 
     # 플래그 이름 없음 — 항상 False (다른 플래그 오류와 분리)
     assert not _is_unknown_budget_flag_error("error: unknown option '--bogus'")
+
+
+def test_claude_cli_not_found_and_not_recognized_are_unknown_option() -> None:
+    """#audit22-amend (Codex 검증 보정): 진짜 unknown 옵션 표현 false-negative 보강.
+
+    'did you mean' 제거가 너무 좁아 다음 형태들이 unknown 옵션으로 인식되지 않았다 →
+    예산 플래그 빼고 재실행 못 함 → 사용자가 호환성 문제로 오인.
+    'not found'/'not recognized' 추가로 보강. '--max-budget-usd' 동시 포함 조건이
+    false-positive 를 막아준다.
+    """
+    from orchestrator.backends.claude_cli import _is_unknown_budget_flag_error
+
+    # Codex 보고 false-negative 2건 (보정 후 True 여야 함)
+    assert _is_unknown_budget_flag_error(
+        "error: option '--max-budget-usd' not found, did you mean '--max-tokens'?"
+    )
+    assert _is_unknown_budget_flag_error(
+        "error: --max-budget-usd is not a recognized option"
+    )
+    # 변형: is not recognized
+    assert _is_unknown_budget_flag_error(
+        "error: --max-budget-usd is not recognized"
+    )
+
+    # false-positive 안전성: 무관 'command not found' 는 플래그 이름 없어 통과 못 함
+    assert not _is_unknown_budget_flag_error("claude: command not found")
+    assert not _is_unknown_budget_flag_error(
+        "error: file 'spec.md' not found"
+    )
 
 
 # ---------------------------------------------------------------------------

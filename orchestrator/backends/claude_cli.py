@@ -123,6 +123,11 @@ def budget_arg(value) -> str:
 # #audit22: 'did you mean' 은 너무 광범위 — CLI 가 값 유효성 오류("invalid value, did you mean
 # a smaller number?")에도 같은 문구를 쓰면 잘못 매칭돼 예산 플래그를 빼고 재실행 → silent
 # budget cap 우회. 명확히 '미지 옵션'을 가리키는 힌트만 유지(보수적 매칭).
+# #audit22-amend (Codex 검증 보정): 'did you mean' 제거가 너무 좁아 진짜 unknown 옵션 표현
+# 일부를 놓치는 false-negative 가 생겼다(예: "option '--max-budget-usd' not found",
+# "--max-budget-usd is not a recognized option"). 'not found'/'not recognized' 힌트를
+# 추가해 보강한다. '--max-budget-usd' 동시 포함 조건이 이미 있어 false-positive 안전
+# ("claude: command not found" 같은 무관 stderr 는 플래그 이름이 없어 통과 못 함).
 _UNKNOWN_OPTION_HINTS = (
     "unknown option",
     "unrecognized option",
@@ -130,6 +135,9 @@ _UNKNOWN_OPTION_HINTS = (
     "no such option",
     "unexpected option",
     "unknown argument",
+    "not found",  # "option '--max-budget-usd' not found"
+    "not recognized",  # "is not recognized" 직접 매칭
+    "recognized option",  # "is not a recognized option" (관사 'a' 가 substring 분리해 위 힌트 우회)
 )
 
 
