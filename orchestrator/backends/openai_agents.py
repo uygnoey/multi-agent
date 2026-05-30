@@ -608,13 +608,21 @@ def _read_file_bytes_under_root(path: Path, root: Path, max_bytes: int) -> bytes
 
 def _write_file_bytes_under_root(path: Path, root: Path, data: bytes) -> None:
     # #audit23: 원자 쓰기 — O_TRUNC 후 직접 write 는 크래시/ENOSPC 시 부분 파일이 남는다.
-    # 같은 디렉터리에 .tmp 로 쓰고 flush+fsync 후 os.replace 로 교체 (board._flush 와 동일 정책).
+    # 같은 디렉터리에 tmp 로 쓰고 flush+fsync 후 os.replace 로 교체 (board._flush 와 동일 정책).
     #
     # 보안 동작 보존: path 가 root 안 symlink 면 _open_inside 의 ELOOP fallback 과 동일하게
     # _symlink_target_under_root 로 root 안 target 을 얻어 거기에 atomic 쓰기 한다(기존 동작).
-    # root 밖 target 은 거부(ELOOP 재던짐). 1차 시도(atomic 만 적용)에서 tmp 경로가 symlink 가
-    # 아니라 link 자체를 일반 파일로 교체하던 회귀가 있었음 — 이 redirect 로 보존.
+    # root 밖 target 은 거부(ELOOP 재던짐).
+    #
+    # #audit23-amend (Codex 보안 검증 보정): tmp 경로에 _open_inside 의 ELOOP redirect 를
+    # 적용하면, 공격자가 사전에 predictable ``path.tmp`` 위치에 root 내부 victim 을 가리키는
+    # symlink 를 심어두면 _symlink_target_under_root 로 redirect 되어 victim 을 덮어쓰고
+    # 최종 os.replace 가 target 을 그 symlink 로 만들었다(Codex 재현).
+    # 해결: tmp 는 ``tempfile.mkstemp(dir=actual.parent)`` 로 random name + O_EXCL|O_NOFOLLOW
+    # 동등 효과로 직접 생성 — predictable symlink 선점 공격 원천 차단.
+    # actual.parent 가 root 안인지 별도로 검증(symlink redirect 가 root 밖으로 새는 일 차단).
     import errno as _errno
+    import tempfile as _tempfile
 
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     actual = path
@@ -632,10 +640,20 @@ def _write_file_bytes_under_root(path: Path, root: Path, data: bytes) -> None:
         else:
             raise
 
-    tmp = actual.with_name(actual.name + ".tmp")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    fd = _open_inside(tmp, root, flags, 0o644)
+    # actual.parent 가 root 안인지 명시 검증(redirect 후에도 root 밖에 tmp 생성 차단).
+    if not _resolve_under_root(actual.parent, root):
+        raise OSError(
+            f"target parent escapes project root: {actual.parent} (root={root})"
+        )
+
+    fd, tmp_str = _tempfile.mkstemp(
+        prefix=actual.name + ".", suffix=".tmp", dir=str(actual.parent)
+    )
+    tmp = Path(tmp_str)
     try:
+        # mkstemp 은 0o600 으로 생성한다. 기존 _write_file_bytes_under_root 가 0o644 로
+        # 만들던 동작과 일치시키려면 fchmod 가 필요하나, 단일 사용자 도구 전제상 0o600 도
+        # 안전하고 더 보수적이라 그대로 유지(다른 사용자 read 차단).
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
             fh.flush()

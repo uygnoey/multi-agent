@@ -182,6 +182,78 @@ def test_openai_write_file_bytes_cleans_tmp_on_failure(tmp_path, monkeypatch) ->
     monkeypatch.setattr(openai_agents.os, "replace", real_replace)
 
 
+def test_fsutil_atomic_write_resists_tmp_symlink_to_outside(tmp_path) -> None:
+    """#audit23-amend (Codex 보안 검증): predictable .tmp 위치에 outside 가리키는
+    symlink 가 사전에 심어져 있어도 outside 파일이 손상되지 않아야 한다.
+
+    이전 ``path.with_name(path.name + '.tmp')`` 는 predictable 경로라 공격자가
+    심어둔 symlink 를 따라가 outside 를 덮어쓰는 우회가 가능했다. mkstemp 의
+    random name + O_EXCL|O_NOFOLLOW 효과로 차단된다.
+    """
+    from orchestrator.fsutil import atomic_write_text
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside-original")
+    root = tmp_path / "proj"
+    root.mkdir()
+    target = root / "x.txt"
+    # 공격자가 사전에 심어둔 predictable .tmp symlink
+    try:
+        (root / "x.txt.tmp").symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink unsupported on this filesystem")
+
+    atomic_write_text(target, "new-content")
+    # 핵심: outside 가 손상되지 않아야 한다
+    assert outside.read_text() == "outside-original", (
+        "predictable .tmp symlink 로 outside 파일이 덮어쓰여졌다 (보안 회귀)"
+    )
+    # 실제 target 은 정상 작성됨
+    assert target.read_text() == "new-content"
+    assert not target.is_symlink()
+
+
+def test_openai_write_resists_tmp_symlink_to_inside_victim(tmp_path) -> None:
+    """#audit23-amend: predictable .tmp 가 root 안 victim 가리키는 symlink 면
+    이전엔 _open_inside 의 ELOOP redirect 가 victim 을 덮어쓰고 최종 target 을
+    symlink 로 만들었다. mkstemp random name 으로 차단."""
+    from orchestrator.backends.openai_agents import _write_file_bytes_under_root
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    victim = root / "victim.txt"
+    victim.write_bytes(b"victim-original")
+    target = root / "out.txt"
+    try:
+        (root / "out.txt.tmp").symlink_to(victim)
+    except OSError:
+        pytest.skip("symlink unsupported on this filesystem")
+
+    _write_file_bytes_under_root(target, root, b"new-data")
+    # victim 보존
+    assert victim.read_bytes() == b"victim-original"
+    # target 은 일반 파일로 정상 생성
+    assert target.exists()
+    assert not target.is_symlink()
+    assert target.read_bytes() == b"new-data"
+
+
+def test_openai_write_rejects_target_parent_outside_root(tmp_path) -> None:
+    """actual.parent 가 root 밖이면 명시 거부 — symlink redirect 가 root 밖으로 새는 차단."""
+    from orchestrator.backends.openai_agents import _write_file_bytes_under_root
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    # 정상: root 안 경로는 통과
+    _write_file_bytes_under_root(root / "ok.txt", root, b"hi")
+
+    # 비정상: 절대경로로 root 밖을 지정해도 _resolve_under_root 검증으로 거부
+    outside_target = tmp_path / "elsewhere.txt"
+    with pytest.raises(OSError):
+        _write_file_bytes_under_root(outside_target, root, b"injected")
+    assert not outside_target.exists()
+
+
 def test_openai_write_file_rejects_symlink_to_outside(tmp_path) -> None:
     """traversal/symlink 방어가 atomic 화 후에도 유지되어야 한다 (_open_inside 보호 보존)."""
 
