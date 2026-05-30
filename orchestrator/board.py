@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import normalize_role
+from .fsutil import atomic_write_text as _fsutil_atomic_write_text
 
 _UNSAFE_ID = re.compile(r"[^A-Za-z0-9_-]+")
 
@@ -340,63 +341,28 @@ class Board:
         # title/description/stack/message)이 _data 에 들어와도 TypeError 로 단일 writer 를
         # 죽이지 않고 문자열로 격하시킨다. (안 그러면 in-memory 상태는 변형됐는데 영속화는 실패해
         # 디버전스가 나고 이후 모든 변형도 실패한다.)
-        tmp = self.path.with_suffix(".json.tmp")
         # #RA-nan: allow_nan=False + NaN/Inf 폴백 살균을 거쳐 board.json 에 표준-비준수
         # NaN/Infinity 토큰이 새지 않게 한다(webui 의 JSON.parse 보호).
         payload = _dumps_safe(self._data, indent=2, default=str)
-        # #audit20: write/fsync 도중 예외(ENOSPC/EIO 등)가 나면 stale board.json.tmp 가 남는다.
-        # _atomic_write_text 와 동일하게 어떤 예외든 tmp 를 정리한 뒤 재던진다(replace 는 write 가
-        # 끝난 뒤에만 실행되므로 board.json 본체는 손상되지 않지만, tmp 잔존은 정리한다).
-        try:
-            with tmp.open("w", encoding="utf-8") as f:
-                f.write(payload)
-                f.flush()
-                os.fsync(f.fileno())  # tmp 본문을 디스크에 강제 반영 (rename 전 내구성 확보)
-            tmp.replace(self.path)  # 원자적 교체 유지
-        except BaseException:
-            tmp.unlink(missing_ok=True)
-            raise
-        # rename(디렉터리 엔트리 변경)을 영속화하려면 상위 디렉터리도 fsync 해야 한다. 단,
-        # 일부 플랫폼/파일시스템(예: Windows)은 디렉터리 fd-fsync 를 지원하지 않으므로 best-effort.
-        try:
-            dir_fd = os.open(str(self.path.parent), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            # 디렉터리 fsync 미지원 플랫폼/디렉터리는 조용히 건너뛴다 (atomic rename 자체는 유지됨).
-            pass
+        # #audit24-A: predictable ``self.path.with_suffix(".json.tmp")`` 는 공격자가 사전에
+        # 그 위치에 outside 가리키는 symlink 를 심어두면 open("w") 가 따라가 outside 파일을
+        # 덮어쓰는 우회가 가능했다(audit23-amend 의 Codex 보안 재현과 동일 클래스 약점).
+        # fsutil.atomic_write_text 는 mkstemp 으로 random name + O_EXCL|O_NOFOLLOW 동등 효과를
+        # 적용하므로 predictable .tmp symlink 선점 공격이 원천 차단된다. flush+fsync+os.replace+
+        # 디렉터리 fsync best-effort 정책은 그대로(검증된 패턴 재사용).
+        _fsutil_atomic_write_text(self.path, payload)
 
     @staticmethod
     def _atomic_write_text(path: Path, text: str) -> None:
-        """report.md / DELIVERABLES*.md 를 원자적으로 기록 (temp→os.replace).
+        """report.md / DELIVERABLES*.md 를 원자적으로 기록 (audit24-A: fsutil 위임).
 
-        plain write_text 는 비-원자적이라 크래시/정전 시 부분 파일이 남을 수 있다. _flush 와
-        동일하게 같은 디렉터리에 tmp 로 쓰고 flush()+fsync 후 os.replace 로 교체한다.
+        plain write_text 는 비-원자적이라 크래시/정전 시 부분 파일이 남을 수 있다.
+        #audit24-A: 1차 구현의 ``path.with_name(path.name + '.tmp')`` predictable tmp 는
+        symlink 선점 공격 표면이었다. fsutil.atomic_write_text 의 mkstemp 기반 random tmp
+        패턴으로 위임 — 동일 정책(flush + fsync + os.replace + 디렉터리 fsync) + 보안 강화.
+        staticmethod 시그니처는 외부 호출자 호환성 위해 유지(report/deliverables 호출부).
         """
-        tmp = path.with_name(path.name + ".tmp")
-        # #M07: 쓰기 도중 예외가 나면 stale .tmp 가 남는다. 어떤 예외든 tmp 를 정리한 뒤
-        # 재던지고, replace 성공 후에는 _flush 와 동일하게 상위 디렉터리도 fsync 해
-        # rename 메타데이터를 영속화한다 (best-effort, 미지원 플랫폼은 건너뜀).
-        try:
-            with tmp.open("w", encoding="utf-8") as f:
-                f.write(text)
-                f.flush()
-                os.fsync(f.fileno())  # tmp 본문을 디스크에 강제 반영 (rename 전 내구성 확보)
-            os.replace(tmp, path)  # 원자적 교체
-        except BaseException:
-            tmp.unlink(missing_ok=True)  # stale tmp 제거 후 재던짐
-            raise
-        try:
-            dir_fd = os.open(str(path.parent), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            # 디렉터리 fsync 미지원 플랫폼/디렉터리는 조용히 건너뛴다 (atomic rename 자체는 유지됨).
-            pass
+        _fsutil_atomic_write_text(path, text)
 
     async def init(self, spec_text: str, stack: dict) -> None:
         async with self._lock:
